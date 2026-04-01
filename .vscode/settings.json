@@ -1,0 +1,18 @@
+{
+    "files.associations": {
+        "array": "cpp",
+        "atomic": "cpp",
+        "bitset": "cpp",
+        "exception": "cpp",
+        "string_view": "cpp",
+        "fstream": "cpp",
+        "iosfwd": "cpp",
+        "new": "cpp",
+        "ostream": "cpp",
+        "sstream": "cpp",
+        "streambuf": "cpp",
+        "cmath": "cpp",
+        "typeinfo": "cpp",
+        "string": "cpp"
+    }
+}
