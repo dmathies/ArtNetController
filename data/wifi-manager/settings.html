@@ -2,9 +2,10 @@
 <html>
 <head>
 <meta charset="UTF-8" />
-<title>Node Dashboard</title>
+<title>Settings</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
 <style>
+
       :root {
         --bg0: #120d09;
         --bg1: #1f1710;
@@ -14,14 +15,13 @@
         --panel-2: rgba(39, 30, 22, 0.97);
         --soft: rgba(255,255,255,0.045);
         --soft-2: rgba(255,255,255,0.08);
-        --line: rgba(214,173,98,0.22);
+        --logo-color: var(--accent-3);
         --line-strong: rgba(214,173,98,0.42);
         --text: #f5ecde;
         --muted: #c6b49d;
         --accent: #d6ad62;
         --accent-2: #946325;
         --accent-3: #f2cf87;
-        --logo-color: var(--accent-3);
         --accent-rgb: 214,173,98;
         --ok: #c5a96b;
         --ok-rgb: 197,169,107;
@@ -30,6 +30,8 @@
         --shadow: 0 18px 48px rgba(0,0,0,0.34);
         --radius: 18px;
         --radius-sm: 14px;
+        --input-bg: rgba(255,255,255,0.06);
+        --input-bg-focus: rgba(255,255,255,0.10);
         --button-text: #24160b;
         --button-bg: linear-gradient(135deg, var(--accent-3), var(--accent-2));
         --button-bg-hover: linear-gradient(135deg, #f7ddab, #b37734);
@@ -52,7 +54,7 @@
         background: transparent;
       }
       a { color: inherit; text-decoration: none; }
-      button, select { font: inherit; }
+      button, input, select { font: inherit; }
       .page { min-height: 100%; padding: 18px; }
       .shell { max-width: 1120px; margin: 0 auto; }
       .topbar, .card {
@@ -129,11 +131,11 @@
         align-items: center;
         justify-content: flex-end;
       }
-      .btn, .theme-select {
+      .btn, .chip, .theme-select {
         border-radius: 999px;
         min-height: 42px;
       }
-      .btn {
+      .btn, .chip {
         display: inline-flex;
         align-items: center;
         justify-content: center;
@@ -148,7 +150,7 @@
         text-transform: uppercase;
         transition: transform .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
       }
-      .btn:hover {
+      .btn:hover, .chip:hover {
         transform: translateY(-1px);
         background: rgba(255,255,255,0.08);
         border-color: rgba(var(--accent-rgb),0.56);
@@ -187,6 +189,7 @@
       .theme-select option { color: #111; }
       .card-inner { padding: 20px; }
       .card-title { margin: 0; font-size: 18px; font-weight: 800; }
+      .muted { color: var(--muted); }
       .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
       .status-badge {
         display: inline-flex;
@@ -209,164 +212,130 @@
         background: var(--accent);
         box-shadow: 0 0 12px rgba(var(--accent-rgb),0.55);
       }
-      .layout {
-        display: grid;
-        grid-template-columns: minmax(320px, 1.15fr) minmax(280px, 0.85fr);
-        gap: 18px;
-      }
-      .stack { display: grid; gap: 18px; }
-      .hero-grid {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-        margin-top: 16px;
-      }
-      .metric {
-        padding: 14px;
-        border-radius: 16px;
-        background: var(--soft);
-        border: 1px solid var(--line);
-      }
-      .metric-label {
-        font-size: 11px;
-        text-transform: uppercase;
-        letter-spacing: 0.12em;
-        color: var(--muted);
-        font-weight: 800;
-      }
-      .metric-value {
-        margin-top: 8px;
-        font-size: clamp(24px, 5vw, 40px);
-        line-height: 1;
-        font-weight: 800;
-      }
-      .status-grid {
-        display: grid;
-        gap: 12px;
-      }
-      .meta-grid {
-        display: grid;
-        gap: 12px;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-      .meta {
-        padding: 14px;
-        border-radius: 16px;
-        background: var(--soft);
-        border: 1px solid var(--line);
-      }
-      .meta .label {
-        display: block;
-        font-size: 11px;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.11em;
-        font-weight: 800;
-        margin-bottom: 8px;
-      }
-      .meta .value {
-        font-size: 24px;
-        font-weight: 800;
-      }
-      .rssi-wrap {
-        margin-top: 10px;
-      }
-      .rssi-bar {
-        position: relative;
-        height: 12px;
-        border-radius: 999px;
-        overflow: hidden;
-        border: 1px solid var(--line);
-        background: linear-gradient(90deg, #c95a53 0%, #d97f57 22%, #e0bf5a 48%, #9fca6a 74%, #63c07e 100%);
-        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
-      }
-      .rssi-marker {
-        position: absolute;
-        top: 50%;
-        width: 12px;
-        height: 12px;
-        border-radius: 999px;
-        background: #fff;
-        border: 2px solid rgba(0,0,0,0.35);
-        box-shadow: 0 0 0 2px rgba(255,255,255,0.18);
-        transform: translate(-50%, -50%);
-        left: 0%;
-      }
-      .rssi-scale {
-        display: flex;
-        justify-content: space-between;
-        gap: 8px;
-        margin-top: 6px;
-        font-size: 10px;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--muted);
-      }
-      .rssi-note {
-        margin-top: 6px;
-        font-size: 11px;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-        font-weight: 800;
-      }
-      .status-row {
-        display: grid;
-        grid-template-columns: 84px 1fr 72px;
-        gap: 12px;
-        align-items: center;
-      }
-      .status-row .label {
-        font-size: 12px;
-        font-weight: 800;
-        color: var(--muted);
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
-      }
-      .meter {
-        position: relative;
-        height: 16px;
-        border-radius: 999px;
-        background: var(--meter-bg);
-        border: 1px solid var(--line);
-        overflow: hidden;
-      }
-      .meter-fill {
-        position: absolute;
-        inset: 0 auto 0 0;
-        width: 0%;
-        border-radius: inherit;
-        background: var(--meter-fill);
-        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 0 24px rgba(var(--accent-rgb),0.20);
-        transition: width .18s ease;
-      }
-      .meter-value {
-        text-align: right;
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--text);
-      }
-      @media (max-width: 920px) {
-        .layout { grid-template-columns: 1fr; }
+      code {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 0.95em;
+        color: var(--accent-3);
       }
       @media (max-width: 760px) {
         .page { padding: 12px; }
         .topbar { flex-direction: column; align-items: flex-start; }
         .toolbar { width: 100%; justify-content: stretch; }
       }
-      @media (max-width: 560px) {
-        .hero-grid, .meta-grid { grid-template-columns: 1fr; }
-        .status-row { grid-template-columns: 68px 1fr 60px; gap: 10px; }
+
+      .panel { max-width: 900px; margin: 0 auto; }
+      .panel .card-inner { padding: 22px; }
+      .section {
+        display: grid;
+        gap: 14px;
       }
+      .section + .section {
+        margin-top: 18px;
+        padding-top: 18px;
+        border-top: 1px solid var(--line);
+      }
+      .section-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .section-title {
+        margin: 0;
+        font-size: 18px;
+        font-weight: 800;
+      }
+      .field-grid { display: grid; gap: 12px; }
+      .field {
+        display: grid;
+        grid-template-columns: 128px minmax(0, 1fr);
+      }
+      .field label {
+        display: flex;
+        align-items: center;
+        padding: 0 14px;
+        min-height: 50px;
+        background: rgba(var(--accent-rgb),0.12);
+        border: 1px solid rgba(var(--accent-rgb),0.28);
+        border-right: none;
+        border-radius: 14px 0 0 14px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-size: 11px;
+        font-weight: 800;
+        color: var(--accent-3);
+      }
+      .field input, .field select {
+        width: 100%;
+        min-height: 50px;
+        padding: 0 14px;
+        border-radius: 0 14px 14px 0;
+        border: 1px solid var(--line);
+        background: var(--input-bg);
+        color: var(--text);
+        outline: none;
+      }
+      .field input:focus, .field select:focus {
+        background: var(--input-bg-focus);
+        border-color: var(--line-strong);
+      }
+      .field input::placeholder { color: var(--muted); }
+      .inline-actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .notice {
+        display: none;
+        margin-top: 18px;
+        padding: 16px 18px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: rgba(var(--accent-rgb),0.10);
+        color: var(--text);
+      }
+      #loader-wrap {
+        display: none;
+        margin-top: 18px;
+        align-items: center;
+        gap: 14px;
+        padding: 16px 18px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: var(--soft);
+      }
+      #loader {
+        width: 30px;
+        height: 30px;
+        border: 3px solid rgba(255,255,255,0.16);
+        border-right-color: var(--accent);
+        border-radius: 50%;
+        animation: spinner .9s linear infinite;
+        display: inline-block;
+      }
+      @keyframes spinner { to { transform: rotate(1turn); } }
+      @media (max-width: 640px) {
+        .field { grid-template-columns: 1fr; }
+        .field label {
+          border-right: 1px solid rgba(var(--accent-rgb),0.28);
+          border-radius: 14px 14px 0 0;
+          min-height: 42px;
+        }
+        .field input, .field select { border-radius: 0 0 14px 14px; }
+      }
+
 </style>
 <script>
+
       const THEMES = {
         gold: {
           '--bg0':'#120d09','--bg1':'#1f1710','--bg2':'#2e2217','--bg3':'#0d0d0f',
           '--panel':'rgba(28,22,17,0.92)','--panel-2':'rgba(39,30,22,0.97)',
-          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(214,173,98,0.22)','--line-strong':'rgba(214,173,98,0.42)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(214,173,98,0.22)','--line-strong':'rgba(214,173,98,0.42)',
           '--text':'#f5ecde','--muted':'#c6b49d','--accent':'#d6ad62','--accent-2':'#946325','--accent-3':'#f2cf87',
           '--accent-rgb':'214,173,98','--ok':'#c5a96b','--ok-rgb':'197,169,107','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
           '--button-text':'#24160b',
           '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
           '--button-bg-hover':'linear-gradient(135deg, #f7ddab, #b37734)',
@@ -377,9 +346,11 @@
         blue: {
           '--bg0':'#0b1018','--bg1':'#111a27','--bg2':'#18273a','--bg3':'#090d14',
           '--panel':'rgba(14,22,34,0.92)','--panel-2':'rgba(19,30,45,0.97)',
-          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(92,166,255,0.20)','--line-strong':'rgba(92,166,255,0.42)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(92,166,255,0.20)','--line-strong':'rgba(92,166,255,0.42)',
           '--text':'#eef6ff','--muted':'#aac0dd','--accent':'#67b5ff','--accent-2':'#2f5e9d','--accent-3':'#b8e3ff',
           '--accent-rgb':'103,181,255','--ok':'#6fb9ff','--ok-rgb':'111,185,255','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
           '--button-text':'#0b1727',
           '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
           '--button-bg-hover':'linear-gradient(135deg, #d4efff, #4877b3)',
@@ -390,9 +361,11 @@
         green: {
           '--bg0':'#0d1511','--bg1':'#15241d','--bg2':'#1d3329','--bg3':'#09100d',
           '--panel':'rgba(15,25,21,0.92)','--panel-2':'rgba(20,35,28,0.97)',
-          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(111,196,145,0.22)','--line-strong':'rgba(111,196,145,0.42)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(111,196,145,0.22)','--line-strong':'rgba(111,196,145,0.42)',
           '--text':'#edf8f0','--muted':'#b3ceb9','--accent':'#78cb97','--accent-2':'#2d7250','--accent-3':'#bce9ca',
           '--accent-rgb':'120,203,151','--ok':'#78cb97','--ok-rgb':'120,203,151','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
           '--button-text':'#0d1c14',
           '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
           '--button-bg-hover':'linear-gradient(135deg, #d5f5df, #428565)',
@@ -419,139 +392,203 @@
         });
       }
 
-      function clamp(value, min, max) {
-        return Math.max(min, Math.min(max, value));
+      document.addEventListener('DOMContentLoaded', initThemePicker);
+
+
+      const apiBase = `${window.location.protocol}//${window.location.host}`;
+      let initialCreds = null;
+      let networkHandlerAttached = false;
+      let networkScanInProgress = false;
+
+      function optionExists(sel, value) {
+        for (const o of sel.options) if (o.value === value) return true;
+        return false;
       }
 
-      function getRssiInfo(rssi) {
-        if (!isFinite(rssi)) return { percent: 0, label: 'Unknown' };
-        const percent = clamp(((rssi + 100) / 50) * 100, 0, 100);
-        if (rssi >= -67) return { percent, label: 'Good' };
-        if (rssi >= -75) return { percent, label: 'Fair' };
-        return { percent, label: 'Weak' };
-      }
-
-      let statusSocket = null;
-      let wsConnected = false;
-      let wsReconnectTimer = null;
-      let statusPollInFlight = false;
-      let statusPollTimer = null;
-      const STATUS_POLL_ACTIVE_MS = 3000;
-      const STATUS_POLL_HIDDEN_MS = 5000;
-      const STATUS_FETCH_TIMEOUT_MS = 3000;
-
-      function applyStatus(s) {
-        for (let i = 0; i < 4; i++) {
-          const raw = s['led_value' + i];
-          const valueEl = document.getElementById('led-val-' + i);
-          const fillEl = document.getElementById('led-fill-' + i);
-          if (typeof raw !== 'undefined') {
-            const num = Number(raw);
-            const clamped = isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;
-            if (valueEl) valueEl.innerText = isFinite(num) ? num.toFixed(3) : String(raw);
-            if (fillEl) fillEl.style.width = (clamped * 100).toFixed(1) + '%';
-          }
-        }
-        const art = Number(s.art_age_ms ?? NaN);
-        const source = typeof s.source === 'string' ? s.source : 'none';
-        const wifiRssi = Number(s.wifi_rssi ?? NaN);
-        const freeHeap = Number(s.free_heap ?? NaN);
-        const minFreeHeap = Number(s.min_free_heap ?? NaN);
-        const resetReason = typeof s.reset_reason === 'string' ? s.reset_reason : '-';
-        const rssiInfo = getRssiInfo(wifiRssi);
-        document.getElementById('artAge').innerText = isFinite(art) ? art : '-';
-        document.getElementById('artBadge').innerText = isFinite(art) && art < 2000 ? 'Live' : 'Idle';
-        document.getElementById('wsBadge').innerText = wsConnected ? 'WebSocket' : 'Polling';
-        document.getElementById('sourceValue').innerText = source === 'none' ? 'Idle' : source;
-        document.getElementById('wifiRssi').innerText = isFinite(wifiRssi) ? `${wifiRssi} dBm` : '-';
-        document.getElementById('wifiRssiMarker').style.left = `${rssiInfo.percent}%`;
-        document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
-        document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
-        document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
-        document.getElementById('resetReason').innerText = resetReason.replace(/_/g, ' ');
-      }
-
-      function scheduleNextStatusPoll(delayMs) {
-        if (statusPollTimer) clearTimeout(statusPollTimer);
-        statusPollTimer = setTimeout(pollStatus, delayMs);
-      }
-
-      function connectStatusWebSocket() {
-        if (statusSocket && (statusSocket.readyState === WebSocket.OPEN || statusSocket.readyState === WebSocket.CONNECTING)) return;
-
-        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        statusSocket = new WebSocket(`${proto}://${window.location.host}/ws`);
-
-        statusSocket.onopen = () => {
-          wsConnected = true;
-          if (wsReconnectTimer) {
-            clearTimeout(wsReconnectTimer);
-            wsReconnectTimer = null;
-          }
-          try { statusSocket.send('status'); } catch (e) {}
-        };
-
-        statusSocket.onmessage = (ev) => {
-          try {
-            applyStatus(JSON.parse(ev.data));
-          } catch (e) {}
-        };
-
-        statusSocket.onclose = () => {
-          wsConnected = false;
-          if (!wsReconnectTimer) {
-            wsReconnectTimer = setTimeout(() => {
-              wsReconnectTimer = null;
-              connectStatusWebSocket();
-            }, 1500);
-          }
-          scheduleNextStatusPoll(500);
-        };
-
-        statusSocket.onerror = () => {
-          if (statusSocket) statusSocket.close();
-        };
-      }
-
-      async function pollStatus() {
-        if (wsConnected) {
-          scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
-          return;
-        }
-        if (statusPollInFlight) {
-          scheduleNextStatusPoll(STATUS_POLL_ACTIVE_MS);
-          return;
-        }
-
-        statusPollInFlight = true;
+      async function loadCredentials() {
         try {
-          const ctrl = new AbortController();
-          const timeoutId = setTimeout(() => ctrl.abort(), STATUS_FETCH_TIMEOUT_MS);
-          const res = await fetch('/status', { cache: 'no-store', signal: ctrl.signal });
-          clearTimeout(timeoutId);
-          if (!res.ok) throw new Error();
-          applyStatus(await res.json());
+          const res = await fetch(`${apiBase}/credentials`, { method: "GET", cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const json = await res.json();
+
+          initialCreds = {
+            ssid: json.ssid || "",
+            password: json.password || "",
+            hostname: json.hostname || "",
+            dmx_address: (json.dmx_address ?? 1),
+            dmx_universe: (json.dmx_universe ?? 0)
+          };
+
+          document.getElementById("ssid").value = initialCreds.ssid || "";
+          document.getElementById("password").value = initialCreds.password || "";
+          document.getElementById("hostname").value = initialCreds.hostname || "";
+          document.getElementById("dmx-address").value = initialCreds.dmx_address;
+          document.getElementById("dmx-universe").value = initialCreds.dmx_universe;
+
+          const sel = document.getElementById("network");
+          if (!sel.disabled && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
+            sel.value = initialCreds.ssid;
+            toggleCustomSsid(sel.value);
+          } else {
+            toggleCustomSsid(sel.value || "");
+          }
         } catch (e) {
-        } finally {
-          statusPollInFlight = false;
-          scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
+          toggleCustomSsid("");
         }
       }
 
-      document.addEventListener('visibilitychange', () => {
-        if (document.hidden) {
-          scheduleNextStatusPoll(STATUS_POLL_HIDDEN_MS);
-        } else {
-          connectStatusWebSocket();
-          scheduleNextStatusPoll(250);
+      function renderNetworks(list) {
+        const sel = document.getElementById("network");
+        const refreshBtn = document.getElementById("refresh-networks");
+        sel.disabled = false;
+        sel.innerHTML = "";
+
+        if (Array.isArray(list) && list.length) {
+          for (const ssid of list) {
+            const opt = document.createElement("option");
+            opt.value = ssid;
+            opt.text = ssid;
+            sel.appendChild(opt);
+          }
         }
+
+        const other = document.createElement("option");
+        other.value = "";
+        other.text = "Other network";
+        sel.appendChild(other);
+
+        if (initialCreds && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
+          sel.value = initialCreds.ssid;
+        }
+
+        toggleCustomSsid(sel.value);
+        if (refreshBtn) {
+          refreshBtn.disabled = false;
+          refreshBtn.textContent = "Refresh Networks";
+        }
+        networkScanInProgress = false;
+
+        if (!networkHandlerAttached) {
+          sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+          networkHandlerAttached = true;
+        }
+      }
+
+      function initNetworkSelector() {
+        const sel = document.getElementById("network");
+        if (!sel) return;
+        sel.disabled = false;
+        sel.innerHTML = "";
+        const other = document.createElement("option");
+        other.value = "";
+        other.text = "Other network";
+        sel.appendChild(other);
+        sel.value = "";
+        if (!networkHandlerAttached) {
+          sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+          networkHandlerAttached = true;
+        }
+      }
+
+      async function fetchNetworks() {
+        const sel = document.getElementById("network");
+        const refreshBtn = document.getElementById("refresh-networks");
+        try {
+          const res = await fetch(`${apiBase}/networks?details=1`, { method: "GET", cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const body = await res.json();
+          const list = Array.isArray(body.networks) ? body.networks : [];
+
+          if (body.scanning) {
+            sel.disabled = true;
+            networkScanInProgress = true;
+            if (refreshBtn) {
+              refreshBtn.disabled = true;
+              refreshBtn.textContent = "Scanning...";
+            }
+            setTimeout(fetchNetworks, 600);
+            return;
+          }
+
+          renderNetworks(list);
+        } catch (e) {
+          networkScanInProgress = false;
+          sel.disabled = false;
+          if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = "Refresh Networks";
+          }
+          showManualSsid();
+        }
+      }
+
+      function refreshNetworks() {
+        if (networkScanInProgress) return;
+        networkScanInProgress = true;
+        const refreshBtn = document.getElementById("refresh-networks");
+        if (refreshBtn) {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = "Scanning...";
+        }
+        fetchNetworks();
+      }
+
+      function showManualSsid() {
+        document.getElementById("custom-ssid").style.display = "grid";
+      }
+
+      function toggleCustomSsid(selected) {
+        const custom = document.getElementById("custom-ssid");
+        const ssidInput = document.getElementById("ssid");
+        const show = selected.length ? "none" : "grid";
+        const value = selected.length ? selected : (initialCreds?.ssid || "");
+        custom.style.display = show;
+        ssidInput.value = value;
+      }
+
+      async function saveAndReboot() {
+        const loaderWrap = document.getElementById("loader-wrap");
+        if (loaderWrap) loaderWrap.style.display = "flex";
+
+        try {
+          const payload = {
+            ssid: document.getElementById("ssid").value,
+            password: document.getElementById("password").value,
+            hostname: document.getElementById("hostname").value,
+            dmx_address: Number(document.getElementById("dmx-address").value || "1"),
+            dmx_universe: Number(document.getElementById("dmx-universe").value || "0")
+          };
+
+          const res = await fetch(`${apiBase}/credentials`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+
+          if (loaderWrap) loaderWrap.style.display = "none";
+          if (res.status === 204) {
+            document.getElementById("confirmation").style.display = "block";
+          } else {
+            restoreWithError();
+          }
+        } catch {
+          restoreWithError();
+        }
+      }
+
+      function restoreWithError() {
+        const loaderWrap = document.getElementById("loader-wrap");
+        if (loaderWrap) loaderWrap.style.display = "none";
+        setTimeout(() => alert("Error saving configuration"), 0);
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        document.getElementById("save").addEventListener("click", saveAndReboot);
+        document.getElementById("refresh-networks").addEventListener("click", refreshNetworks);
+        initNetworkSelector();
+        loadCredentials();
       });
 
-      document.addEventListener('DOMContentLoaded', () => {
-        initThemePicker();
-        connectStatusWebSocket();
-        pollStatus();
-      });
 </script>
 </head>
 <body>
@@ -575,8 +612,8 @@
 </svg></div>
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
-          <h1>ESP32 Node Dashboard</h1>
-          <p class="subtitle">Embedded lighting controller</p>
+          <h1>Settings</h1>
+          <p class="subtitle">Wi-Fi, hostname and DMX / Art-Net configuration</p>
         </div>
       </div>
       <div class="toolbar">
@@ -588,64 +625,75 @@
             <option value="green">Green</option>
           </select>
         </div>
-        <a class="btn" href="/settings.html">Settings</a>
-        <a class="btn btn-primary" href="/ota.html">Updates</a>
+        <a class="btn" href="/">Dashboard</a>
+        <a class="btn" href="/ota.html">Updates</a>
       </div>
     </header>
 
-    <main class="layout">
-      <section class="stack">
-        <article class="card">
-          <div class="card-inner">
-            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
-              <div>
-                <h2 class="card-title">Status</h2>
-              </div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                <span class="status-badge"><span class="dot"></span><span id="artBadge">Waiting</span></span>
-                <span class="status-badge"><span class="dot"></span><span id="wsBadge">Connecting</span></span>
-              </div>
+    <main class="panel">
+      <section class="card">
+        <div class="card-inner" id="manager">
+          <section class="section">
+            <div class="section-head">
+              <h2 class="section-title">Wi-Fi</h2>
+              <button id="refresh-networks" type="button" class="btn">Refresh Networks</button>
             </div>
 
-            <div class="hero-grid">
-              <div class="metric">
-                <div class="metric-label">Art-Net age</div>
-                <div class="metric-value mono"><span id="artAge">-</span><span style="font-size:.45em;margin-left:8px;color:var(--muted);">ms</span></div>
+            <div class="field-grid">
+              <div class="field">
+                <label for="network">Network</label>
+                <select id="network">
+                  <option>Other network</option>
+                </select>
               </div>
-              <div class="metric">
-                <div class="metric-label">Active source</div>
-                <div id="sourceValue" class="metric-value" style="font-size:30px;">Waiting</div>
-              </div>
-            </div>
-          </div>
-        </article>
 
-        <article class="card">
-          <div class="card-inner">
-            <h2 class="card-title">System</h2>
-            <div class="meta-grid" style="margin-top:16px;">
-              <div class="meta"><span class="label">Wi-Fi RSSI</span><div id="wifiRssi" class="value mono">-</div><div class="rssi-wrap"><div class="rssi-bar"><div id="wifiRssiMarker" class="rssi-marker"></div></div><div class="rssi-scale"><span>Weak</span><span>Fair</span><span>Good</span></div><div id="wifiRssiQuality" class="rssi-note">Unknown</div></div></div>
-              <div class="meta"><span class="label">Free Heap</span><div id="freeHeap" class="value mono">-</div></div>
-              <div class="meta"><span class="label">Min Free Heap</span><div id="minFreeHeap" class="value mono">-</div></div>
-              <div class="meta"><span class="label">Reset Reason</span><div id="resetReason" class="value">-</div></div>
+              <div id="custom-ssid" class="field" style="display:none;">
+                <label for="ssid">WLAN SSID</label>
+                <input id="ssid" type="text" placeholder="Name of the network" />
+              </div>
+
+              <div class="field">
+                <label for="password">Password</label>
+                <input id="password" type="password" placeholder="Only if required" />
+              </div>
+
+              <div class="field">
+                <label for="hostname">Hostname</label>
+                <input id="hostname" type="text" placeholder="eg. my-esp32" />
+              </div>
             </div>
+          </section>
+
+          <section class="section">
+            <div class="section-head">
+              <h2 class="section-title">DMX / Art-Net</h2>
+            </div>
+            <div class="field-grid">
+              <div class="field">
+                <label for="dmx-address">Address</label>
+                <input id="dmx-address" type="number" min="1" max="512" step="1" inputmode="numeric" placeholder="1 - 512" />
+              </div>
+              <div class="field">
+                <label for="dmx-universe">Universe</label>
+                <input id="dmx-universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
+              </div>
+            </div>
+          </section>
+
+          <div class="inline-actions" style="margin-top:18px;">
+            <button id="save" class="btn btn-primary" type="button">Save and Restart</button>
           </div>
-        </article>
+
+          <div id="loader-wrap">
+            <span id="loader"></span>
+            <div>Saving configuration and restarting the controller…</div>
+          </div>
+
+          <div id="confirmation" class="notice">
+            Credentials saved. The controller is restarting and will reconnect using the new settings.
+          </div>
+        </div>
       </section>
-
-      <aside class="stack">
-        <article class="card">
-          <div class="card-inner">
-            <h2 class="card-title">LED Output</h2>
-            <div class="status-grid" style="margin-top:16px;">
-              <div class="status-row"><div class="label">LED 0</div><div class="meter"><div id="led-fill-0" class="meter-fill"></div></div><div id="led-val-0" class="meter-value mono">0.000</div></div>
-              <div class="status-row"><div class="label">LED 1</div><div class="meter"><div id="led-fill-1" class="meter-fill"></div></div><div id="led-val-1" class="meter-value mono">0.000</div></div>
-              <div class="status-row"><div class="label">LED 2</div><div class="meter"><div id="led-fill-2" class="meter-fill"></div></div><div id="led-val-2" class="meter-value mono">0.000</div></div>
-              <div class="status-row"><div class="label">LED 3</div><div class="meter"><div id="led-fill-3" class="meter-fill"></div></div><div id="led-val-3" class="meter-value mono">0.000</div></div>
-            </div>
-          </div>
-        </article>
-      </aside>
     </main>
   </div>
 </div>

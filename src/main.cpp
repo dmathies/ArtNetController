@@ -5,6 +5,7 @@
 #include <SPIFFS.h>
 #include <Update.h>
 #include <esp_partition.h>
+#include <esp_system.h>
 #include <ArduinoJson.h>
 #include <cstring>
 #include "WifiManager.h"
@@ -259,6 +260,23 @@ static void formatIp(uint32_t rawIp, char* out, size_t outSize) {
            (unsigned int)((rawIp >> 24) & 0xFF));
 }
 
+static const char* resetReasonToString(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN: return "unknown";
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "other";
+  }
+}
+
 static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   DynamicJsonDocument j(1536);
   uint32_t now = millis();
@@ -268,6 +286,10 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["source"] = src;
   j["dmx_age_ms"] = now - snapshot.lastDmxMs;
   j["art_age_ms"] = now - snapshot.lastArtMs;
+  j["wifi_rssi"] = WifiManager.getRSSI();
+  j["free_heap"] = ESP.getFreeHeap();
+  j["min_free_heap"] = ESP.getMinFreeHeap();
+  j["reset_reason"] = resetReasonToString(esp_reset_reason());
   if (details) {
     j["art_udp_packets_total"] = snapshot.artUdpPacketsTotal;
     j["art_udp_bytes_total"] = snapshot.artUdpBytesTotal;
@@ -515,6 +537,7 @@ static esp_err_t sendSpiffsFile(httpd_req_t* req, const char* path, const char* 
 
 static esp_err_t indexHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/index.html", "text/html"); }
 static esp_err_t otaPageHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/ota.html", "text/html"); }
+static esp_err_t settingHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/settings.html", "text/html"); }
 
 static esp_err_t statusHandler(httpd_req_t* req) {
   bool details = false;
@@ -760,6 +783,7 @@ static void startWebServer() {
     registerUri("/", HTTP_GET, indexHandler);
     registerUri("/index.html", HTTP_GET, indexHandler);
     registerUri("/ota.html", HTTP_GET, otaPageHandler);
+    registerUri("/settings.html", HTTP_GET, settingHandler);
     registerUri("/status", HTTP_GET, statusHandler);
     registerUri("/networks", HTTP_GET, networksHandler);
     registerUri("/credentials", HTTP_GET, credentialsGetHandler);

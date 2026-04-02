@@ -1,209 +1,435 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <meta charset="UTF-8">
-    <title>OTA Firmware Update</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
-    <style>
+<head>
+<meta charset="UTF-8" />
+<title>Firmware Updates</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
+<style>
+
+      :root {
+        --bg0: #120d09;
+        --bg1: #1f1710;
+        --bg2: #2e2217;
+        --bg3: #0d0d0f;
+        --panel: rgba(28, 22, 17, 0.92);
+        --panel-2: rgba(39, 30, 22, 0.97);
+        --soft: rgba(255,255,255,0.045);
+        --soft-2: rgba(255,255,255,0.08);
+        --logo-color: var(--accent-3);
+        --line-strong: rgba(214,173,98,0.42);
+        --text: #f5ecde;
+        --muted: #c6b49d;
+        --accent: #d6ad62;
+        --accent-2: #946325;
+        --accent-3: #f2cf87;
+        --accent-rgb: 214,173,98;
+        --ok: #c5a96b;
+        --ok-rgb: 197,169,107;
+        --warn: #f0c670;
+        --danger: #ef9a7d;
+        --shadow: 0 18px 48px rgba(0,0,0,0.34);
+        --radius: 18px;
+        --radius-sm: 14px;
+        --input-bg: rgba(255,255,255,0.06);
+        --input-bg-focus: rgba(255,255,255,0.10);
+        --button-text: #24160b;
+        --button-bg: linear-gradient(135deg, var(--accent-3), var(--accent-2));
+        --button-bg-hover: linear-gradient(135deg, #f7ddab, #b37734);
+        --meter-bg: rgba(255,255,255,0.05);
+        --meter-fill: linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96));
+        --header-line: linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent);
+      }
+      * { box-sizing: border-box; }
       html, body { height: 100%; }
-      html { background-color: #0f2027; }
+      html {
+        background:
+          radial-gradient(circle at top left, rgba(var(--accent-rgb), 0.14), transparent 28%),
+          radial-gradient(circle at top right, rgba(var(--accent-rgb), 0.10), transparent 22%),
+          linear-gradient(180deg, var(--bg2), var(--bg0) 44%, var(--bg3));
+      }
       body {
-        color: #fff; background: linear-gradient(#2c5364, #203a43, #0f2027);
-        margin: 0; font-family: Verdana, sans-serif; font-weight: 300;
+        margin: 0;
+        color: var(--text);
+        font-family: "Segoe UI", Verdana, sans-serif;
+        background: transparent;
       }
-      body { display: flex; flex-direction: column; justify-content: center; align-items: center; }
-      
-      #container {
-        background: rgba(255,255,255,0.1); border-radius: 8px; padding: 24px;
-        width: 90%; max-width: 450px; box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+      a { color: inherit; text-decoration: none; }
+      button, input, select { font: inherit; }
+      .page { min-height: 100%; padding: 18px; }
+      .shell { max-width: 1120px; margin: 0 auto; }
+      .topbar, .card {
+        background: linear-gradient(180deg, var(--panel-2), var(--panel));
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        position: relative;
+        overflow: hidden;
       }
-      
-      h1 { margin: 0 0 20px; font-size: 24px; text-align: center; }
-      
+      .topbar::before, .card::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 1px;
+        background: var(--header-line);
+      }
+      .topbar {
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+      .brand-logo {
+        width: 56px;
+        height: 56px;
+        flex: 0 0 auto;
+        border-radius: 16px;
+        padding: 8px;
+        color: var(--logo-color);
+        background:
+          radial-gradient(circle at 28% 22%, rgba(255,255,255,0.08), transparent 46%),
+          linear-gradient(180deg, rgba(var(--accent-rgb),0.10), rgba(255,255,255,0.02));
+        border: 1px solid var(--line);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.05),
+          0 0 22px rgba(var(--accent-rgb),0.08);
+      }
+      .brand-logo svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .eyebrow {
+        margin: 0 0 3px;
+        font-size: 11px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        color: var(--accent-3);
+        font-weight: 800;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(24px, 4vw, 34px);
+        line-height: 1.08;
+      }
+      .subtitle {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        justify-content: flex-end;
+      }
+      .btn, .chip, .theme-select {
+        border-radius: 999px;
+        min-height: 42px;
+      }
+      .btn, .chip {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 16px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid var(--line-strong);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        transition: transform .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
+      }
+      .btn:hover, .chip:hover {
+        transform: translateY(-1px);
+        background: rgba(255,255,255,0.08);
+        border-color: rgba(var(--accent-rgb),0.56);
+      }
+      .btn-primary {
+        border: none;
+        background: var(--button-bg);
+        color: var(--button-text);
+        box-shadow: 0 10px 22px rgba(var(--accent-rgb),0.22);
+      }
+      .btn-primary:hover { background: var(--button-bg-hover); }
+      .theme-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 8px 0 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line-strong);
+        background: rgba(255,255,255,0.05);
+        min-height: 42px;
+      }
+      .theme-label {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-weight: 800;
+      }
+      .theme-select {
+        border: none;
+        background: transparent;
+        color: var(--text);
+        padding: 0 8px 0 0;
+        outline: none;
+      }
+      .theme-select option { color: #111; }
+      .card-inner { padding: 20px; }
+      .card-title { margin: 0; font-size: 18px; font-weight: 800; }
+      .muted { color: var(--muted); }
+      .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 11px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid var(--line);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        font-weight: 800;
+        color: var(--muted);
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 12px rgba(var(--accent-rgb),0.55);
+      }
+      code {
+        font-family: Consolas, "Courier New", monospace;
+        font-size: 0.95em;
+        color: var(--accent-3);
+      }
+      @media (max-width: 760px) {
+        .page { padding: 12px; }
+        .topbar { flex-direction: column; align-items: flex-start; }
+        .toolbar { width: 100%; justify-content: stretch; }
+      }
+
+      .panel { max-width: 960px; margin: 0 auto; }
+      .panel .card-inner { padding: 22px; }
       .tabs {
-        display: flex; gap: 8px; margin-bottom: 20px; border-bottom: 2px solid rgba(122,184,147,0.3);
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin: 18px 0 20px;
       }
-      
       .tab-btn {
-        padding: 10px 16px; background: transparent; border: none; color: #aaa;
-        cursor: pointer; font-size: 12px; font-weight: bold; text-transform: uppercase;
-        border-bottom: 2px solid transparent; transition: all 0.3s;
+        width: 100%;
+        min-height: 50px;
+        padding: 0 16px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.04);
+        color: var(--muted);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 900;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        transition: transform .15s ease, background .15s ease, border-color .15s ease, color .15s ease;
       }
-      
       .tab-btn.active {
-        color: #7ab893; border-bottom-color: #7ab893;
+        color: var(--text);
+        background: linear-gradient(135deg, rgba(var(--accent-rgb),0.16), rgba(var(--accent-rgb),0.24));
+        border-color: rgba(var(--accent-rgb),0.42);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.04);
       }
-      
-      .tab-btn:hover { color: #9fd9a5; }
-      
+      .tab-btn:hover { transform: translateY(-1px); }
       .tab-content { display: none; }
       .tab-content.active { display: block; }
-      
       .info-box {
-        background: rgba(122,184,147,0.2); border-left: 4px solid #7ab893;
-        padding: 12px; margin: 12px 0; border-radius: 3px; font-size: 12px;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.05);
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
       }
-      
-      .form-group {
-        margin: 16px 0;
-      }
-      
-      label {
-        display: block; margin-bottom: 6px; font-weight: bold; font-size: 12px;
+      .form-group { margin: 16px 0; }
+      label.form-label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 800;
+        font-size: 12px;
         text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--accent-3);
       }
-      
       input[type="file"] {
-        display: block; width: 100%; padding: 8px;
-        background: rgba(255,255,255,0.1); border: 1px solid rgba(122,184,147,0.5);
-        border-radius: 3px; color: #fff; cursor: pointer; font-size: 11px;
-        box-sizing: border-box;
+        display: block;
+        width: 100%;
+        padding: 10px;
+        background: var(--input-bg);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        color: var(--text);
+        cursor: pointer;
       }
-      
       input[type="file"]::file-selector-button {
-        background: #7ab893; color: #fff; border: none;
-        padding: 6px 12px; border-radius: 3px; cursor: pointer;
-        font-weight: bold; font-size: 11px;
+        margin-right: 10px;
+        border: none;
+        border-radius: 999px;
+        min-height: 36px;
+        padding: 0 14px;
+        background: var(--button-bg);
+        color: var(--button-text);
+        font-weight: 800;
+        cursor: pointer;
       }
-      
-      button {
-        width: 100%; padding: 10px; margin-top: 12px;
-        background: #7ab893; color: #fff; border: none; border-radius: 3px;
-        font-weight: bold; font-size: 12px; text-transform: uppercase;
-        cursor: pointer; transition: all 0.3s ease;
+      .upload-btn {
+        width: 100%;
+        min-height: 52px;
       }
-      
-      button:hover { background: #5f9a76; }
-      button:disabled { background: #666; cursor: not-allowed; opacity: 0.6; }
-      
-      #status-firmware, #status-spiffs {
-        margin-top: 16px; padding: 12px; border-radius: 3px;
-        text-align: center; font-size: 12px; display: none;
+      .status {
+        margin-top: 16px;
+        padding: 12px 14px;
+        border-radius: 14px;
+        text-align: center;
+        font-size: 12px;
+        display: none;
+        border: 1px solid var(--line);
       }
-      
       .status.success {
-        background: rgba(95,200,100,0.2); border: 1px solid #5fc864;
-        color: #7fff7f;
+        background: rgba(120,203,151,0.12);
+        color: #cbf0d5;
+        border-color: rgba(120,203,151,0.34);
       }
-      
       .status.error {
-        background: rgba(255,100,100,0.2); border: 1px solid #ff6464;
-        color: #ff9999;
+        background: rgba(239,154,125,0.12);
+        color: #ffd8ce;
+        border-color: rgba(239,154,125,0.34);
       }
-      
       .status.info {
-        background: rgba(122,184,147,0.2); border: 1px solid #7ab893;
-        color: #b3f5c3;
+        background: rgba(var(--accent-rgb),0.12);
+        color: var(--text);
+        border-color: rgba(var(--accent-rgb),0.34);
       }
-      
-      .progress-container {
-        display: none; margin-top: 12px;
-      }
-      
+      .progress-container { display: none; margin-top: 12px; }
       .progressBar {
-        width: 100%; height: 20px; background: rgba(0,0,0,0.3);
-        border-radius: 3px; overflow: hidden;
+        width: 100%;
+        height: 18px;
+        background: var(--meter-bg);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        overflow: hidden;
       }
-      
       .progressFill {
-        height: 100%; background: linear-gradient(90deg, #7ab893, #5fc864);
-        width: 0%; transition: width 0.1s linear;
+        height: 100%;
+        width: 0%;
+        background: var(--meter-fill);
+        transition: width .1s linear, background .18s ease;
+        box-shadow: 0 0 18px rgba(var(--accent-rgb),0.22);
       }
-      
       .progressText {
-        text-align: center; margin-top: 6px; font-size: 11px;
+        text-align: center;
+        margin-top: 8px;
+        font-size: 11px;
+        color: var(--muted);
       }
-      
-      a { color: #7ab893; text-decoration: none; }
-      a:hover { text-decoration: underline; }
-      
-      .back-link {
-        margin-top: 16px; font-size: 11px; text-align: center;
+      .footer-links { margin-top: 18px; display:flex; gap:10px; flex-wrap:wrap; }
+      @media (max-width: 580px) {
+        .tabs { grid-template-columns: 1fr; }
       }
-    </style>
-  </head>
-  <body>
-    <div id="container">
-      <h1>Firmware & Filesystem Updates</h1>
-      
-      <div class="tabs">
-        <button class="tab-btn active" onclick="switchTab('firmware')">Firmware</button>
-        <button class="tab-btn" onclick="switchTab('spiffs')">Filesystem</button>
-      </div>
-      
-      <!-- Firmware Tab -->
-      <div id="firmware" class="tab-content active">
-        <div class="info-box">
-          <strong>Firmware Update:</strong> Uploads the compiled application code. Built with <code>pio run</code>, file: <code>firmware.bin</code>
-        </div>
-        
-        <div class="form-group">
-          <label for="firmware-file">Select Firmware File</label>
-          <input type="file" id="firmware-file" accept=".bin" />
-          <small style="font-size: 10px; color: #aaa; margin-top: 4px; display: block;">
-            Expected: .pio/build/seeed_xiao_esp32s3/firmware.bin
-          </small>
-        </div>
-        
-        <button onclick="uploadFirmware()">Upload Firmware</button>
-        
-        <div id="progress-firmware" class="progress-container">
-          <div class="progressBar">
-            <div class="progressFill firmware-fill"></div>
-          </div>
-          <div class="progressText firmware-text">0%</div>
-        </div>
-        
-        <div id="status-firmware" class="status"></div>
-      </div>
-      
-      <!-- Filesystem Tab -->
-      <div id="spiffs" class="tab-content">
-        <div class="info-box">
-          <strong>Filesystem Update:</strong> Uploads the data/ folder (web pages, configs). Built with <code>pio run --target buildfs</code>, file: <code>spiffs.bin</code>
-        </div>
-        
-        <div class="form-group">
-          <label for="spiffs-file">Select SPIFFS Image File</label>
-          <input type="file" id="spiffs-file" accept=".bin" />
-          <small style="font-size: 10px; color: #aaa; margin-top: 4px; display: block;">
-            Build with: <code>pio run --target buildfs</code><br>
-            Find at: .pio/build/seeed_xiao_esp32s3/spiffs.bin
-          </small>
-        </div>
-        
-        <button onclick="uploadSPIFFS()">Upload Filesystem</button>
-        
-        <div id="progress-spiffs" class="progress-container">
-          <div class="progressBar">
-            <div class="progressFill spiffs-fill"></div>
-          </div>
-          <div class="progressText spiffs-text">0%</div>
-        </div>
-        
-        <div id="status-spiffs" class="status"></div>
-      </div>
-      
-      <div class="back-link">
-        <a href="/">← Back to Management</a>
-      </div>
-    </div>
 
-    <script>
-      function switchTab(tab) {
-        // Hide all tabs
+</style>
+<script>
+
+      const THEMES = {
+        gold: {
+          '--bg0':'#120d09','--bg1':'#1f1710','--bg2':'#2e2217','--bg3':'#0d0d0f',
+          '--panel':'rgba(28,22,17,0.92)','--panel-2':'rgba(39,30,22,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(214,173,98,0.22)','--line-strong':'rgba(214,173,98,0.42)',
+          '--text':'#f5ecde','--muted':'#c6b49d','--accent':'#d6ad62','--accent-2':'#946325','--accent-3':'#f2cf87',
+          '--accent-rgb':'214,173,98','--ok':'#c5a96b','--ok-rgb':'197,169,107','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
+          '--button-text':'#24160b',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #f7ddab, #b37734)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent)'
+        },
+        blue: {
+          '--bg0':'#0b1018','--bg1':'#111a27','--bg2':'#18273a','--bg3':'#090d14',
+          '--panel':'rgba(14,22,34,0.92)','--panel-2':'rgba(19,30,45,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(92,166,255,0.20)','--line-strong':'rgba(92,166,255,0.42)',
+          '--text':'#eef6ff','--muted':'#aac0dd','--accent':'#67b5ff','--accent-2':'#2f5e9d','--accent-3':'#b8e3ff',
+          '--accent-rgb':'103,181,255','--ok':'#6fb9ff','--ok-rgb':'111,185,255','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
+          '--button-text':'#0b1727',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #d4efff, #4877b3)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.26), rgba(var(--accent-rgb),0.94))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+        },
+        green: {
+          '--bg0':'#0d1511','--bg1':'#15241d','--bg2':'#1d3329','--bg3':'#09100d',
+          '--panel':'rgba(15,25,21,0.92)','--panel-2':'rgba(20,35,28,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--soft-2':'rgba(255,255,255,0.08)',
+          '--line':'rgba(111,196,145,0.22)','--line-strong':'rgba(111,196,145,0.42)',
+          '--text':'#edf8f0','--muted':'#b3ceb9','--accent':'#78cb97','--accent-2':'#2d7250','--accent-3':'#bce9ca',
+          '--accent-rgb':'120,203,151','--ok':'#78cb97','--ok-rgb':'120,203,151','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--input-bg':'rgba(255,255,255,0.06)','--input-bg-focus':'rgba(255,255,255,0.10)',
+          '--button-text':'#0d1c14',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #d5f5df, #428565)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.28), rgba(var(--accent-rgb),0.96))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+        }
+      };
+
+      function applyTheme(themeName) {
+        const theme = THEMES[themeName] || THEMES.gold;
+        const root = document.documentElement;
+        Object.keys(theme).forEach(k => root.style.setProperty(k, theme[k]));
+        root.style.setProperty('--logo-color', 'var(--accent-3)');
+        document.querySelectorAll('.theme-select').forEach(sel => sel.value = themeName);
+        try { localStorage.setItem('gaos-theme', themeName); } catch (e) {}
+      }
+
+      function initThemePicker() {
+        const saved = (() => { try { return localStorage.getItem('gaos-theme'); } catch(e) { return null; } })() || 'gold';
+        applyTheme(saved);
+        document.querySelectorAll('.theme-select').forEach(sel => {
+          sel.addEventListener('change', () => applyTheme(sel.value));
+        });
+      }
+
+      document.addEventListener('DOMContentLoaded', initThemePicker);
+
+
+      function switchTab(tab, btn) {
         document.getElementById('firmware').classList.remove('active');
         document.getElementById('spiffs').classList.remove('active');
-        
-        // Remove active from all buttons
-        document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-        
-        // Show selected tab
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
         document.getElementById(tab).classList.add('active');
-        
-        // Mark button as active
-        event.target.classList.add('active');
+        if (btn) btn.classList.add('active');
       }
+
+
       
       async function uploadFirmware() {
         const fileInput = document.getElementById('firmware-file');
@@ -417,6 +643,108 @@
           console.log('Could not fetch device info');
         }
       });
-    </script>
-  </body>
+    
+</script>
+</head>
+<body>
+<div class="page">
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo" aria-label="GAOS logo"><svg class="gaos-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 955.27 390.39">
+  <g>
+    <path fill="currentColor" d="M396.22,387.4h53.28l-12.2-47.35c-48.46,14.81-116.46.89-147.68-66.77-6.38-13.82-10.95-26.54-12.71-39.18l-32.24,153.3h83.88l5.01-34.75h57.64l5.01,34.75Z"/>
+    <path fill="currentColor" d="M368.02,71.1s-5.81-23-8.98-34.42c-2.84-10.22-5.46-20.53-7.37-31h-26.71l-32.51,154.58c12.58-27.88,48.39-56.03,75.58-89.17"/>
+    <path fill="currentColor" d="M218.58,139.99l-75.99.02v-4.76c0-38.03-7.26-58.65-26.61-58.65-25.71,0-36.22,50.84-36.22,118.66s10.39,121.76,36.22,121.76c35.17,0,34.82-59.71,34.38-73.36l-23.25-18.28v-47.36h91.47v209.3h-29.21l-16.67-21.97c-9.95,16.07-35.66,25.04-69.2,25.04C15.52,390.39,0,271.69,0,195.22S12.87,0,114.17,0c91.18,0,104.41,67.62,104.41,136.3v3.69Z"/>
+    <path fill="currentColor" d="M811.69,246.7v22.19c0,33,13.38,52.3,36.84,52.3,19.56,0,31.46-15.55,31.46-34.87,0-23.23-13.33-37.5-45.86-59.69l-35.18-23.78c-40-26.94-51.78-56.52-51.78-95.61,0-70.79,44.31-107.25,102.96-107.25,55.46,0,101.89,32.76,101.89,116.76v15.32h-70.38v-10.04c0-36.45-12.13-52.82-33.64-52.82-15.84,0-29.86,11.79-29.86,31.17,0,12.67,4.8,25.36,41.59,49.13l35.72,23.25c61.32,40.15,59.82,90.33,59.82,108.29,0,69.73-36.89,109.34-101.94,109.34-59.19,0-115.23-32.74-115.23-116.21v-27.47h73.59Z"/>
+    <path fill="currentColor" d="M604.05,0C496.08,0,493.34,130.75,493.34,195.26s2.19,195.13,110.71,195.13,110.71-130.62,110.71-195.13S712.03,0,604.05,0M604.05,313.79c-29.11,0-34.89-54.17-34.89-118.55s5.26-118.64,34.89-118.64,34.89,54.27,34.89,118.64-5.79,118.55-34.89,118.55"/>
+    <path fill="currentColor" d="M401.17,198.33c-10.23,1.92-21.48,11.43-27.05,20.21-.58.92-.74,1.18-1.26,2.15l7.76,54.7h-9.55c3.21,7.09,7.88,13.09,14,16.99,2.94,1.88,10.22,5.93,19.8,7.3-1.58.74-9.32,1.02-10.9,1.02-2.76.01-5.61-.5-8.26-1.32-13.89-4.3-23.64-12.81-29.6-24.01h-10.39l3.98-27.6c-1.21-9.46.63-23.54,4.64-33.92l7.78-53.38h2.16l4.19,31.1c2.23-2.5,4.7-4.97,7.47-7.36,4.96-4.3,11.41-8.76,18.61-11.89-4.76-18.82-10.72-41.91-15.74-61.76-6.16,7.06-51.52,54.18-62.81,77.29-12.32,25.21-13.3,48.76-5.33,76.47,10.45,36.39,57.7,76.89,123.06,61.75-10.35-40.85-22.2-86.89-32.55-127.74"/>
+    <path fill="currentColor" d="M420.48,167.54c6.88-.08,13.33.42,19.33,1.53l-23.08-109.16c-7.77,14.6-16.01,25.14-26.98,38.29l18.13,70.38c3.66-.54,8.44-.99,12.6-1.04"/>
+    <path fill="currentColor" d="M407.07,14.4l-1.85-8.71h-38.56c-1.12,1.63,13.55,54.64,13.55,54.64,8.81-12.2,18.39-28.42,26.86-45.93"/>
+    <path fill="currentColor" d="M486.03,387.4l-14.11-66.67c-4.73,5.09-11.05,9.77-21.14,14.38l13.47,52.29h21.78Z"/>
+    <path fill="currentColor" d="M468.84,305.53l-21.97-103.12c-11.3-6.11-22.79-7.81-32.1-7.07l32.59,126.51c6.85-3.06,15.97-8.7,21.48-16.32"/>
+  </g>
+</svg></div>
+        <div>
+          <p class="eyebrow">Geneva Musical Theatre</p>
+          <h1>Firmware Updates</h1>
+          <p class="subtitle">Firmware and filesystem deployment</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="theme-wrap">
+          <span class="theme-label">Theme</span>
+          <select class="theme-select" aria-label="Theme">
+            <option value="gold">Gold</option>
+            <option value="blue">Blue</option>
+            <option value="green">Green</option>
+          </select>
+        </div>
+        <a class="btn" href="/">Dashboard</a>
+        <a class="btn" href="/settings.html">Settings</a>
+      </div>
+    </header>
+
+    <main class="panel">
+      <section class="card">
+        <div class="card-inner">
+          <h2 class="card-title">Update Packages</h2>
+
+          <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('firmware', this)">Firmware</button>
+            <button class="tab-btn" onclick="switchTab('spiffs', this)">Filesystem</button>
+          </div>
+
+          <div id="firmware" class="tab-content active">
+            <div class="info-box">
+              <strong>Firmware:</strong> <code>firmware.bin</code>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="firmware-file">Select firmware file</label>
+              <input type="file" id="firmware-file" accept=".bin" />
+              <small class="muted" style="display:block;margin-top:8px;">Expected: <code>.pio/build/seeed_xiao_esp32s3/firmware.bin</code></small>
+            </div>
+
+            <button class="btn btn-primary upload-btn" onclick="uploadFirmware()">Upload Firmware</button>
+
+            <div id="progress-firmware" class="progress-container">
+              <div class="progressBar"><div class="progressFill firmware-fill"></div></div>
+              <div class="progressText firmware-text">0%</div>
+            </div>
+
+            <div id="status-firmware" class="status"></div>
+          </div>
+
+          <div id="spiffs" class="tab-content">
+            <div class="info-box">
+              <strong>Filesystem:</strong> <code>spiffs.bin</code>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="spiffs-file">Select filesystem image</label>
+              <input type="file" id="spiffs-file" accept=".bin" />
+              <small class="muted" style="display:block;margin-top:8px;">Build with <code>pio run --target buildfs</code> then use <code>.pio/build/seeed_xiao_esp32s3/spiffs.bin</code></small>
+            </div>
+
+            <button class="btn btn-primary upload-btn" onclick="uploadSPIFFS()">Upload Filesystem</button>
+
+            <div id="progress-spiffs" class="progress-container">
+              <div class="progressBar"><div class="progressFill spiffs-fill"></div></div>
+              <div class="progressText spiffs-text">0%</div>
+            </div>
+
+            <div id="status-spiffs" class="status"></div>
+          </div>
+
+          <div class="footer-links">
+            <a class="btn" href="/">Back to Dashboard</a>
+            <a class="btn" href="/settings.html">Open Settings</a>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+</body>
 </html>
