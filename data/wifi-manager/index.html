@@ -78,6 +78,7 @@
       const STATUS_POLL_ACTIVE_MS = 3000;
       const STATUS_POLL_HIDDEN_MS = 5000;
       const STATUS_FETCH_TIMEOUT_MS = 3000;
+      const apiBase = `${window.location.protocol}//${window.location.host}`;
 
       function applyStatus(s) {
         // LED values
@@ -98,6 +99,13 @@
         document.getElementById("artAge").innerText = s.art_age_ms ?? "-";
       }
 
+      function scheduleNextStatusPoll(delayMs) {
+        if (statusPollTimer) {
+          clearTimeout(statusPollTimer);
+        }
+        statusPollTimer = setTimeout(pollStatus, delayMs);
+      }
+
       function connectStatusWebSocket() {
         if (statusSocket && (statusSocket.readyState === WebSocket.OPEN || statusSocket.readyState === WebSocket.CONNECTING)) {
           return;
@@ -112,6 +120,7 @@
             clearTimeout(wsReconnectTimer);
             wsReconnectTimer = null;
           }
+          try { statusSocket.send("status"); } catch (e) {}
         };
 
         statusSocket.onmessage = (ev) => {
@@ -139,13 +148,6 @@
         };
       }
 
-      function scheduleNextStatusPoll(delayMs) {
-        if (statusPollTimer) {
-          clearTimeout(statusPollTimer);
-        }
-        statusPollTimer = setTimeout(pollStatus, delayMs);
-      }
-
       async function pollStatus() {
         if (wsConnected) {
           const nextDelay = document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS;
@@ -162,7 +164,7 @@
         try {
           const ctrl = new AbortController();
           const timeoutId = setTimeout(() => ctrl.abort(), STATUS_FETCH_TIMEOUT_MS);
-          const res = await fetch("/status", { cache: "no-store", signal: ctrl.signal });
+          const res = await fetch(`${apiBase}/status`, { cache: "no-store", signal: ctrl.signal });
           clearTimeout(timeoutId);
           if (!res.ok) throw new Error();
           const s = await res.json();
@@ -190,6 +192,7 @@
 
       let initialCreds = null;
       let networkHandlerAttached = false;
+      let networkScanInProgress = false;
 
       function optionExists(sel, value) {
         for (const o of sel.options) if (o.value === value) return true;
@@ -198,7 +201,7 @@
 
       async function loadCredentials() {
         try {
-          const res = await fetch("/credentials", { method: "GET", cache: "no-store" });
+          const res = await fetch(`${apiBase}/credentials`, { method: "GET", cache: "no-store" });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const json = await res.json();
 
@@ -230,6 +233,7 @@
 
       function renderNetworks(list) {
         const sel = document.getElementById("network");
+        const refreshBtn = document.getElementById("refresh-networks");
         sel.disabled = false;
         sel.innerHTML = "";
 
@@ -252,6 +256,29 @@
         }
 
         toggleCustomSsid(sel.value);
+        if (refreshBtn) {
+          refreshBtn.disabled = false;
+          refreshBtn.textContent = "Refresh Networks";
+        }
+        networkScanInProgress = false;
+
+        if (!networkHandlerAttached) {
+          sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+          networkHandlerAttached = true;
+        }
+      }
+
+      function initNetworkSelector() {
+        const sel = document.getElementById("network");
+        if (!sel) return;
+        sel.disabled = false;
+        sel.innerHTML = "";
+
+        const other = document.createElement("option");
+        other.value = "";
+        other.text = "Other network";
+        sel.appendChild(other);
+        sel.value = "";
 
         if (!networkHandlerAttached) {
           sel.addEventListener("change", () => toggleCustomSsid(sel.value));
@@ -261,25 +288,45 @@
 
       async function fetchNetworks() {
         const sel = document.getElementById("network");
-        const loading = document.getElementById("network-loading");
+        const refreshBtn = document.getElementById("refresh-networks");
         try {
-          const res = await fetch("/networks?details=1", { method: "GET", cache: "no-store" });
+          const res = await fetch(`${apiBase}/networks?details=1`, { method: "GET", cache: "no-store" });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const body = await res.json();
           const list = Array.isArray(body.networks) ? body.networks : [];
 
           if (body.scanning) {
             sel.disabled = true;
-            if (loading) loading.innerText = "Scanning networks...";
+            networkScanInProgress = true;
+            if (refreshBtn) {
+              refreshBtn.disabled = true;
+              refreshBtn.textContent = "Scanning...";
+            }
             setTimeout(fetchNetworks, 600);
             return;
           }
 
           renderNetworks(list);
         } catch (e) {
-          if (loading) loading.innerText = "Unable to fetch networks";
+          networkScanInProgress = false;
+          sel.disabled = false;
+          if (refreshBtn) {
+            refreshBtn.disabled = false;
+            refreshBtn.textContent = "Refresh Networks";
+          }
           showManualSsid();
         }
+      }
+
+      function refreshNetworks() {
+        if (networkScanInProgress) return;
+        networkScanInProgress = true;
+        const refreshBtn = document.getElementById("refresh-networks");
+        if (refreshBtn) {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = "Scanning...";
+        }
+        fetchNetworks();
       }
 
       function showManualSsid() {
@@ -302,14 +349,19 @@
         loader.style.display = "inline";
 
         try {
-          const fd = new FormData();
-          fd.append("ssid", document.getElementById("ssid").value);
-          fd.append("password", document.getElementById("password").value);
-          fd.append("hostname", document.getElementById("hostname").value);
-          fd.append("dmx_address", document.getElementById("dmx-address").value || "1");
-          fd.append("dmx_universe", document.getElementById("dmx-universe").value || "0");
+          const payload = {
+            ssid: document.getElementById("ssid").value,
+            password: document.getElementById("password").value,
+            hostname: document.getElementById("hostname").value,
+            dmx_address: Number(document.getElementById("dmx-address").value || "1"),
+            dmx_universe: Number(document.getElementById("dmx-universe").value || "0")
+          };
 
-          const res = await fetch("/credentials", { method: "PUT", body: fd });
+          const res = await fetch(`${apiBase}/credentials`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
           loader.style.display = "none";
           if (res.status === 204) {
             document.getElementById("confirmation").style.display = "inline";
@@ -329,8 +381,9 @@
 
       document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("save").addEventListener("click", saveAndReboot);
+        document.getElementById("refresh-networks").addEventListener("click", refreshNetworks);
+        initNetworkSelector();
         loadCredentials();
-        fetchNetworks();
       });
     </script>
   </head>
@@ -370,11 +423,14 @@
         <h2>Wi-Fi</h2>
         <span>
           <label for="network">Network</label>
-          <select id="network" disabled>
-            <option id="network-loading">Loading networks</option>
+          <select id="network">
+            <option>Other network</option>
           </select>
         </span>
 
+        <span>
+          <button id="refresh-networks" type="button">Refresh Networks</button>
+        </span>
         <span id="custom-ssid">
           <label for="ssid">WLAN SSID</label>
           <input id="ssid" type="text" placeholder="Name of the network" />

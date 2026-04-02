@@ -228,9 +228,6 @@
         progressContainer.style.display = 'block';
         showStatus(statusDiv, 'Uploading firmware...', 'info');
 
-        const formData = new FormData();
-        formData.append('firmware', file);
-
         try {
           const xhr = new XMLHttpRequest();
           let uploadComplete = false;
@@ -296,7 +293,8 @@
           xhr.timeout = 180000;  // 3 minute timeout
           
           xhr.open('POST', '/update');
-          xhr.send(formData);
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.send(file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -327,9 +325,6 @@
         uploadBtn.disabled = true;
         progressContainer.style.display = 'block';
         showStatus(statusDiv, 'Uploading filesystem...', 'info');
-
-        const formData = new FormData();
-        formData.append('filesystem', file);
 
         try {
           const xhr = new XMLHttpRequest();
@@ -396,7 +391,8 @@
           xhr.timeout = 180000;  // 3 minute timeout
           
           xhr.open('POST', '/updatefs');
-          xhr.send(formData);
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.send(file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');

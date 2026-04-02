@@ -1,9 +1,9 @@
 #ifndef WIFI_MANAGER_H
 #define WIFI_MANAGER_H
 
-#include <ESPAsyncWebServer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <WiFi.h>
 
 #include "Configuration.h"
 
@@ -14,10 +14,11 @@ class WifiManagerClass {
 		bool connectToWifi();
 
 		void startManagementAP();
-        void startManagementServerWeb();
-		AsyncWebServer& getServer();
 
 		void check();
+		String getNetworksPayload(bool details);
+		void scheduleRestart(unsigned long delayMs);
+		void setOtaInProgress(bool inProgress);
 
 		String getHostname();
 		String getSSID();
@@ -27,7 +28,6 @@ class WifiManagerClass {
 		bool isConnected();
 
 	private:
-		AsyncWebServer _server;
 		Configuration& _config;
 
 		bool _connected;
@@ -52,12 +52,12 @@ class WifiManagerClass {
 
 		String getAvailableNetworks();
 		void requestRestart(unsigned long delayMs);
+		void cleanupBeforeRestart();
 		void pollNetworkScan();
 		void startNetworkScan();
 		void runNetworkScanTask();
 		static void networkScanTaskEntry(void* parameter);
 
 		bool waitForConnection();
-        bool acceptsCompressedResponse(AsyncWebServerRequest *request);
 };
 #endif

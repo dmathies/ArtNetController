@@ -1,19 +1,14 @@
 #include "WifiManager.h"
 
-#include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
-#include <SPIFFS.h>
 #include <WiFi.h>
-#include <Update.h>
-#include <esp_partition.h>
 #include <esp_wifi.h>
 
 #include "Configuration.h"
 
 WifiManagerClass::WifiManagerClass(Configuration& config)
-	: _server(80), 
-	  _config(config) {
+	: _config(config) {
 	_reconnectIntervalCheck = 5000;
 	_connectionTimeout = 10000;
 
@@ -32,11 +27,6 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 	_ssid = "";
 }
 
-AsyncWebServer& WifiManagerClass::getServer()
-{
-	return _server;
-}
-
 void WifiManagerClass::check() {
 	if (!_otaInProgress) {
 		pollNetworkScan();
@@ -44,6 +34,8 @@ void WifiManagerClass::check() {
 
 	if (_restartPending && millis() >= _restartAtMs) {
 		Serial.println("Restarting device...");
+		cleanupBeforeRestart();
+		delay(100);  // Give cleanup time to complete
 		ESP.restart();
 	}
 
@@ -62,9 +54,45 @@ void WifiManagerClass::check() {
 	}
 }
 
+String WifiManagerClass::getNetworksPayload(bool details) {
+	if (!_otaInProgress && !_scanInProgress && !_scanRequested && !_scanHasResult) {
+		startNetworkScan();
+	}
+	bool isScanning = _scanInProgress || _scanRequested || !_scanHasResult;
+
+	if (details) {
+		return String("{\"scanning\":") + (isScanning ? "true" : "false") + ",\"networks\":" + _networks + "}";
+	}
+
+	return _networks;
+}
+
+void WifiManagerClass::scheduleRestart(unsigned long delayMs) {
+	requestRestart(delayMs);
+}
+
+void WifiManagerClass::setOtaInProgress(bool inProgress) {
+	_otaInProgress = inProgress;
+}
+
 void WifiManagerClass::requestRestart(unsigned long delayMs) {
 	_restartPending = true;
 	_restartAtMs = millis() + delayMs;
+}
+
+void WifiManagerClass::cleanupBeforeRestart() {
+	Serial.println("Cleaning up WiFi and mDNS before restart...");
+	
+	// Stop mDNS responder
+	MDNS.end();
+	
+	// Disconnect from WiFi
+	WiFi.disconnect(true);  // true = turn off WiFi radio
+	
+	// Fully deinitialize WiFi driver
+	esp_wifi_deinit();
+	
+	Serial.println("Cleanup complete");
 }
 
 void WifiManagerClass::startNetworkScan() {
@@ -234,227 +262,6 @@ void WifiManagerClass::startManagementAP() {
 
 	Serial.println("Server IP Address:");
 	Serial.println(_ip);
-}
-
-void WifiManagerClass::startManagementServerWeb() {
-
-	_server
-		.serveStatic("/", SPIFFS, "/wifi-manager")
-		.setDefaultFile("index.html");
-
-	_server.on("/networks", HTTP_GET, [this](AsyncWebServerRequest *request) {
-		if (!_otaInProgress && !_scanInProgress && !_scanRequested && !_scanHasResult) {
-			startNetworkScan();
-		}
-		bool isScanning = _scanInProgress || _scanRequested || !_scanHasResult;
-
-		if (request->hasParam("details")) {
-			String payload = String("{\"scanning\":") + (isScanning ? "true" : "false") + ",\"networks\":" + _networks + "}";
-			request->send(200, "application/json", payload);
-		} else {
-			// Legacy response shape for older UI versions.
-			request->send(200, "application/json", _networks);
-		}
-	});
-
-	_server.on("/credentials", HTTP_PUT, [this](AsyncWebServerRequest *request) {
-		int params = request->params();
-
-		for (int i = 0; i < params; i++) {
-			AsyncWebParameter *param = (AsyncWebParameter*)(request->getParam(i));
-			if (!param->isPost()) continue; // body/form-data
-
-			const String &name = param->name();
-			const String &value = param->value();
-
-			if ((name == "ssid") && (!value.equals("Loading networks")))   {
-				_config.writeSSID(value.c_str());
-			} else if (name == "password") {
-				_config.writePass(value.c_str());
-			} else if (name == "hostname") {
-				_config.writeHostname(value.c_str());
-			} else if (name == "dmx_address") {
-				_config.writeDMXAddress(value.toInt());
-			} else if (name == "dmx_universe") {
-				_config.writeDMXUniverse(value.toInt());
-			}
-		}
-
-		request->send(204);
-		requestRestart(1000);
-	});
-
-	_server.on("/credentials", HTTP_GET, [=](AsyncWebServerRequest *request) {
-		StaticJsonDocument<256> doc;
-		doc["ssid"] = _config.getSSID();        // const char* or String is fine
-		doc["hostname"] = _config.getHostname();
-
-		// For safety, either omit or return empty password.
-		// If you really want to return it, uncomment next line:
-		doc["password"] = _config.getPass();
-//		doc["password"] = ""; // recommended
-	    doc["dmx_address"] = _config.getDMXAddress();   // e.g., 1..512
-	    doc["dmx_universe"]= _config.getDMXUniverse();  // e.g., 0..32767
-
-		String out;
-		serializeJson(doc, out);
-
-		AsyncWebServerResponse *res = request->beginResponse(200, "application/json", out);
-		res->addHeader("Cache-Control", "no-store");
-		request->send(res);
-	});
-
-	// ---- OTA Update endpoints ----
-	
-	// GET /update - returns OTA page/info
-	_server.on("/update", HTTP_GET, [](AsyncWebServerRequest *request) {
-		StaticJsonDocument<128> doc;
-		doc["version"] = "1.0.0";  // You can set your firmware version here
-		doc["device"] = "CableCar";
-		doc["ota_ready"] = true;
-		
-		String out;
-		serializeJson(doc, out);
-		
-		AsyncWebServerResponse *res = request->beginResponse(200, "application/json", out);
-		res->addHeader("Cache-Control", "no-store");
-		request->send(res);
-	});
-
-	// POST /update - handle firmware upload
-	_server.on("/update", HTTP_POST, 
-		[this](AsyncWebServerRequest *request) {
-			// This callback is called when ALL upload data has been received
-			bool success = (Update.hasError() == 0);
-			_otaInProgress = false;
-			AsyncWebServerResponse *res;
-			if (success) {
-				res = request->beginResponse(200, "application/json", "{\"success\": true, \"message\": \"Firmware updated. Device restarting...\"}");
-				res->addHeader("Cache-Control", "no-store");
-				request->send(res);
-				Serial.println("OTA Update successful, restart scheduled");
-				requestRestart(1000);
-			} else {
-				res = request->beginResponse(400, "application/json", "{\"success\": false, \"message\": \"Update failed\"}");
-				res->addHeader("Cache-Control", "no-store");
-				request->send(res);
-			}
-		},
-		[this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
-			_otaInProgress = true;
-			// Handle the upload
-			if (index == 0) {
-				// Start of upload
-				Serial.printf("Update Start: %s\n", filename.c_str());
-
-				// Begin OTA update - use U_FLASH for firmware
-				if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-					Update.printError(Serial);
-					Serial.println("OTA: Not enough space or other error");
-					_otaInProgress = false;
-					return;
-				}
-			}
-
-			// Write uploaded data
-			if (Update.write(data, len) != len) {
-				Update.printError(Serial);
-				Serial.println("OTA: Write failed");
-				_otaInProgress = false;
-				return;
-			}
-
-			// Check if upload is finished
-			if (final) {
-				if (Update.end(true)) {  // true = check MD5
-					Serial.printf("Update Success: %u bytes\n", index + len);
-				} else {
-					Update.printError(Serial);
-					Serial.println("OTA: Final check failed");
-				}
-				_otaInProgress = false;
-			}
-		}
-	);
-
-	// ---- SPIFFS Update endpoints ----
-	
-	// POST /updatefs - handle SPIFFS filesystem upload
-	_server.on("/updatefs", HTTP_POST, 
-		[this](AsyncWebServerRequest *request) {
-			// This callback is called when ALL upload data has been received
-			bool success = (Update.hasError() == 0);
-			_otaInProgress = false;
-			AsyncWebServerResponse *res;
-			if (success) {
-				res = request->beginResponse(200, "application/json", "{\"success\": true, \"message\": \"Filesystem updated. Device restarting...\"}");
-				res->addHeader("Cache-Control", "no-store");
-				request->send(res);
-				Serial.println("SPIFFS Update successful, restart scheduled");
-				requestRestart(1000);
-			} else {
-				res = request->beginResponse(400, "application/json", "{\"success\": false, \"message\": \"Update failed\"}");
-				res->addHeader("Cache-Control", "no-store");
-				request->send(res);
-			}
-		},
-		[this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
-			_otaInProgress = true;
-			// Handle the upload
-			if (index == 0) {
-				// Start of upload
-				Serial.printf("SPIFFS Update Start: %s\n", filename.c_str());
-
-				const esp_partition_t* spiffsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-				if (spiffsPart == NULL) {
-					Serial.println("SPIFFS OTA: Partition not found");
-					_otaInProgress = false;
-					return;
-				}
-
-				// Begin OTA update - use U_SPIFFS for filesystem
-				if (!Update.begin(spiffsPart->size, U_SPIFFS)) {
-					Update.printError(Serial);
-					Serial.println("SPIFFS OTA: Not enough space or other error");
-					_otaInProgress = false;
-					return;
-				}
-			}
-
-			// Write uploaded data
-			if (Update.write(data, len) != len) {
-				Update.printError(Serial);
-				Serial.println("SPIFFS OTA: Write failed");
-				_otaInProgress = false;
-				return;
-			}
-
-			// Check if upload is finished
-			if (final) {
-				if (Update.end(true)) {  // true = check MD5
-					Serial.printf("SPIFFS Update Success: %u bytes\n", index + len);
-				} else {
-					Update.printError(Serial);
-					Serial.println("SPIFFS OTA: Final check failed");
-				}
-				_otaInProgress = false;
-			}
-		}
-	);
-
-	_server.begin();
-}
-
-bool WifiManagerClass::acceptsCompressedResponse(AsyncWebServerRequest *request) {
-    if (request->hasHeader("Accept-Encoding")){
-        AsyncWebHeader* header = (AsyncWebHeader*)(request->getHeader("Accept-Encoding"));
-        String value = header->value();
-        bool hasGzip = value.indexOf("gzip") > -1;
-
-        return hasGzip;
-    }
-
-    return false;
 }
 
 String WifiManagerClass::getHostname() {
