@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Wifi Manager</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
+    <style>
+      html, body { height: 100%; }
+      html { background-color: #0f2027; }
+      body {
+        color: #fff; background: linear-gradient(#2c5364, #203a43, #0f2027);
+        margin: 0; font-family: Verdana, sans-serif; font-weight: 300;
+      }
+      body, #manager { display: flex; flex-direction: column; justify-content: center; align-items: center; }
+      button {
+        text-shadow: 0 1px #134a4666; text-transform: uppercase; color: #fff; cursor: pointer;
+        background-color: #7ab893; border: none; border-radius: 3px; margin-top: 12px; padding: 8px 14px;
+        font-family: Verdana, sans-serif; font-size: 11px; font-weight: 700;
+      }
+      h1 { margin: 0 0 20px; font-size: 22px; }
+      h2 { margin: 12px 0 6px; font-size: 16px; }
+      span { margin-bottom: 6px; display: flex; }
+      input, select, label { box-sizing: border-box; height: 34px; }
+      input, select {
+        width: 160px; text-indent: 8px; color: #377d6a; background: #efefef; border: 0; border-radius: 0 3px 3px 0;
+        outline: 0; font-family: Verdana, sans-serif; font-size: 11px; font-weight: 400;
+      }
+      input::-webkit-input-placeholder { color: #aaa; }
+      label {
+        width: 100px; text-transform: uppercase; color: #2a3b31; text-shadow: 0 1px #fff6; background: #7ab893;
+        border-radius: 3px 0 0 3px; padding: 10px 14px; font-size: 11px; font-weight: 700; display: inline-block;
+      }
+      #custom-ssid { display: none; }
+      #confirmation {
+        width: 275px; color: #2a3b31; background: #7ab893; border-radius: 3px; padding: 24px; font-size: 12px;
+        display: none; position: absolute; box-shadow: 0 3px 8px #0000003d;
+      }
+      #confirmation p:last-child { margin-bottom: 0; }
+      #loader {
+        width: 50px; height: 50px; border: 8px solid #efefef; border-right-color: #7ab893; border-radius: 50%;
+        animation: 2s linear infinite spinner; display: none;
+      }
+      @keyframes spinner { to { transform: rotate(1turn); } }
+      .section { margin-top: 8px; width: 260px; display: flex; flex-direction: column; align-items: center; }
+      #live {
+        display:flex; gap:12px; margin:10px 0 18px;
+        background:#ffffff22; padding:8px 12px; border-radius:6px;
+      }
+      #live strong { min-width: 48px; display:inline-block; text-align:right; }
+    </style>
+    <script>
+      async function pollStatus() {
+        try {
+          const res = await fetch("/status", { cache: "no-store" });
+          if (!res.ok) throw new Error();
+          const s = await res.json();
+          document.getElementById("src").innerText = s.source || "none";
+          document.getElementById("motor").innerText = s.motor_value ?? 0;
+          document.getElementById("dmxAge").innerText = s.dmx_age_ms ?? "-";
+          document.getElementById("artAge").innerText = s.art_age_ms ?? "-";
+        } catch {}
+      }
+      setInterval(pollStatus, 500);
+      document.addEventListener("DOMContentLoaded", pollStatus);
+
+      let initialCreds = null; // { ssid, password?, hostname, dmx_address, dmx_universe }
+
+      function optionExists(sel, value) {
+        for (const o of sel.options) if (o.value === value) return true;
+        return false;
+      }
+
+      async function loadCredentials() {
+        try {
+          const res = await fetch("/credentials", { method: "GET", cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const json = await res.json();
+
+          initialCreds = {
+            ssid: json.ssid || "",
+            password: json.password || "",
+            hostname: json.hostname || "",
+            dmx_address: (json.dmx_address ?? 1),
+            dmx_universe: (json.dmx_universe ?? 0)
+          };
+
+          // Pre-fill fields
+          document.getElementById("ssid").value = initialCreds.ssid || "";
+          document.getElementById("password").value = initialCreds.password || "";
+          document.getElementById("hostname").value = initialCreds.hostname || "";
+          document.getElementById("dmx-address").value = initialCreds.dmx_address;
+          document.getElementById("dmx-universe").value = initialCreds.dmx_universe;
+
+          // If the dropdown is ready, try to select the matching SSID
+          const sel = document.getElementById("network");
+          if (!sel.disabled && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
+            sel.value = initialCreds.ssid;
+            toggleCustomSsid(sel.value);
+          } else {
+            toggleCustomSsid(sel.value || "");
+          }
+        } catch (e) {
+          // If credentials fetch fails, at least allow manual SSID
+          toggleCustomSsid("");
+        }
+      }
+
+      async function fetchNetworks() {
+        const sel = document.getElementById("network");
+        try {
+          const res = await fetch("/networks", { method: "GET", cache: "no-store" });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const list = await res.json();
+
+          sel.disabled = false;
+          sel.remove(0); // remove "Loading networks"
+
+          if (Array.isArray(list) && list.length) {
+            for (const ssid of list) {
+              const opt = document.createElement("option");
+              opt.value = ssid;
+              opt.text = ssid;
+              sel.appendChild(opt);
+            }
+          }
+
+          // Always add the "Other" option
+          const other = document.createElement("option");
+          other.value = "";
+          other.text = "Other network";
+          sel.appendChild(other);
+
+          // Pick saved SSID if available
+          if (initialCreds && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
+            sel.value = initialCreds.ssid;
+          }
+          toggleCustomSsid(sel.value);
+        } catch (e) {
+          const loading = document.getElementById("network-loading");
+          if (loading) loading.innerText = "Unable to fetch networks";
+          showManualSsid();
+        }
+
+        sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+      }
+
+      function showManualSsid() {
+        document.getElementById("custom-ssid").style.display = "flex";
+      }
+
+      function toggleCustomSsid(selected) {
+        const custom = document.getElementById("custom-ssid");
+        const ssidInput = document.getElementById("ssid");
+        const show = selected.length ? "none" : "flex";
+        const value = selected.length ? selected : (initialCreds?.ssid || "");
+        custom.style.display = show;
+        ssidInput.value = value;
+      }
+
+      async function saveAndReboot() {
+        const manager = document.getElementById("manager");
+        const loader = document.getElementById("loader");
+        manager.style.display = "none";
+        loader.style.display = "inline";
+
+        try {
+          const fd = new FormData();
+          fd.append("ssid", document.getElementById("ssid").value);
+          fd.append("password", document.getElementById("password").value);
+          fd.append("hostname", document.getElementById("hostname").value);
+          fd.append("dmx_address", document.getElementById("dmx-address").value || "1");
+          fd.append("dmx_universe", document.getElementById("dmx-universe").value || "0");
+
+          const res = await fetch("/credentials", { method: "PUT", body: fd });
+          loader.style.display = "none";
+          if (res.status === 204) {
+            document.getElementById("confirmation").style.display = "inline";
+          } else {
+            restoreWithError();
+          }
+        } catch {
+          restoreWithError();
+        }
+      }
+
+      function restoreWithError() {
+        document.getElementById("manager").style.display = "flex";
+        document.getElementById("loader").style.display = "none";
+        setTimeout(() => alert("Error saving configuration"), 0);
+      }
+
+      document.addEventListener("DOMContentLoaded", () => {
+        document.getElementById("save").addEventListener("click", saveAndReboot);
+        // Load in parallel; each reconciles as needed
+        loadCredentials();
+        fetchNetworks();
+      });
+    </script>
+  </head>
+
+  <body>
+    <div id="live">
+      <span>Source: <strong id="src">-</strong></span>
+      <span>Motor: <strong id="motor">0</strong></span>
+      <span>DMX age: <strong id="dmxAge">-</strong> ms</span>
+      <span>Art-Net age: <strong id="artAge">-</strong> ms</span>
+    </div>    
+
+    <div id="manager">
+      <h1>Wifi Manager</h1>
+
+      <div class="section">
+        <h2>Wi-Fi</h2>
+        <span>
+          <label for="network">Network</label>
+          <select id="network" disabled>
+            <option id="network-loading">Loading networks</option>
+          </select>
+        </span>
+
+        <span id="custom-ssid">
+          <label for="ssid">WLAN SSID</label>
+          <input id="ssid" type="text" placeholder="Name of the network" />
+        </span>
+
+        <span>
+          <label for="password">Password</label>
+          <input id="password" type="password" placeholder="Only if required" />
+        </span>
+
+        <span>
+          <label for="hostname">Hostname</label>
+          <input id="hostname" type="text" placeholder="eg. 'my-esp32'" />
+        </span>
+      </div>
+
+      <div class="section">
+        <h2>DMX</h2>
+        <span>
+          <label for="dmx-address">Address</label>
+          <input id="dmx-address" type="number" min="1" max="512" step="1" inputmode="numeric" placeholder="1 - 512" />
+        </span>
+        <span>
+          <label for="dmx-universe">Universe</label>
+          <input id="dmx-universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
+        </span>
+      </div>
+
+      <button id="save">Save and restart</button>
+    </div>
+
+    <div id="loader"></div>
+
+    <div id="confirmation">
+      <h2>Credentials saved!</h2>
+      <p>The controller is now being restarted and will try to connect to the WiFi wi
