@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <WiFiUdp.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
@@ -36,6 +38,18 @@ struct MotorCmd {
   uint8_t value;
 };
 
+struct AppConfigCache {
+  uint16_t dmxStartAddress = 1;
+  uint16_t artnetUniverse = 0;
+};
+
+struct TaskMetrics {
+  uint32_t lastLoopMs = 0;
+  uint32_t windowStartUs = 0;
+  uint32_t busyUsAccum = 0;
+  uint16_t utilPermille = 0;
+};
+
 struct StatusSnapshot {
   uint8_t motorRaw = 0;
   uint8_t motorStep = 0;
@@ -45,9 +59,14 @@ struct StatusSnapshot {
   uint32_t artDmxUniverseMismatchTotal = 0;
   uint32_t artDmxInvalidTotal = 0;
   uint32_t artDmxLastArrivalMs = 0;
+  uint32_t controlTaskLastLoopMs = 0;
+  uint32_t motorTaskLastLoopMs = 0;
+  uint16_t controlTaskUtilPermille = 0;
+  uint16_t motorTaskUtilPermille = 0;
 };
 
 static TaskHandle_t motorTaskHandle = nullptr;
+static TaskHandle_t controlTaskHandle = nullptr;
 static QueueHandle_t motorQueue = nullptr;
 
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
@@ -66,6 +85,42 @@ static uint16_t artLastUniverseFlat = 0;
 static uint16_t artUdpLastPacketSize = 0;
 static uint16_t artUdpLastRemotePort = 0;
 static IPAddress artUdpLastRemoteIp(0, 0, 0, 0);
+static AppConfigCache g_cfg;
+static TaskMetrics g_controlTaskMetrics;
+static TaskMetrics g_motorTaskMetrics;
+
+static void recordTaskMetrics(TaskMetrics& metrics, uint32_t busyUs) {
+  uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
+
+  portENTER_CRITICAL(&statusMux);
+  if (metrics.windowStartUs == 0) {
+    metrics.windowStartUs = nowUs;
+  }
+
+  metrics.lastLoopMs = nowMs;
+  metrics.busyUsAccum += busyUs;
+
+  uint32_t elapsedUs = nowUs - metrics.windowStartUs;
+  if (elapsedUs >= 1000000UL) {
+    uint32_t permille = (metrics.busyUsAccum * 1000UL) / elapsedUs;
+    metrics.utilPermille = (uint16_t)(permille > 1000UL ? 1000UL : permille);
+    metrics.busyUsAccum = 0;
+    metrics.windowStartUs = nowUs;
+  }
+  portEXIT_CRITICAL(&statusMux);
+}
+
+static const char* taskStateToString(eTaskState state) {
+  switch (state) {
+    case eRunning: return "running";
+    case eReady: return "ready";
+    case eBlocked: return "blocked";
+    case eSuspended: return "suspended";
+    case eDeleted: return "deleted";
+    default: return "unknown";
+  }
+}
 
 static inline uint8_t rawToStep(uint8_t raw) {
   return (uint8_t)((((uint16_t)raw) * 60U + 127U) / 255U);
@@ -86,8 +141,10 @@ static void motorTask(void* parameter) {
   };
 
   for (;;) {
+    uint32_t workUs = 0;
     MotorCmd cmd;
     if (xQueueReceive(motorQueue, &cmd, pdMS_TO_TICKS(MOTOR_TASK_DELAY_MS)) == pdPASS) {
+      uint32_t t0 = micros();
       currentRaw = cmd.value;
       uint8_t step = rawToStep(currentRaw);
       bldc.sendSpeed(step);
@@ -96,9 +153,15 @@ static void motorTask(void* parameter) {
       g_motorRaw = currentRaw;
       g_motorStep = step;
       portEXIT_CRITICAL(&statusMux);
+      workUs += micros() - t0;
     }
 
+    uint32_t t1 = micros();
     bldc.poll();
+    workUs += micros() - t1;
+
+    // Queue wait time is idle time and must not be counted as task busy load.
+    recordTaskMetrics(g_motorTaskMetrics, workUs);
   }
 }
 
@@ -108,7 +171,7 @@ static void processArtnet(const ArtDmxPacket& a) {
   artLastUniverseFlat = a.universe_flat;
   portEXIT_CRITICAL(&statusMux);
 
-  uint16_t universe = appConfig().getDMXUniverse();
+  uint16_t universe = g_cfg.artnetUniverse;
   if (a.universe_flat != universe) {
     portENTER_CRITICAL(&statusMux);
     artDmxUniverseMismatchTotal++;
@@ -116,7 +179,7 @@ static void processArtnet(const ArtDmxPacket& a) {
     return;
   }
 
-  uint16_t channel = appConfig().getDMXAddress();
+  uint16_t channel = g_cfg.dmxStartAddress;
   if (channel < 1 || channel > a.length) return;
 
   uint8_t raw = a.data[channel - 1];
@@ -132,8 +195,8 @@ static void processArtnet(const ArtDmxPacket& a) {
 static void pollArtnet() {
   static uint8_t artbuf[600];
   static uint32_t lastRebindAttemptMs = 0;
-  static constexpr uint32_t ARTNET_IDLE_REBIND_MS = 3000;
-  static constexpr uint32_t ARTNET_REBIND_GUARD_MS = 1000;
+  static constexpr uint32_t ARTNET_IDLE_REBIND_MS = 10000;
+  static constexpr uint32_t ARTNET_REBIND_GUARD_MS = 3000;
   WiFiUDP& artudp = appArtnetUdp();
 
   uint32_t now = millis();
@@ -194,6 +257,16 @@ static void pollArtnet() {
   }
 }
 
+static void controlTask(void* parameter) {
+  (void)parameter;
+  for (;;) {
+    uint32_t busyStartUs = micros();
+    pollArtnet();
+    recordTaskMetrics(g_controlTaskMetrics, micros() - busyStartUs);
+    vTaskDelay(pdMS_TO_TICKS(CONTROL_TASK_DELAY_MS));
+  }
+}
+
 static StatusSnapshot readStatusSnapshot() {
   StatusSnapshot snapshot;
   portENTER_CRITICAL(&statusMux);
@@ -205,6 +278,10 @@ static StatusSnapshot readStatusSnapshot() {
   snapshot.artDmxUniverseMismatchTotal = artDmxUniverseMismatchTotal;
   snapshot.artDmxInvalidTotal = artDmxInvalidTotal;
   snapshot.artDmxLastArrivalMs = artDmxLastArrivalMs;
+  snapshot.controlTaskLastLoopMs = g_controlTaskMetrics.lastLoopMs;
+  snapshot.motorTaskLastLoopMs = g_motorTaskMetrics.lastLoopMs;
+  snapshot.controlTaskUtilPermille = g_controlTaskMetrics.utilPermille;
+  snapshot.motorTaskUtilPermille = g_motorTaskMetrics.utilPermille;
   portEXIT_CRITICAL(&statusMux);
   return snapshot;
 }
@@ -214,15 +291,31 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   StatusSnapshot s = readStatusSnapshot();
   uint32_t now = millis();
   uint32_t artAge = (s.lastArtMs == 0) ? 0xFFFFFFFFu : (now - s.lastArtMs);
+  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
   j["motor_value"] = s.motorRaw;
   j["motor_step"] = s.motorStep;
   j["wifi_rssi"] = appWifiManager().getRSSI();
+  j["hostname"] = appWifiManager().getHostname();
+  j["wifi_ip"] = appWifiManager().getIP().toString();
+  j["wifi_mac"] = appWifiManager().getMacAddress();
   j["free_heap"] = ESP.getFreeHeap();
   j["min_free_heap"] = ESP.getMinFreeHeap();
   j["reset_reason"] = appResetReasonToString(esp_reset_reason());
+  j["task_control_state"] = taskStateToString(eTaskGetState(controlTaskHandle));
+  j["task_control_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  j["task_control_last_ms_ago"] = (s.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.controlTaskLastLoopMs);
+  j["task_control_util_pct"] = (float)s.controlTaskUtilPermille / 10.0f;
+  j["task_motor_state"] = taskStateToString(eTaskGetState(motorTaskHandle));
+  j["task_motor_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(motorTaskHandle);
+  j["task_motor_last_ms_ago"] = (s.motorTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.motorTaskLastLoopMs);
+  j["task_motor_util_pct"] = (float)s.motorTaskUtilPermille / 10.0f;
+  j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
+  j["task_web_stack_hwm"] = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+  j["task_web_last_ms_ago"] = -1;
+  j["task_web_util_pct"] = -1;
 
   if (details) {
     j["art_rx_total"] = s.artDmxRxTotal;
@@ -300,6 +393,10 @@ void setup() {
     pinMode(UART_OE, OUTPUT);
     digitalWrite(UART_OE, LOW);
   }
+
+  g_cfg.dmxStartAddress = appConfig().getDMXAddress();
+  g_cfg.artnetUniverse = appConfig().getDMXUniverse();
+
   bldc.begin();
   bldc.sendSpeed(0);
 
@@ -308,7 +405,7 @@ void setup() {
     "CableCar BLDC",
     buildStatusJson,
     buildHealthSummary,
-    pollArtnet,
+    nullptr,
   });
 
   appConnectWifi();
@@ -316,6 +413,7 @@ void setup() {
 
   motorQueue = xQueueCreate(1, sizeof(MotorCmd));
   xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, nullptr, 2, &motorTaskHandle, 1);
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, nullptr, 1, &controlTaskHandle, 0);
 }
 
 void loop() {

@@ -28,6 +28,7 @@ WiFiUDP& appArtnetUdp();
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len);
 void appMarkArtnetActivity();
 uint32_t appGetLastArtnetMs();
+TaskHandle_t appGetWebServerTaskHandle();
 
 const char* appResetReasonToString(esp_reset_reason_t reason);
 

@@ -15,6 +15,12 @@ class Configuration {
 		const char *hostnamePath;
 		const char *dmx_addrPath;
 		const char *dmx_uniPath;
+		const char *dhcpPath;
+		const char *ipPath;
+		const char *gatewayPath;
+		const char *subnetPath;
+		const char *dns1Path;
+		const char *dns2Path;
 
 		bool fsInitialized;
 
@@ -26,12 +32,24 @@ class Configuration {
         void writeDMXAddress(int value);
         void writeDMXUniverse(int value);
         void writeHostname(const char *hostname);
+		void writeDhcpEnabled(bool enabled);
+		void writeStaticIP(const char *ip);
+		void writeGateway(const char *gateway);
+		void writeSubnet(const char *subnet);
+		void writeDNS1(const char *dns1);
+		void writeDNS2(const char *dns2);
 
         String getSSID();
 		String getPass();
 		String getHostname();
         int getDMXAddress();
         int getDMXUniverse();
+		bool getDhcpEnabled();
+		String getStaticIP();
+		String getGateway();
+		String getSubnet();
+		String getDNS1();
+		String getDNS2();
 };
 
 #endif

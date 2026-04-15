@@ -25,6 +25,14 @@ static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
 #define WEB_DEBUG_LOG 0
 #endif
 
+#ifndef HEALTH_LOG_ENABLE
+#define HEALTH_LOG_ENABLE 0
+#endif
+
+#ifndef FS_BENCHMARK_LOG_ENABLE
+#define FS_BENCHMARK_LOG_ENABLE 0
+#endif
+
 Configuration g_config;
 WifiManagerClass g_wifiManager(g_config);
 
@@ -37,6 +45,7 @@ static AppRuntimeHooks g_hooks = {
 };
 
 static httpd_handle_t g_webHttpd = nullptr;
+static TaskHandle_t g_webTaskHandle = nullptr;
 static WiFiUDP g_artudp;
 
 static portMUX_TYPE g_statusMux = portMUX_INITIALIZER_UNLOCKED;
@@ -398,13 +407,16 @@ static int wsCopyClients(int* out, int maxCount) {
 
 static esp_err_t wsSendStatusToClient(int fd) {
   if (!g_hooks.buildStatusJson) return ESP_FAIL;
-  char out[512];
-  size_t outLen = g_hooks.buildStatusJson(out, sizeof(out), false);
+  char* out = (char*)malloc(2048);
+  if (!out) return ESP_ERR_NO_MEM;
+  size_t outLen = g_hooks.buildStatusJson(out, 2048, false);
   httpd_ws_frame_t frame = {};
   frame.type = HTTPD_WS_TYPE_TEXT;
   frame.payload = (uint8_t*)out;
   frame.len = outLen;
-  return httpd_ws_send_frame_async(g_webHttpd, fd, &frame);
+  esp_err_t ret = httpd_ws_send_frame_async(g_webHttpd, fd, &frame);
+  free(out);
+  return ret;
 }
 
 static void wsBroadcastStatus() {
@@ -539,23 +551,30 @@ static esp_err_t networksHandler(httpd_req_t* req) {
 
 static esp_err_t credentialsGetHandler(httpd_req_t* req) {
   uint32_t startMs = millis();
-  StaticJsonDocument<256> doc;
+  DynamicJsonDocument doc(1024);
   int channel = g_config.getDMXAddress();
   int universe = g_config.getDMXUniverse();
   doc["ssid"] = g_config.getSSID();
   doc["hostname"] = g_config.getHostname();
   doc["password"] = g_config.getPass();
+  doc["dhcp"] = g_config.getDhcpEnabled();
+  doc["ip"] = g_config.getStaticIP();
+  doc["gateway"] = g_config.getGateway();
+  doc["subnet"] = g_config.getSubnet();
+  doc["dns1"] = g_config.getDNS1();
+  doc["dns2"] = g_config.getDNS2();
   doc["channel"] = channel;
   doc["universe"] = universe;
   doc["dmx_address"] = channel;
   doc["dmx_universe"] = universe;
 
-  char out[256];
-  size_t outLen = serializeJson(doc, out, sizeof(out));
+  String out;
+  out.reserve(512);
+  size_t outLen = serializeJson(doc, out);
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  esp_err_t ret = httpd_resp_send(req, out, outLen);
+  esp_err_t ret = httpd_resp_send(req, out.c_str(), outLen);
   logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500);
   return ret;
 }
@@ -593,7 +612,7 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     remaining -= read;
   }
 
-  StaticJsonDocument<384> doc;
+  DynamicJsonDocument doc(1024);
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     setCorsHeaders(req);
@@ -606,6 +625,12 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
   if (doc.containsKey("ssid")) g_config.writeSSID(doc["ssid"].as<const char*>());
   if (doc.containsKey("password")) g_config.writePass(doc["password"].as<const char*>());
   if (doc.containsKey("hostname")) g_config.writeHostname(doc["hostname"].as<const char*>());
+  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(doc["dhcp"].as<bool>());
+  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
+  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
+  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
+  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
+  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
 
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
@@ -749,6 +774,7 @@ static void startWebServer() {
   configHttp.max_uri_handlers = 24;
 
   if (httpd_start(&g_webHttpd, &configHttp) == ESP_OK) {
+    g_webTaskHandle = xTaskGetHandle("httpd");
     registerUri("/", HTTP_GET, indexHandler);
     registerUri("/index.html", HTTP_GET, indexHandler);
     registerUri("/ota.html", HTTP_GET, otaPageHandler);
@@ -773,6 +799,13 @@ static void startWebServer() {
   }
 }
 
+TaskHandle_t appGetWebServerTaskHandle() {
+  if (g_webTaskHandle == nullptr) {
+    g_webTaskHandle = xTaskGetHandle("httpd");
+  }
+  return g_webTaskHandle;
+}
+
 void appInitRuntime(const AppRuntimeHooks& hooks) {
   g_hooks = hooks;
 }
@@ -782,10 +815,12 @@ void appStartCommonServices() {
   WiFi.setSleep(false);
   g_artudp.begin(ARTNET_PORT);
 
+#if FS_BENCHMARK_LOG_ENABLE
   logFileReadPerf("/wifi-manager/index.html");
   logFileReadPerf("/wifi-manager/index_led.html");
   logFileReadPerf("/wifi-manager/settings.html");
   logFileReadPerf("/wifi-manager/ota.html");
+#endif
 }
 
 void appConnectWifi() {
@@ -807,6 +842,7 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
   g_wifiManager.check();
 
   uint32_t now = millis();
+#if HEALTH_LOG_ENABLE
   if (now - g_lastHealthLogMs >= HEALTH_LOG_INTERVAL_MS) {
     wl_status_t wifiStatus = WiFi.status();
     IPAddress ip = g_wifiManager.getIP();
@@ -837,6 +873,9 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
     }
     g_lastHealthLogMs = now;
   }
+#else
+  (void)g_lastHealthLogMs;
+#endif
 
   if (now - g_lastWsPushMs >= wsStatusPushMs) {
     wsBroadcastStatus();

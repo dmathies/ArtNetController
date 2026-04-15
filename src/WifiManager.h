@@ -22,6 +22,7 @@ class WifiManagerClass {
 
 		String getHostname();
 		String getSSID();
+		String getMacAddress();
 		int8_t getRSSI();
 		IPAddress getIP();
 

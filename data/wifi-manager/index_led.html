@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="UTF-8" />
-<title>Node Dashboard</title>
+<title>Cablecar Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
 <style>
       :root {
@@ -268,6 +268,21 @@
         font-size: 24px;
         font-weight: 800;
       }
+      .task-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.05);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
       .rssi-wrap {
         margin-top: 10px;
       }
@@ -307,6 +322,29 @@
         font-size: 11px;
         color: var(--muted);
         text-transform: uppercase;
+      .kv-pairs {
+        display: grid;
+        gap: 8px;
+      }
+      .kv-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .kv-key {
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 800;
+      }
+      .kv-val {
+        font-size: 16px;
+        font-weight: 800;
+        text-align: right;
+        word-break: break-word;
+      }
         letter-spacing: 0.08em;
         font-weight: 800;
       }
@@ -431,16 +469,56 @@
         return { percent, label: 'Weak' };
       }
 
+      function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.innerText = value;
+      }
+
+      function toInitCapHostname(hostname) {
+        if (typeof hostname !== 'string') return '';
+        return hostname
+          .replace(/[^a-zA-Z0-9]+/g, ' ')
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+          .join(' ');
+      }
+
+      function updateDashboardTitle(hostname) {
+        const base = toInitCapHostname(hostname) || 'Cablecar';
+        const title = `${base} Dashboard`;
+        setText('dashboardTitle', title);
+        document.title = title;
+      }
+
+      function formatTaskAge(msAgo) {
+        return isFinite(msAgo) && msAgo >= 0 ? `${Math.round(msAgo)} ms` : '-';
+      }
+
+      function formatTaskState(state) {
+        const s = typeof state === 'string' ? state.toLowerCase() : '';
+        if (s === 'running') return 'Running';
+        if (s === 'ready') return 'Ready';
+        if (s === 'blocked') return 'Waiting';
+        if (s === 'suspended') return 'Paused';
+        if (s === 'deleted') return 'Stopped';
+        return '-';
+      }
+
       let statusSocket = null;
       let wsConnected = false;
       let wsReconnectTimer = null;
       let statusPollInFlight = false;
       let statusPollTimer = null;
+      let lastStatusUpdateMs = 0;
       const STATUS_POLL_ACTIVE_MS = 3000;
       const STATUS_POLL_HIDDEN_MS = 5000;
       const STATUS_FETCH_TIMEOUT_MS = 3000;
+      const STATUS_WS_STALE_MS = 6000;
 
       function applyStatus(s) {
+        lastStatusUpdateMs = Date.now();
         for (let i = 0; i < 4; i++) {
           const raw = s['led_value' + i];
           const valueEl = document.getElementById('led-val-' + i);
@@ -454,19 +532,32 @@
         }
         const art = Number(s.art_age_ms ?? NaN);
         const wifiRssi = Number(s.wifi_rssi ?? NaN);
+        const wifiIp = typeof s.wifi_ip === 'string' && s.wifi_ip.length ? s.wifi_ip : '-';
+        const wifiMac = typeof s.wifi_mac === 'string' && s.wifi_mac.length ? s.wifi_mac : '-';
         const freeHeap = Number(s.free_heap ?? NaN);
         const minFreeHeap = Number(s.min_free_heap ?? NaN);
         const resetReason = typeof s.reset_reason === 'string' ? s.reset_reason : '-';
         const rssiInfo = getRssiInfo(wifiRssi);
+        updateDashboardTitle(s.hostname);
         document.getElementById('artAge').innerText = isFinite(art) ? art : '-';
         document.getElementById('artBadge').innerText = isFinite(art) && art < 2000 ? 'Live' : 'Idle';
         document.getElementById('wsBadge').innerText = wsConnected ? 'WebSocket' : 'Polling';
         document.getElementById('wifiRssi').innerText = isFinite(wifiRssi) ? `${wifiRssi} dBm` : '-';
+        document.getElementById('wifiIp').innerText = wifiIp;
+        document.getElementById('wifiMac').innerText = wifiMac;
         document.getElementById('wifiRssiMarker').style.left = `${rssiInfo.percent}%`;
         document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
         document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
         document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
         document.getElementById('resetReason').innerText = resetReason.replace(/_/g, ' ');
+        setText('controlTaskState', formatTaskState(s.task_control_state));
+        setText('controlTaskStack', isFinite(Number(s.task_control_stack_hwm ?? NaN)) ? `${Math.round(Number(s.task_control_stack_hwm))} words` : '-');
+        setText('controlTaskLast', formatTaskAge(Number(s.task_control_last_ms_ago ?? NaN)));
+        setText('controlTaskUtil', isFinite(Number(s.task_control_util_pct ?? NaN)) ? `${Number(s.task_control_util_pct).toFixed(1)}%` : '-');
+        setText('webTaskState', formatTaskState(s.task_web_state));
+        setText('webTaskStack', isFinite(Number(s.task_web_stack_hwm ?? NaN)) ? `${Math.round(Number(s.task_web_stack_hwm))} words` : '-');
+        setText('webTaskLast', formatTaskAge(Number(s.task_web_last_ms_ago ?? NaN)));
+        setText('webTaskUtil', isFinite(Number(s.task_web_util_pct ?? NaN)) ? `${Number(s.task_web_util_pct).toFixed(1)}%` : '-');
       }
 
       function scheduleNextStatusPoll(delayMs) {
@@ -513,8 +604,12 @@
 
       async function pollStatus() {
         if (wsConnected) {
-          scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
-          return;
+          if (lastStatusUpdateMs > 0 && (Date.now() - lastStatusUpdateMs) > STATUS_WS_STALE_MS) {
+            // If WS appears stuck but still open, use HTTP poll as a recovery path.
+          } else {
+            scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
+            return;
+          }
         }
         if (statusPollInFlight) {
           scheduleNextStatusPoll(STATUS_POLL_ACTIVE_MS);
@@ -573,7 +668,7 @@
 </svg></div>
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
-          <h1>ESP32 Node Dashboard</h1>
+          <h1 id="dashboardTitle">Cablecar Dashboard</h1>
           <p class="subtitle">Embedded lighting controller</p>
         </div>
       </div>
@@ -617,11 +712,21 @@
         <article class="card">
           <div class="card-inner">
             <h2 class="card-title">System</h2>
-            <div class="meta-grid" style="margin-top:16px;">
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
               <div class="meta"><span class="label">Wi-Fi RSSI</span><div id="wifiRssi" class="value mono">-</div><div class="rssi-wrap"><div class="rssi-bar"><div id="wifiRssiMarker" class="rssi-marker"></div></div><div class="rssi-scale"><span>Weak</span><span>Fair</span><span>Good</span></div><div id="wifiRssiQuality" class="rssi-note">Unknown</div></div></div>
-              <div class="meta"><span class="label">Free Heap</span><div id="freeHeap" class="value mono">-</div></div>
-              <div class="meta"><span class="label">Min Free Heap</span><div id="minFreeHeap" class="value mono">-</div></div>
+              <div class="meta"><span class="label">Network</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">IP</span><span id="wifiIp" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MAC</span><span id="wifiMac" class="kv-val mono">-</span></div></div></div>
+              <div class="meta"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div></div></div>
               <div class="meta"><span class="label">Reset Reason</span><div id="resetReason" class="value">-</div></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-inner">
+            <h2 class="card-title">Tasks</h2>
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(2, minmax(0, 1fr));">
+              <div class="meta"><span class="label">Art-Net Task</span><div id="controlTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="controlTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="controlTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="controlTaskStack" class="mono">-</span></div></div>
+              <div class="meta"><span class="label">Web Task</span><div id="webTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="webTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="webTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="webTaskStack" class="mono">-</span></div></div>
             </div>
           </div>
         </article>

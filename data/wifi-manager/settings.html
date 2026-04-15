@@ -434,6 +434,12 @@
             ssid: json.ssid || "",
             password: json.password || "",
             hostname: json.hostname || "",
+            dhcp: (typeof json.dhcp === 'boolean') ? json.dhcp : true,
+            ip: json.ip || "",
+            gateway: json.gateway || "",
+            subnet: json.subnet || "",
+            dns1: json.dns1 || "",
+            dns2: json.dns2 || "",
             channel: (json.channel ?? json.dmx_address ?? 1),
             universe: (json.universe ?? json.dmx_universe ?? 0)
           };
@@ -441,8 +447,15 @@
           document.getElementById("ssid").value = initialCreds.ssid || "";
           document.getElementById("password").value = initialCreds.password || "";
           document.getElementById("hostname").value = initialCreds.hostname || "";
+          document.getElementById("ip_mode").value = initialCreds.dhcp ? "dhcp" : "static";
+          document.getElementById("static_ip").value = initialCreds.ip || "";
+          document.getElementById("gateway").value = initialCreds.gateway || "";
+          document.getElementById("subnet").value = initialCreds.subnet || "";
+          document.getElementById("dns1").value = initialCreds.dns1 || "";
+          document.getElementById("dns2").value = initialCreds.dns2 || "";
           document.getElementById("channel").value = initialCreds.channel;
           document.getElementById("universe").value = initialCreds.universe;
+          toggleIpMode(document.getElementById("ip_mode").value);
 
           const sel = document.getElementById("network");
           if (!sel.disabled && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
@@ -452,8 +465,15 @@
             toggleCustomSsid(sel.value || "");
           }
         } catch (e) {
+          toggleIpMode(document.getElementById("ip_mode").value);
           toggleCustomSsid("");
         }
+      }
+
+      function toggleIpMode(mode) {
+        const wrap = document.getElementById("static-ip-fields");
+        if (!wrap) return;
+        wrap.style.display = mode === "static" ? "grid" : "none";
       }
 
       function renderNetworks(list) {
@@ -559,10 +579,30 @@
         if (loaderWrap) loaderWrap.style.display = "flex";
 
         try {
+          const ipMode = document.getElementById("ip_mode").value;
+          const dhcp = ipMode !== "static";
+          const ip = document.getElementById("static_ip").value.trim();
+          const gateway = document.getElementById("gateway").value.trim();
+          const subnet = document.getElementById("subnet").value.trim();
+          const dns1 = document.getElementById("dns1").value.trim();
+          const dns2 = document.getElementById("dns2").value.trim();
+
+          if (!dhcp && (!ip || !gateway || !subnet)) {
+            if (loaderWrap) loaderWrap.style.display = "none";
+            setTimeout(() => alert("Static IPv4 requires IP, gateway and subnet."), 0);
+            return;
+          }
+
           const payload = {
             ssid: document.getElementById("ssid").value,
             password: document.getElementById("password").value,
             hostname: document.getElementById("hostname").value,
+            dhcp,
+            ip,
+            gateway,
+            subnet,
+            dns1,
+            dns2,
             channel: Number(document.getElementById("channel").value || "1"),
             universe: Number(document.getElementById("universe").value || "0")
           };
@@ -593,7 +633,9 @@
       document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("save").addEventListener("click", saveAndReboot);
         document.getElementById("refresh-networks").addEventListener("click", refreshNetworks);
+        document.getElementById("ip_mode").addEventListener("change", (e) => toggleIpMode(e.target.value));
         initNetworkSelector();
+        toggleIpMode(document.getElementById("ip_mode").value);
         loadCredentials();
       });
 
@@ -684,6 +726,44 @@
               <div class="field">
                 <label for="universe">Universe</label>
                 <input id="universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
+              </div>
+            </div>
+          </section>
+
+          <section class="section">
+            <div class="section-head">
+              <h2 class="section-title">IPv4</h2>
+            </div>
+            <div class="field-grid">
+              <div class="field">
+                <label for="ip_mode">Address Mode</label>
+                <select id="ip_mode">
+                  <option value="dhcp">DHCP</option>
+                  <option value="static">Fixed IP</option>
+                </select>
+              </div>
+
+              <div id="static-ip-fields" style="display:none; gap:12px;">
+                <div class="field">
+                  <label for="static_ip">IP Address</label>
+                  <input id="static_ip" type="text" placeholder="192.168.1.50" />
+                </div>
+                <div class="field">
+                  <label for="gateway">Gateway</label>
+                  <input id="gateway" type="text" placeholder="192.168.1.1" />
+                </div>
+                <div class="field">
+                  <label for="subnet">Subnet Mask</label>
+                  <input id="subnet" type="text" placeholder="255.255.255.0" />
+                </div>
+                <div class="field">
+                  <label for="dns1">DNS 1</label>
+                  <input id="dns1" type="text" placeholder="8.8.8.8" />
+                </div>
+                <div class="field">
+                  <label for="dns2">DNS 2</label>
+                  <input id="dns2" type="text" placeholder="1.1.1.1" />
+                </div>
               </div>
             </div>
           </section>

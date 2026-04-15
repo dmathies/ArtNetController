@@ -209,8 +209,40 @@ bool WifiManagerClass::connectToWifi() {
 	_networks = "[]";
 	_scanHasResult = false;
 
-	// Fixes issue with mDNS where hostname was not set (v1.0.1) and mDNS crashed (v1.0.2)
-	WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
+	bool useDhcp = _config.getDhcpEnabled();
+	if (useDhcp) {
+		// Keep DHCP behavior for backward compatibility.
+		WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
+	} else {
+		IPAddress ip;
+		IPAddress gateway;
+		IPAddress subnet;
+		IPAddress dns1;
+		IPAddress dns2;
+		String ipStr = _config.getStaticIP();
+		String gwStr = _config.getGateway();
+		String subnetStr = _config.getSubnet();
+		String dns1Str = _config.getDNS1();
+		String dns2Str = _config.getDNS2();
+
+		bool validRequired = ip.fromString(ipStr) && gateway.fromString(gwStr) && subnet.fromString(subnetStr);
+		bool validDns1 = dns1.fromString(dns1Str);
+		bool validDns2 = dns2.fromString(dns2Str);
+		if (!validDns1) dns1 = INADDR_NONE;
+		if (!validDns2) dns2 = INADDR_NONE;
+
+		if (validRequired) {
+			if (!WiFi.config(ip, gateway, subnet, dns1, dns2)) {
+				Serial.println("Static IP config failed, falling back to DHCP");
+				WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
+			} else {
+				Serial.println("Using static IPv4 configuration");
+			}
+		} else {
+			Serial.println("Invalid static IPv4 settings, falling back to DHCP");
+			WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
+		}
+	}
 
 	if (_hostname != "") {
 		WiFi.setHostname(_hostname.c_str());
@@ -281,6 +313,14 @@ String WifiManagerClass::getHostname() {
 
 String WifiManagerClass::getSSID() {
 	return _ssid;
+}
+
+String WifiManagerClass::getMacAddress() {
+	String mac = WiFi.macAddress();
+	if (mac == "" || mac == "00:00:00:00:00:00") {
+		mac = WiFi.softAPmacAddress();
+	}
+	return mac;
 }
 
 int8_t WifiManagerClass::getRSSI() {
