@@ -1,11 +1,11 @@
 #ifndef CONFIGURATION_H
 #define CONFIGURATION_H
 
-#include <SPIFFS.h>
+#include <LittleFS.h>
 
 class Configuration {
 	protected:
-		void initSPIFFS();
+		void initFileSystem();
 
 		void writeFile(fs::FS &fs, const char *path, const char *message);
 		String readFile(fs::FS &fs, const char *path);

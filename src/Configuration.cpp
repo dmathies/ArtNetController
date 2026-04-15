@@ -1,6 +1,6 @@
 #include "Configuration.h"
 
-#include <SPIFFS.h>
+#include <LittleFS.h>
 
 Configuration::Configuration() {
 	// File paths to save input values permanently
@@ -13,67 +13,67 @@ Configuration::Configuration() {
 	fsInitialized = false;
 }
 
-void Configuration::initSPIFFS() {
+void Configuration::initFileSystem() {
 	if (fsInitialized) {
 		return;
 	}
 
 	fsInitialized = true;
 
-	if (!SPIFFS.begin(true)) {
-		Serial.println("An error has occurred while mounting SPIFFS");
+	if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+		Serial.println("An error has occurred while mounting LittleFS");
 		return;
 	}
 
-	Serial.println("SPIFFS mounted successfully");
+	Serial.println("LittleFS mounted successfully");
 }
 
 void Configuration::writeSSID(const char *ssid) {
-	writeFile(SPIFFS, ssidPath, ssid);
+	writeFile(LittleFS, ssidPath, ssid);
 }
 
 void Configuration::writePass(const char *pass) {
-	writeFile(SPIFFS, passPath, pass);
+	writeFile(LittleFS, passPath, pass);
 }
 
 void Configuration::writeHostname(const char *hostname) {
-	writeFile(SPIFFS, hostnamePath, hostname);
+	writeFile(LittleFS, hostnamePath, hostname);
 }
 
 void Configuration::writeDMXAddress(int value) {
-	writeFile(SPIFFS, dmx_addrPath, String(value).c_str());
+	writeFile(LittleFS, dmx_addrPath, String(value).c_str());
 }
 
 void Configuration::writeDMXUniverse(int value) {
-	writeFile(SPIFFS, dmx_uniPath, String(value).c_str());
+	writeFile(LittleFS, dmx_uniPath, String(value).c_str());
 }
 
 String Configuration::getSSID() {
-	return readFile(SPIFFS, ssidPath);
+	return readFile(LittleFS, ssidPath);
 }
 
 String Configuration::getPass() {
-	String pass = readFile(SPIFFS, passPath);
+	String pass = readFile(LittleFS, passPath);
 	return pass;
 }
 
 String Configuration::getHostname() {
-	return readFile(SPIFFS, hostnamePath);
+	return readFile(LittleFS, hostnamePath);
 }
 
 int Configuration::getDMXAddress() {
-	String value = readFile(SPIFFS, dmx_addrPath);
+	String value = readFile(LittleFS, dmx_addrPath);
 	return atoi(value.c_str());
 }
 
 int Configuration::getDMXUniverse() {
-	String value = readFile(SPIFFS, dmx_uniPath);
+	String value = readFile(LittleFS, dmx_uniPath);
 	return atoi(value.c_str());
 }
 
-// Read File from SPIFFS
+// Read file from LittleFS
 String Configuration::readFile(fs::FS &fs, const char *path) {
-	initSPIFFS();
+	initFileSystem();
 
 	File file = fs.open(path);
 	if (!file || file.isDirectory()) {
@@ -84,9 +84,9 @@ String Configuration::readFile(fs::FS &fs, const char *path) {
 	return fileContent;
 }
 
-// Write file to SPIFFS
+// Write file to LittleFS
 void Configuration::writeFile(fs::FS &fs, const char *path, const char *message) {
-	initSPIFFS();
+	initFileSystem();
 
 	File file = fs.open(path, FILE_WRITE);
 	if (!file) {

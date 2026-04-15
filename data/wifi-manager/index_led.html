@@ -441,10 +441,17 @@
       const STATUS_FETCH_TIMEOUT_MS = 3000;
 
       function applyStatus(s) {
-        const motorValue = Number(s.motor_value ?? NaN);
-        const motorValueEl = document.getElementById('motorValue');
-        if (motorValueEl) motorValueEl.innerText = isFinite(motorValue) ? String(Math.round(motorValue)) : '-';
-
+        for (let i = 0; i < 4; i++) {
+          const raw = s['led_value' + i];
+          const valueEl = document.getElementById('led-val-' + i);
+          const fillEl = document.getElementById('led-fill-' + i);
+          if (typeof raw !== 'undefined') {
+            const num = Number(raw);
+            const clamped = isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;
+            if (valueEl) valueEl.innerText = isFinite(num) ? num.toFixed(3) : String(raw);
+            if (fillEl) fillEl.style.width = (clamped * 100).toFixed(1) + '%';
+          }
+        }
         const art = Number(s.art_age_ms ?? NaN);
         const wifiRssi = Number(s.wifi_rssi ?? NaN);
         const freeHeap = Number(s.free_heap ?? NaN);
@@ -566,8 +573,8 @@
 </svg></div>
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
-          <h1>ESP32 BLDC Dashboard</h1>
-          <p class="subtitle">Single-channel Art-Net motor controller</p>
+          <h1>ESP32 Node Dashboard</h1>
+          <p class="subtitle">Embedded lighting controller</p>
         </div>
       </div>
       <div class="toolbar">
@@ -623,12 +630,12 @@
       <aside class="stack">
         <article class="card">
           <div class="card-inner">
-            <h2 class="card-title">BLDC Output</h2>
-            <div class="meta-grid" style="margin-top:16px;grid-template-columns:1fr;">
-              <div class="meta">
-                <span class="label">Output Value</span>
-                <div id="motorValue" class="value mono">0</div>
-              </div>
+            <h2 class="card-title">LED Output</h2>
+            <div class="status-grid" style="margin-top:16px;">
+              <div class="status-row"><div class="label">LED 0</div><div class="meter"><div id="led-fill-0" class="meter-fill"></div></div><div id="led-val-0" class="meter-value mono">0.000</div></div>
+              <div class="status-row"><div class="label">LED 1</div><div class="meter"><div id="led-fill-1" class="meter-fill"></div></div><div id="led-val-1" class="meter-value mono">0.000</div></div>
+              <div class="status-row"><div class="label">LED 2</div><div class="meter"><div id="led-fill-2" class="meter-fill"></div></div><div id="led-val-2" class="meter-value mono">0.000</div></div>
+              <div class="status-row"><div class="label">LED 3</div><div class="meter"><div id="led-fill-3" class="meter-fill"></div></div><div id="led-val-3" class="meter-value mono">0.000</div></div>
             </div>
           </div>
         </article>

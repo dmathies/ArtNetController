@@ -16,7 +16,7 @@ class WifiManagerClass {
 		void startManagementAP();
 
 		void check();
-		String getNetworksPayload(bool details);
+		String getNetworksPayload(bool details, bool refresh);
 		void scheduleRestart(unsigned long delayMs);
 		void setOtaInProgress(bool inProgress);
 
@@ -26,6 +26,10 @@ class WifiManagerClass {
 		IPAddress getIP();
 
 		bool isConnected();
+		uint32_t getReconnectAttempts() const;
+		uint32_t getReconnectSuccesses() const;
+		uint32_t getLastReconnectAttemptMs() const;
+		uint32_t getLastReconnectSuccessMs() const;
 
 	private:
 		Configuration& _config;
@@ -49,6 +53,10 @@ class WifiManagerClass {
 		bool _scanHasResult;
 		bool _otaInProgress;
 		TaskHandle_t _scanTaskHandle;
+		uint32_t _reconnectAttempts;
+		uint32_t _reconnectSuccesses;
+		uint32_t _lastReconnectAttemptMs;
+		uint32_t _lastReconnectSuccessMs;
 
 		String getAvailableNetworks();
 		void requestRestart(unsigned long delayMs);

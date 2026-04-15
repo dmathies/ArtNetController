@@ -21,6 +21,10 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 	_scanHasResult = false;
 	_otaInProgress = false;
 	_scanTaskHandle = nullptr;
+	_reconnectAttempts = 0;
+	_reconnectSuccesses = 0;
+	_lastReconnectAttemptMs = 0;
+	_lastReconnectSuccessMs = 0;
 
 	_networks = "";
 	_hostname = "";
@@ -28,8 +32,11 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 }
 
 void WifiManagerClass::check() {
-	if (!_otaInProgress) {
-		pollNetworkScan();
+	if (!_connected && WiFi.status() == WL_CONNECTED) {
+		_connected = true;
+		_reconnectSuccesses++;
+		_lastReconnectSuccessMs = millis();
+		Serial.println("WiFi reconnected");
 	}
 
 	if (_restartPending && millis() >= _restartAtMs) {
@@ -44,21 +51,23 @@ void WifiManagerClass::check() {
 			_connected = false;
 
 			Serial.println("WiFi connection lost. Attempting to reconnect.");
+			_reconnectAttempts++;
+			_lastReconnectAttemptMs = millis();
 
 			WiFi.reconnect();
-
-			waitForConnection();
 		}
 
 		_nextReconnectCheck = millis() + _reconnectIntervalCheck;
 	}
 }
 
-String WifiManagerClass::getNetworksPayload(bool details) {
-	if (!_otaInProgress && !_scanInProgress && !_scanRequested && !_scanHasResult) {
-		startNetworkScan();
+String WifiManagerClass::getNetworksPayload(bool details, bool refresh) {
+	if (!_otaInProgress && refresh) {
+		_networks = getAvailableNetworks();
+		_scanHasResult = true;
 	}
-	bool isScanning = _scanInProgress || _scanRequested || !_scanHasResult;
+
+	bool isScanning = false;
 
 	if (details) {
 		return String("{\"scanning\":") + (isScanning ? "true" : "false") + ",\"networks\":" + _networks + "}";
@@ -108,7 +117,7 @@ void WifiManagerClass::networkScanTaskEntry(void* parameter) {
 }
 
 void WifiManagerClass::runNetworkScanTask() {
-	_networks = getAvailableNetworks();
+	// _networks = getAvailableNetworks();
 	_scanInProgress = false;
 	_scanHasResult = true;
 	_scanTaskHandle = nullptr;
@@ -236,6 +245,8 @@ bool WifiManagerClass::waitForConnection() {
 
 			return false;
 		}
+
+		delay(20);
 	}
 
 	_ip = WiFi.localIP();
@@ -282,4 +293,20 @@ IPAddress WifiManagerClass::getIP() {
 
 bool WifiManagerClass::isConnected() {
 	return _connected;
+}
+
+uint32_t WifiManagerClass::getReconnectAttempts() const {
+	return _reconnectAttempts;
+}
+
+uint32_t WifiManagerClass::getReconnectSuccesses() const {
+	return _reconnectSuccesses;
+}
+
+uint32_t WifiManagerClass::getLastReconnectAttemptMs() const {
+	return _lastReconnectAttemptMs;
+}
+
+uint32_t WifiManagerClass::getLastReconnectSuccessMs() const {
+	return _lastReconnectSuccessMs;
 }

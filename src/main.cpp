@@ -2,68 +2,99 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_http_server.h>
-#include <SPIFFS.h>
+#include <LittleFS.h>
 #include <Update.h>
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <ArduinoJson.h>
 #include <cstring>
-#include "WifiManager.h"
-#include "esp_dmx.h"
-#include "bldc_uart.h"
 
-Configuration config;
-WifiManagerClass WifiManager(config);
+#include "main_common.h"
 
-static constexpr int CH1 = 1;
-static constexpr int CH2 = 2;
-static constexpr int CH3 = 3;
-static constexpr int CH4 = 21;
-
-const int LEDC_RES_BITS = 12;
-const int LEDC_MAX_DUTY = (1 << LEDC_RES_BITS) - 1;
-const int LEDC_FREQ_HZ = 1000;
-static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
-static constexpr uint32_t WS_STATUS_PUSH_MS = 250;
-static constexpr int MAX_WS_CLIENTS = 6;
-
-float currentValues[4];
-static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
-static TaskHandle_t controlTaskHandle = nullptr;
-static portMUX_TYPE wsClientMux = portMUX_INITIALIZER_UNLOCKED;
-static int wsClientFds[MAX_WS_CLIENTS] = { -1, -1, -1, -1, -1, -1 };
-static uint32_t lastWsPushMs = 0;
-
-static constexpr dmx_port_t DMX_PORT = DMX_NUM_1;
-static uint8_t dmx_buf[DMX_PACKET_SIZE];
-
-struct AppConfig {
-  uint16_t dmx_start_address = config.getDMXAddress();
-  uint16_t artnet_universe = config.getDMXUniverse();
-} CFG;
-
-WiFiUDP artudp;
 static constexpr uint16_t ARTNET_PORT = 6454;
+static constexpr int MAX_WS_CLIENTS = 6;
+static constexpr uint32_t SLOW_HTTP_MS = 100;
+static constexpr uint32_t SLOW_WS_BROADCAST_MS = 50;
+static constexpr uint32_t SLOW_FS_SEND_MS = 500;
+static constexpr uint32_t SLOW_FS_TOTAL_MS = 1000;
+static constexpr size_t HTTP_FILE_CHUNK_SIZE = 1024;
+static constexpr size_t HTTP_FILE_DIRECT_SEND_LIMIT = 32768;
+static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
 
-struct ArtDmxPacket {
-  bool ok = false;
-  uint16_t universe_flat = 0;
-  uint16_t length = 0;
-  const uint8_t* data = nullptr;
+#ifndef WEB_DEBUG_LOG
+#define WEB_DEBUG_LOG 0
+#endif
+
+Configuration g_config;
+WifiManagerClass g_wifiManager(g_config);
+
+static AppRuntimeHooks g_hooks = {
+  "/wifi-manager/index.html",
+  "CableCar",
+  nullptr,
+  nullptr,
+  nullptr,
 };
 
-static ArtDmxPacket parseArtDmx(const uint8_t* p, int len) {
+static httpd_handle_t g_webHttpd = nullptr;
+static WiFiUDP g_artudp;
+
+static portMUX_TYPE g_statusMux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t g_lastArtMs = 0;
+
+static portMUX_TYPE g_wsClientMux = portMUX_INITIALIZER_UNLOCKED;
+static int g_wsClientFds[MAX_WS_CLIENTS] = {-1, -1, -1, -1, -1, -1};
+static uint32_t g_lastWsPushMs = 0;
+static uint32_t g_lastHealthLogMs = 0;
+static portMUX_TYPE g_fileSendMux = portMUX_INITIALIZER_UNLOCKED;
+static int g_activeFileSends = 0;
+
+static void logFileReadPerf(const char* path) {
+  File f = LittleFS.open(path, FILE_READ);
+  if (!f || f.isDirectory()) {
+    Serial.printf("[FS] open failed: %s\n", path);
+    return;
+  }
+
+  const size_t size = f.size();
+  uint8_t buf[1024];
+  size_t total = 0;
+  const uint32_t start = millis();
+
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    total += n;
+  }
+
+  const uint32_t elapsed = millis() - start;
+  f.close();
+  Serial.printf("[FS] read %s %lu/%lu B in %lu ms\n",
+                path,
+                (unsigned long)total,
+                (unsigned long)size,
+                (unsigned long)elapsed);
+}
+
+Configuration& appConfig() { return g_config; }
+WifiManagerClass& appWifiManager() { return g_wifiManager; }
+WiFiUDP& appArtnetUdp() { return g_artudp; }
+
+ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
   ArtDmxPacket r;
   if (len < 18) return r;
   if (memcmp(p, "Art-Net\0", 8) != 0) return r;
   if (!(p[8] == 0x00 && p[9] == 0x50)) return r;
+
   uint8_t subUni = p[14];
   uint8_t net = p[15];
   uint16_t dlen = ((uint16_t)p[16] << 8) | p[17];
   if (dlen > 512 || 18 + dlen > len) return r;
+
   uint8_t subnet = (subUni >> 4) & 0x0F;
-  uint8_t uni = (subUni) & 0x0F;
+  uint8_t uni = subUni & 0x0F;
   uint16_t flat = ((uint16_t)net << 8) | ((uint16_t)subnet << 4) | uni;
+
   r.ok = true;
   r.universe_flat = flat;
   r.length = dlen;
@@ -71,196 +102,21 @@ static ArtDmxPacket parseArtDmx(const uint8_t* p, int len) {
   return r;
 }
 
-enum class Source { None, DMX, Artnet };
-static uint32_t lastDmxMs = 0, lastArtMs = 0;
-static constexpr uint32_t SOURCE_HOLD_MS = 1000;
-
-struct StatusSnapshot {
-  float ledValues[4];
-  uint32_t lastDmxMs;
-  uint32_t lastArtMs;
-  uint32_t artUdpPacketsTotal;
-  uint32_t artUdpBytesTotal;
-  uint32_t artNetPacketsTotal;
-  uint32_t artPollTotal;
-  uint32_t artPollReplyTotal;
-  uint32_t artSyncTotal;
-  uint32_t artOtherOpcodeTotal;
-  uint32_t artDmxRxTotal;
-  uint32_t artDmxUniverseMatchTotal;
-  uint32_t artDmxUniverseMismatchTotal;
-  uint32_t artDmxInvalidTotal;
-  uint32_t artDmxTruncatedTotal;
-  uint32_t artDmxLastArrivalMs;
-  uint32_t artDmxLastSecondRate;
-  uint32_t artDmxMaxGapMs;
-  uint32_t artLastSourceIp;
-  uint16_t artLastSourcePort;
-  uint32_t artMatchSourceIp;
-  uint16_t artMatchSourcePort;
-  uint32_t artSourceChangeTotal;
-  uint32_t artPacketsLastLoop;
-  uint32_t artPacketsMaxLoop;
-  uint32_t controlLoopLastUs;
-  uint32_t controlLoopMaxUs;
-  uint32_t controlLoopOver10ms;
-};
-
-static httpd_handle_t webHttpd = nullptr;
-
-static uint32_t artDmxRxTotal = 0;
-static uint32_t artDmxUniverseMatchTotal = 0;
-static uint32_t artDmxUniverseMismatchTotal = 0;
-static uint32_t artDmxInvalidTotal = 0;
-static uint32_t artDmxTruncatedTotal = 0;
-static uint32_t artDmxLastArrivalMs = 0;
-static uint32_t artDmxLastSecondStartMs = 0;
-static uint32_t artDmxThisSecond = 0;
-static uint32_t artDmxLastSecondRate = 0;
-static uint32_t artDmxMaxGapMs = 0;
-static uint32_t artUdpPacketsTotal = 0;
-static uint32_t artUdpBytesTotal = 0;
-static uint32_t artNetPacketsTotal = 0;
-static uint32_t artPollTotal = 0;
-static uint32_t artPollReplyTotal = 0;
-static uint32_t artSyncTotal = 0;
-static uint32_t artOtherOpcodeTotal = 0;
-static uint32_t artLastSourceIp = 0;
-static uint16_t artLastSourcePort = 0;
-static uint32_t artMatchSourceIp = 0;
-static uint16_t artMatchSourcePort = 0;
-static uint32_t artSourceChangeTotal = 0;
-
-static uint32_t artPacketsLastLoop = 0;
-static uint32_t artPacketsMaxLoop = 0;
-static uint32_t controlLoopLastUs = 0;
-static uint32_t controlLoopMaxUs = 0;
-static uint32_t controlLoopOver10ms = 0;
-
-static void recordArtUdpPacketMeta(size_t packetLen, uint32_t sourceIp, uint16_t sourcePort) {
-  portENTER_CRITICAL(&statusMux);
-  artUdpPacketsTotal++;
-  artUdpBytesTotal += packetLen;
-  if (artLastSourceIp != 0 && (artLastSourceIp != sourceIp || artLastSourcePort != sourcePort)) {
-    artSourceChangeTotal++;
-  }
-  artLastSourceIp = sourceIp;
-  artLastSourcePort = sourcePort;
-  portEXIT_CRITICAL(&statusMux);
+void appMarkArtnetActivity() {
+  portENTER_CRITICAL(&g_statusMux);
+  g_lastArtMs = millis();
+  portEXIT_CRITICAL(&g_statusMux);
 }
 
-static void recordArtNetOpcode(uint16_t opcode) {
-  portENTER_CRITICAL(&statusMux);
-  artNetPacketsTotal++;
-  if (opcode == 0x2000) artPollTotal++;
-  else if (opcode == 0x2100) artPollReplyTotal++;
-  else if (opcode == 0x5200) artSyncTotal++;
-  else if (opcode != 0x5000) artOtherOpcodeTotal++;
-  portEXIT_CRITICAL(&statusMux);
+uint32_t appGetLastArtnetMs() {
+  uint32_t last;
+  portENTER_CRITICAL(&g_statusMux);
+  last = g_lastArtMs;
+  portEXIT_CRITICAL(&g_statusMux);
+  return last;
 }
 
-static void recordControlLoopTiming(uint32_t loopDeltaUs) {
-  portENTER_CRITICAL(&statusMux);
-  controlLoopLastUs = loopDeltaUs;
-  if (loopDeltaUs > controlLoopMaxUs) controlLoopMaxUs = loopDeltaUs;
-  if (loopDeltaUs > 10000) controlLoopOver10ms++;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static void recordArtLoopDrain(uint32_t packetsDrained) {
-  portENTER_CRITICAL(&statusMux);
-  artPacketsLastLoop = packetsDrained;
-  if (packetsDrained > artPacketsMaxLoop) artPacketsMaxLoop = packetsDrained;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static void recordArtDmxFrame(bool matchedUniverse, bool truncated, uint32_t sourceIp, uint16_t sourcePort) {
-  uint32_t now = millis();
-  portENTER_CRITICAL(&statusMux);
-  artDmxRxTotal++;
-  if (matchedUniverse) artDmxUniverseMatchTotal++;
-  else artDmxUniverseMismatchTotal++;
-  if (truncated) artDmxTruncatedTotal++;
-  if (matchedUniverse) {
-    artMatchSourceIp = sourceIp;
-    artMatchSourcePort = sourcePort;
-  }
-
-  if (artDmxLastArrivalMs != 0) {
-    uint32_t gap = now - artDmxLastArrivalMs;
-    if (gap > artDmxMaxGapMs) artDmxMaxGapMs = gap;
-  }
-  artDmxLastArrivalMs = now;
-
-  if (artDmxLastSecondStartMs == 0) artDmxLastSecondStartMs = now;
-  if (now - artDmxLastSecondStartMs >= 1000) {
-    artDmxLastSecondRate = artDmxThisSecond;
-    artDmxThisSecond = 0;
-    artDmxLastSecondStartMs = now;
-  }
-  artDmxThisSecond++;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static void recordArtInvalidFrame(bool truncated) {
-  portENTER_CRITICAL(&statusMux);
-  artDmxInvalidTotal++;
-  if (truncated) artDmxTruncatedTotal++;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static StatusSnapshot readStatusSnapshot() {
-  StatusSnapshot snapshot;
-  portENTER_CRITICAL(&statusMux);
-  for (int led = 0; led < 4; led++) snapshot.ledValues[led] = currentValues[led];
-  snapshot.lastDmxMs = lastDmxMs;
-  snapshot.lastArtMs = lastArtMs;
-  snapshot.artUdpPacketsTotal = artUdpPacketsTotal;
-  snapshot.artUdpBytesTotal = artUdpBytesTotal;
-  snapshot.artNetPacketsTotal = artNetPacketsTotal;
-  snapshot.artPollTotal = artPollTotal;
-  snapshot.artPollReplyTotal = artPollReplyTotal;
-  snapshot.artSyncTotal = artSyncTotal;
-  snapshot.artOtherOpcodeTotal = artOtherOpcodeTotal;
-  snapshot.artDmxRxTotal = artDmxRxTotal;
-  snapshot.artDmxUniverseMatchTotal = artDmxUniverseMatchTotal;
-  snapshot.artDmxUniverseMismatchTotal = artDmxUniverseMismatchTotal;
-  snapshot.artDmxInvalidTotal = artDmxInvalidTotal;
-  snapshot.artDmxTruncatedTotal = artDmxTruncatedTotal;
-  snapshot.artDmxLastArrivalMs = artDmxLastArrivalMs;
-  snapshot.artDmxLastSecondRate = artDmxLastSecondRate;
-  snapshot.artDmxMaxGapMs = artDmxMaxGapMs;
-  snapshot.artLastSourceIp = artLastSourceIp;
-  snapshot.artLastSourcePort = artLastSourcePort;
-  snapshot.artMatchSourceIp = artMatchSourceIp;
-  snapshot.artMatchSourcePort = artMatchSourcePort;
-  snapshot.artSourceChangeTotal = artSourceChangeTotal;
-  snapshot.artPacketsLastLoop = artPacketsLastLoop;
-  snapshot.artPacketsMaxLoop = artPacketsMaxLoop;
-  snapshot.controlLoopLastUs = controlLoopLastUs;
-  snapshot.controlLoopMaxUs = controlLoopMaxUs;
-  snapshot.controlLoopOver10ms = controlLoopOver10ms;
-  portEXIT_CRITICAL(&statusMux);
-  return snapshot;
-}
-
-static void setSourceTimestamp(Source source) {
-  uint32_t now = millis();
-  portENTER_CRITICAL(&statusMux);
-  if (source == Source::DMX) lastDmxMs = now;
-  else if (source == Source::Artnet) lastArtMs = now;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static void formatIp(uint32_t rawIp, char* out, size_t outSize) {
-  snprintf(out, outSize, "%u.%u.%u.%u",
-           (unsigned int)(rawIp & 0xFF),
-           (unsigned int)((rawIp >> 8) & 0xFF),
-           (unsigned int)((rawIp >> 16) & 0xFF),
-           (unsigned int)((rawIp >> 24) & 0xFF));
-}
-
-static const char* resetReasonToString(esp_reset_reason_t reason) {
+const char* appResetReasonToString(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_UNKNOWN: return "unknown";
     case ESP_RST_POWERON: return "power_on";
@@ -277,229 +133,57 @@ static const char* resetReasonToString(esp_reset_reason_t reason) {
   }
 }
 
-static size_t buildStatusJson(char* out, size_t outSize, bool details) {
-  DynamicJsonDocument j(1536);
-  uint32_t now = millis();
-  char key[16];
-  StatusSnapshot snapshot = readStatusSnapshot();
-  const char* src = ((now - snapshot.lastDmxMs) <= SOURCE_HOLD_MS) ? "DMX" : ((now - snapshot.lastArtMs) <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
-  j["source"] = src;
-  j["dmx_age_ms"] = now - snapshot.lastDmxMs;
-  j["art_age_ms"] = now - snapshot.lastArtMs;
-  j["wifi_rssi"] = WifiManager.getRSSI();
-  j["free_heap"] = ESP.getFreeHeap();
-  j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["reset_reason"] = resetReasonToString(esp_reset_reason());
-  if (details) {
-    j["art_udp_packets_total"] = snapshot.artUdpPacketsTotal;
-    j["art_udp_bytes_total"] = snapshot.artUdpBytesTotal;
-    j["artnet_packets_total"] = snapshot.artNetPacketsTotal;
-    j["artpoll_total"] = snapshot.artPollTotal;
-    j["artpoll_reply_total"] = snapshot.artPollReplyTotal;
-    j["artsync_total"] = snapshot.artSyncTotal;
-    j["art_other_opcode_total"] = snapshot.artOtherOpcodeTotal;
-    j["art_rx_fps"] = snapshot.artDmxLastSecondRate;
-    j["art_rx_total"] = snapshot.artDmxRxTotal;
-    j["art_rx_universe_total"] = snapshot.artDmxUniverseMatchTotal;
-    j["art_rx_universe_mismatch_total"] = snapshot.artDmxUniverseMismatchTotal;
-    j["art_rx_invalid_total"] = snapshot.artDmxInvalidTotal;
-    j["art_rx_truncated_total"] = snapshot.artDmxTruncatedTotal;
-    j["art_rx_max_gap_ms"] = snapshot.artDmxMaxGapMs;
-    j["art_source_change_total"] = snapshot.artSourceChangeTotal;
-    j["art_rx_packets_last_loop"] = snapshot.artPacketsLastLoop;
-    j["art_rx_packets_max_loop"] = snapshot.artPacketsMaxLoop;
-    j["control_loop_last_us"] = snapshot.controlLoopLastUs;
-    j["control_loop_max_us"] = snapshot.controlLoopMaxUs;
-    j["control_loop_over_10ms"] = snapshot.controlLoopOver10ms;
-    if (snapshot.artLastSourceIp != 0) {
-      char sourceIp[16];
-      formatIp(snapshot.artLastSourceIp, sourceIp, sizeof(sourceIp));
-      j["art_last_src_ip"] = sourceIp;
-      j["art_last_src_port"] = snapshot.artLastSourcePort;
-    }
-    if (snapshot.artMatchSourceIp != 0) {
-      char matchIp[16];
-      formatIp(snapshot.artMatchSourceIp, matchIp, sizeof(matchIp));
-      j["art_match_src_ip"] = matchIp;
-      j["art_match_src_port"] = snapshot.artMatchSourcePort;
-    }
+static const char* httpMethodToString(int method) {
+  switch (method) {
+    case HTTP_GET: return "GET";
+    case HTTP_POST: return "POST";
+    case HTTP_PUT: return "PUT";
+    case HTTP_PATCH: return "PATCH";
+    case HTTP_DELETE: return "DELETE";
+    case HTTP_HEAD: return "HEAD";
+    case HTTP_OPTIONS: return "OPTIONS";
+    default: return "OTHER";
   }
-  if (snapshot.artDmxLastArrivalMs == 0) {
-    j["art_rx_last_ms_ago"] = -1;
+}
+
+static bool shouldLogRequest(httpd_req_t* req, uint32_t durationMs, int statusCode) {
+  if (statusCode >= 400 || durationMs >= SLOW_HTTP_MS) return true;
+  if (strcmp(req->uri, "/") == 0) return true;
+  if (strcmp(req->uri, "/index.html") == 0) return true;
+  if (strcmp(req->uri, "/settings.html") == 0) return true;
+  if (strcmp(req->uri, "/ota.html") == 0) return true;
+  if (strcmp(req->uri, "/credentials") == 0) return true;
+  if (strcmp(req->uri, "/update") == 0) return true;
+  if (strcmp(req->uri, "/updatefs") == 0) return true;
+  return false;
+}
+
+static void logHttpRequest(httpd_req_t* req, uint32_t startMs, int statusCode, const char* detail = nullptr) {
+#if !WEB_DEBUG_LOG
+  (void)req;
+  (void)startMs;
+  (void)statusCode;
+  (void)detail;
+  return;
+#else
+  uint32_t durationMs = millis() - startMs;
+  if (!shouldLogRequest(req, durationMs, statusCode)) return;
+
+  if (detail && detail[0] != '\0') {
+    Serial.printf("[HTTP] %s %s -> %d in %lu ms (%s)\n",
+                  httpMethodToString(req->method),
+                  req->uri,
+                  statusCode,
+                  (unsigned long)durationMs,
+                  detail);
   } else {
-    j["art_rx_last_ms_ago"] = now - snapshot.artDmxLastArrivalMs;
+    Serial.printf("[HTTP] %s %s -> %d in %lu ms\n",
+                  httpMethodToString(req->method),
+                  req->uri,
+                  statusCode,
+                  (unsigned long)durationMs);
   }
-  for (int led = 0; led < 4; led++) {
-    snprintf(key, sizeof(key), "led_value%d", led);
-    j[key] = snapshot.ledValues[led];
-  }
-  return serializeJson(j, out, outSize);
-}
-
-static inline Source activeSource() {
-  StatusSnapshot snapshot = readStatusSnapshot();
-  uint32_t now = millis();
-  bool dmx = (now - snapshot.lastDmxMs) <= SOURCE_HOLD_MS;
-  bool art = (now - snapshot.lastArtMs) <= SOURCE_HOLD_MS;
-  if (dmx) return Source::DMX;
-  if (art) return Source::Artnet;
-  return Source::None;
-}
-
-static inline void processDmx(uint16_t len) {
-  setSourceTimestamp(Source::DMX);
-  uint16_t addr = CFG.dmx_start_address;
-  if (addr < 1 || addr > len) return;
-  analogWrite(CH1, dmx_buf[addr]);
-  analogWrite(CH2, dmx_buf[addr] + 1);
-  analogWrite(CH3, dmx_buf[addr] + 2);
-  analogWrite(CH4, dmx_buf[addr] + 3);
-}
-
-void setLedFloat(int ledcChannel, float brightness01) {
-  if (brightness01 < 0.0f) brightness01 = 0.0f;
-  if (brightness01 > 1.0f) brightness01 = 1.0f;
-  int duty = (int)(brightness01 * LEDC_MAX_DUTY + 0.5f);
-  ledcWrite(ledcChannel, duty);
-  portENTER_CRITICAL(&statusMux);
-  currentValues[ledcChannel] = brightness01;
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static inline void writeValue(int ledcChannel, const uint8_t* data, int addr) {
-  uint16_t value = data[addr] * 256 + data[addr + 1];
-  setLedFloat(ledcChannel, (float)value / 65535.0f);
-}
-
-static inline void processArtnet(const ArtDmxPacket& a) {
-  setSourceTimestamp(Source::Artnet);
-  if (a.universe_flat != CFG.artnet_universe) return;
-  uint16_t addr = CFG.dmx_start_address;
-  if (addr < 1 || addr > a.length) return;
-  addr -= 1;
-  writeValue(0, a.data, addr);
-  addr += 2;
-  writeValue(1, a.data, addr);
-  addr += 2;
-  writeValue(2, a.data, addr);
-  addr += 2;
-  writeValue(3, a.data, addr);
-}
-
-static void controlTask(void* parameter) {
-  uint32_t prevLoopStartUs = micros();
-  while (true) {
-    uint32_t loopStartUs = micros();
-    recordControlLoopTiming(loopStartUs - prevLoopStartUs);
-    prevLoopStartUs = loopStartUs;
-
-    dmx_packet_t packet;
-    int size = dmx_receive(DMX_PORT, &packet, 0);
-    if (size > 0) {
-      dmx_read(DMX_PORT, dmx_buf, size);
-      processDmx((uint16_t)size);
-    }
-    static uint8_t artbuf[600];
-    uint32_t drainedThisLoop = 0;
-    int psize = artudp.parsePacket();
-    while (psize > 0) {
-      int readLen = psize;
-      bool truncated = false;
-      if (readLen > (int)sizeof(artbuf)) {
-        readLen = sizeof(artbuf);
-        truncated = true;
-      }
-      IPAddress remoteIp = artudp.remoteIP();
-      uint16_t remotePort = artudp.remotePort();
-      int n = artudp.read(artbuf, readLen);
-      if (n > 0) {
-        uint32_t srcIpRaw = (uint32_t)remoteIp;
-        recordArtUdpPacketMeta((size_t)n, srcIpRaw, remotePort);
-
-        bool isArtNet = (n >= 10 && memcmp(artbuf, "Art-Net\0", 8) == 0);
-        if (isArtNet) {
-          uint16_t opcode = ((uint16_t)artbuf[9] << 8) | artbuf[8];
-          recordArtNetOpcode(opcode);
-          if (opcode == 0x5000) {
-            ArtDmxPacket a = parseArtDmx(artbuf, n);
-            if (a.ok) {
-              bool matchedUniverse = (a.universe_flat == CFG.artnet_universe);
-              recordArtDmxFrame(matchedUniverse, truncated, srcIpRaw, remotePort);
-              processArtnet(a);
-            } else {
-              recordArtInvalidFrame(truncated);
-            }
-          }
-        } else {
-          recordArtInvalidFrame(truncated);
-        }
-        drainedThisLoop++;
-      }
-      psize = artudp.parsePacket();
-    }
-    recordArtLoopDrain(drainedThisLoop);
-    vTaskDelay(pdMS_TO_TICKS(CONTROL_TASK_DELAY_MS));
-  }
-}
-
-static void wsAddClient(int fd) {
-  if (fd < 0) return;
-  portENTER_CRITICAL(&wsClientMux);
-  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-    if (wsClientFds[i] == fd) {
-      portEXIT_CRITICAL(&wsClientMux);
-      return;
-    }
-  }
-  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-    if (wsClientFds[i] < 0) {
-      wsClientFds[i] = fd;
-      break;
-    }
-  }
-  portEXIT_CRITICAL(&wsClientMux);
-}
-
-static void wsRemoveClient(int fd) {
-  if (fd < 0) return;
-  portENTER_CRITICAL(&wsClientMux);
-  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-    if (wsClientFds[i] == fd) {
-      wsClientFds[i] = -1;
-      break;
-    }
-  }
-  portEXIT_CRITICAL(&wsClientMux);
-}
-
-static int wsCopyClients(int* out, int maxCount) {
-  int count = 0;
-  portENTER_CRITICAL(&wsClientMux);
-  for (int i = 0; i < MAX_WS_CLIENTS && count < maxCount; i++) {
-    if (wsClientFds[i] >= 0) out[count++] = wsClientFds[i];
-  }
-  portEXIT_CRITICAL(&wsClientMux);
-  return count;
-}
-
-static esp_err_t wsSendStatusToClient(int fd) {
-  char out[512];
-  size_t outLen = buildStatusJson(out, sizeof(out), false);
-  httpd_ws_frame_t frame = {};
-  frame.type = HTTPD_WS_TYPE_TEXT;
-  frame.payload = (uint8_t*)out;
-  frame.len = outLen;
-  return httpd_ws_send_frame_async(webHttpd, fd, &frame);
-}
-
-static void wsBroadcastStatus() {
-  int clients[MAX_WS_CLIENTS];
-  int count = wsCopyClients(clients, MAX_WS_CLIENTS);
-  for (int i = 0; i < count; i++) {
-    if (wsSendStatusToClient(clients[i]) != ESP_OK) {
-      wsRemoveClient(clients[i]);
-    }
-  }
+#endif
 }
 
 static void setCorsHeaders(httpd_req_t* req) {
@@ -509,37 +193,137 @@ static void setCorsHeaders(httpd_req_t* req) {
 }
 
 static esp_err_t optionsHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   setCorsHeaders(req);
   httpd_resp_set_status(req, "204 No Content");
-  return httpd_resp_send(req, nullptr, 0);
-}
-
-static esp_err_t sendSpiffsFile(httpd_req_t* req, const char* path, const char* contentType) {
-  File file = SPIFFS.open(path, FILE_READ);
-  if (!file || file.isDirectory()) {
-    httpd_resp_set_status(req, "404 Not Found");
-    return httpd_resp_send(req, "Not Found", HTTPD_RESP_USE_STRLEN);
-  }
-  size_t size = file.size();
-  char* buf = (char*)malloc(size + 1);
-  if (!buf) {
-    httpd_resp_set_status(req, "500 Internal Server Error");
-    return httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
-  }
-  file.readBytes(buf, size);
-  buf[size] = '\0';
-  httpd_resp_set_type(req, contentType);
-  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  esp_err_t ret = httpd_resp_send(req, buf, size);
-  free(buf);
+  esp_err_t ret = httpd_resp_send(req, nullptr, 0);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 204 : 500);
   return ret;
 }
 
-static esp_err_t indexHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/index.html", "text/html"); }
-static esp_err_t otaPageHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/ota.html", "text/html"); }
-static esp_err_t settingHandler(httpd_req_t* req) { return sendSpiffsFile(req, "/wifi-manager/settings.html", "text/html"); }
+static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* contentType) {
+  uint32_t startMs = millis();
+
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends++;
+  portEXIT_CRITICAL(&g_fileSendMux);
+
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file || file.isDirectory()) {
+    httpd_resp_set_status(req, "404 Not Found");
+    esp_err_t ret = httpd_resp_send(req, "Not Found", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 404, path);
+    portENTER_CRITICAL(&g_fileSendMux);
+    g_activeFileSends--;
+    portEXIT_CRITICAL(&g_fileSendMux);
+    return ret;
+  }
+
+  size_t size = file.size();
+  size_t allocSize = (size <= HTTP_FILE_DIRECT_SEND_LIMIT) ? (size + 1) : HTTP_FILE_CHUNK_SIZE;
+  char* buf = (char*)malloc(allocSize);
+  if (!buf) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    esp_err_t ret = httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 500, "malloc failed");
+    portENTER_CRITICAL(&g_fileSendMux);
+    g_activeFileSends--;
+    portEXIT_CRITICAL(&g_fileSendMux);
+    return ret;
+  }
+
+  httpd_resp_set_type(req, contentType);
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  esp_err_t ret = ESP_OK;
+  size_t totalSent = 0;
+  uint32_t readMs = 0;
+  uint32_t sendMs = 0;
+
+  if (size <= HTTP_FILE_DIRECT_SEND_LIMIT) {
+    uint32_t t0 = millis();
+    size_t bytesRead = file.read((uint8_t*)buf, size);
+    readMs = millis() - t0;
+    if (bytesRead != size) {
+      ret = ESP_FAIL;
+      totalSent = bytesRead;
+    } else {
+      t0 = millis();
+      ret = httpd_resp_send(req, buf, size);
+      sendMs = millis() - t0;
+      totalSent = size;
+    }
+  } else {
+    while (file.available()) {
+      uint32_t t0 = millis();
+      size_t bytesRead = file.read((uint8_t*)buf, HTTP_FILE_CHUNK_SIZE);
+      readMs += millis() - t0;
+      if (bytesRead == 0) {
+        break;
+      }
+
+      t0 = millis();
+      ret = httpd_resp_send_chunk(req, buf, bytesRead);
+      sendMs += millis() - t0;
+      if (ret != ESP_OK) {
+        break;
+      }
+      totalSent += bytesRead;
+    }
+
+    if (ret == ESP_OK) {
+      ret = httpd_resp_send_chunk(req, nullptr, 0);
+    }
+  }
+
+  const uint32_t totalMs = millis() - startMs;
+  if (WEB_DEBUG_LOG || sendMs >= SLOW_FS_SEND_MS || totalMs >= SLOW_FS_TOTAL_MS) {
+    Serial.printf("[FS] %s read=%lu ms send=%lu ms total=%lu ms size=%lu\n",
+                  path,
+                  (unsigned long)readMs,
+                  (unsigned long)sendMs,
+                  (unsigned long)totalMs,
+                  (unsigned long)size);
+  }
+
+  char detail[128];
+  snprintf(detail,
+           sizeof(detail),
+           "%s, %lu/%lu B, heap=%lu, err=%d",
+           path,
+           (unsigned long)totalSent,
+           (unsigned long)size,
+           (unsigned long)ESP.getFreeHeap(),
+           (int)ret);
+  file.close();
+  free(buf);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
+
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends--;
+  portEXIT_CRITICAL(&g_fileSendMux);
+
+  return ret;
+}
+
+static esp_err_t indexHandler(httpd_req_t* req) {
+  return sendFsFile(req, g_hooks.indexPagePath, "text/html");
+}
+static esp_err_t otaPageHandler(httpd_req_t* req) {
+  return sendFsFile(req, "/wifi-manager/ota.html", "text/html");
+}
+static esp_err_t settingHandler(httpd_req_t* req) {
+  return sendFsFile(req, "/wifi-manager/settings.html", "text/html");
+}
 
 static esp_err_t statusHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
+  if (!g_hooks.buildStatusJson) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    esp_err_t ret = httpd_resp_send(req, "Status callback missing", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 500, "status callback missing");
+    return ret;
+  }
+
   bool details = false;
   size_t qlen = httpd_req_get_url_query_len(req);
   if (qlen > 0 && qlen < 64) {
@@ -555,21 +339,117 @@ static esp_err_t statusHandler(httpd_req_t* req) {
   char* out = (char*)malloc(2048);
   if (!out) {
     httpd_resp_set_status(req, "500 Internal Server Error");
-    return httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 500, "status buffer alloc failed");
+    return ret;
   }
-  size_t outLen = buildStatusJson(out, 2048, details);
+
+  size_t outLen = g_hooks.buildStatusJson(out, 2048, details);
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   esp_err_t ret = httpd_resp_send(req, out, outLen);
   free(out);
+  char detail[48];
+  snprintf(detail, sizeof(detail), "details=%d, %lu B", details ? 1 : 0, (unsigned long)outLen);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
   return ret;
 }
 
+static void wsAddClient(int fd) {
+  if (fd < 0) return;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] == fd) {
+      portEXIT_CRITICAL(&g_wsClientMux);
+      return;
+    }
+  }
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] < 0) {
+      g_wsClientFds[i] = fd;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+}
+
+static void wsRemoveClient(int fd) {
+  if (fd < 0) return;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] == fd) {
+      g_wsClientFds[i] = -1;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+}
+
+static int wsCopyClients(int* out, int maxCount) {
+  int count = 0;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS && count < maxCount; i++) {
+    if (g_wsClientFds[i] >= 0) out[count++] = g_wsClientFds[i];
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+  return count;
+}
+
+static esp_err_t wsSendStatusToClient(int fd) {
+  if (!g_hooks.buildStatusJson) return ESP_FAIL;
+  char out[512];
+  size_t outLen = g_hooks.buildStatusJson(out, sizeof(out), false);
+  httpd_ws_frame_t frame = {};
+  frame.type = HTTPD_WS_TYPE_TEXT;
+  frame.payload = (uint8_t*)out;
+  frame.len = outLen;
+  return httpd_ws_send_frame_async(g_webHttpd, fd, &frame);
+}
+
+static void wsBroadcastStatus() {
+  int activeSends;
+  portENTER_CRITICAL(&g_fileSendMux);
+  activeSends = g_activeFileSends;
+  portEXIT_CRITICAL(&g_fileSendMux);
+
+  if (activeSends > 0) {
+    return;
+  }
+
+  uint32_t startMs = millis();
+  int clients[MAX_WS_CLIENTS];
+  int count = wsCopyClients(clients, MAX_WS_CLIENTS);
+  int failed = 0;
+  for (int i = 0; i < count; i++) {
+    if (wsSendStatusToClient(clients[i]) != ESP_OK) {
+      wsRemoveClient(clients[i]);
+      failed++;
+    }
+  }
+
+  uint32_t durationMs = millis() - startMs;
+#if WEB_DEBUG_LOG
+  if (failed > 0 || durationMs >= SLOW_WS_BROADCAST_MS) {
+    Serial.printf("[WS] broadcast clients=%d failed=%d in %lu ms heap=%lu\n",
+                  count,
+                  failed,
+                  (unsigned long)durationMs,
+                  (unsigned long)ESP.getFreeHeap());
+  }
+#else
+  (void)durationMs;
+#endif
+}
+
 static esp_err_t wsHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   int fd = httpd_req_to_sockfd(req);
   if (req->method == HTTP_GET) {
     wsAddClient(fd);
+#if WEB_DEBUG_LOG
+    Serial.printf("[WS] client connected fd=%d uri=%s\n", fd, req->uri);
+#endif
     return ESP_OK;
   }
 
@@ -577,11 +457,17 @@ static esp_err_t wsHandler(httpd_req_t* req) {
   esp_err_t ret = httpd_ws_recv_frame(req, &frame, 0);
   if (ret != ESP_OK) {
     wsRemoveClient(fd);
+#if WEB_DEBUG_LOG
+    Serial.printf("[WS] recv header failed fd=%d err=%d\n", fd, ret);
+#endif
     return ret;
   }
 
   if (frame.type == HTTPD_WS_TYPE_CLOSE) {
     wsRemoveClient(fd);
+#if WEB_DEBUG_LOG
+    Serial.printf("[WS] client closed fd=%d\n", fd);
+#endif
     return ESP_OK;
   }
 
@@ -602,48 +488,89 @@ static esp_err_t wsHandler(httpd_req_t* req) {
   }
 
   if (payload) free(payload);
+  uint32_t durationMs = millis() - startMs;
+#if WEB_DEBUG_LOG
+  if (ret != ESP_OK || durationMs >= SLOW_HTTP_MS) {
+    Serial.printf("[WS] fd=%d type=%d len=%u err=%d in %lu ms\n",
+                  fd,
+                  (int)frame.type,
+                  (unsigned int)frame.len,
+                  ret,
+                  (unsigned long)durationMs);
+  }
+#else
+  (void)durationMs;
+#endif
   return ret;
 }
 
 static esp_err_t networksHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   bool details = false;
+  bool refresh = false;
+  bool legacyDetailsOnly = false;
   size_t qlen = httpd_req_get_url_query_len(req);
   if (qlen > 0 && qlen < 64) {
     char query[64];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
       char value[8];
       if (httpd_query_key_value(query, "details", value, sizeof(value)) == ESP_OK) details = true;
+      if (httpd_query_key_value(query, "refresh", value, sizeof(value)) == ESP_OK) {
+        refresh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+      }
+      if (httpd_query_key_value(query, "scan", value, sizeof(value)) == ESP_OK) {
+        refresh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
+      }
+      legacyDetailsOnly = details && !refresh;
     }
   }
-  String payload = WifiManager.getNetworksPayload(details);
+  // Backward compatibility: older settings pages request details only on refresh click.
+  if (legacyDetailsOnly) refresh = true;
+  String payload = g_wifiManager.getNetworksPayload(details, refresh);
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_send(req, payload.c_str(), payload.length());
+  esp_err_t ret = httpd_resp_send(req, payload.c_str(), payload.length());
+  char detail[48];
+  snprintf(detail, sizeof(detail), "details=%d refresh=%d, %u B", details ? 1 : 0, refresh ? 1 : 0, (unsigned int)payload.length());
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
+  return ret;
 }
 
 static esp_err_t credentialsGetHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   StaticJsonDocument<256> doc;
-  doc["ssid"] = config.getSSID();
-  doc["hostname"] = config.getHostname();
-  doc["password"] = config.getPass();
-  doc["dmx_address"] = config.getDMXAddress();
-  doc["dmx_universe"] = config.getDMXUniverse();
+  int channel = g_config.getDMXAddress();
+  int universe = g_config.getDMXUniverse();
+  doc["ssid"] = g_config.getSSID();
+  doc["hostname"] = g_config.getHostname();
+  doc["password"] = g_config.getPass();
+  doc["channel"] = channel;
+  doc["universe"] = universe;
+  doc["dmx_address"] = channel;
+  doc["dmx_universe"] = universe;
+
   char out[256];
   size_t outLen = serializeJson(doc, out, sizeof(out));
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_send(req, out, outLen);
+  esp_err_t ret = httpd_resp_send(req, out, outLen);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500);
+  return ret;
 }
 
 static esp_err_t credentialsPutHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   int len = req->content_len;
   if (len <= 0 || len > 1024) {
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_send(req, "", 0);
+    esp_err_t ret = httpd_resp_send(req, "", 0);
+    logHttpRequest(req, startMs, 400, "invalid content length");
+    return ret;
   }
+
   String body;
   body.reserve(len + 1);
   int remaining = len;
@@ -654,62 +581,95 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     if (read <= 0) {
       setCorsHeaders(req);
       httpd_resp_set_status(req, "500 Internal Server Error");
-      return httpd_resp_send(req, "", 0);
+      esp_err_t ret = httpd_resp_send(req, "", 0);
+      logHttpRequest(req, startMs, 500, "request body read failed");
+      return ret;
     }
+
     char tmp[257];
     memcpy(tmp, buf, read);
     tmp[read] = '\0';
     body += tmp;
     remaining -= read;
   }
+
   StaticJsonDocument<384> doc;
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_send(req, "", 0);
+    esp_err_t ret = httpd_resp_send(req, "", 0);
+    logHttpRequest(req, startMs, 400, "invalid json");
+    return ret;
   }
-  if (doc.containsKey("ssid")) config.writeSSID(doc["ssid"].as<const char*>());
-  if (doc.containsKey("password")) config.writePass(doc["password"].as<const char*>());
-  if (doc.containsKey("hostname")) config.writeHostname(doc["hostname"].as<const char*>());
-  if (doc.containsKey("dmx_address")) config.writeDMXAddress(doc["dmx_address"].as<int>());
-  if (doc.containsKey("dmx_universe")) config.writeDMXUniverse(doc["dmx_universe"].as<int>());
-  WifiManager.scheduleRestart(1000);
+
+  if (doc.containsKey("ssid")) g_config.writeSSID(doc["ssid"].as<const char*>());
+  if (doc.containsKey("password")) g_config.writePass(doc["password"].as<const char*>());
+  if (doc.containsKey("hostname")) g_config.writeHostname(doc["hostname"].as<const char*>());
+
+  if (doc.containsKey("channel")) {
+    int channel = doc["channel"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  } else if (doc.containsKey("dmx_address")) {
+    int channel = doc["dmx_address"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  }
+
+  if (doc.containsKey("universe")) {
+    int universe = doc["universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  } else if (doc.containsKey("dmx_universe")) {
+    int universe = doc["dmx_universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  }
+
+  g_wifiManager.scheduleRestart(1000);
   setCorsHeaders(req);
   httpd_resp_set_status(req, "204 No Content");
-  return httpd_resp_send(req, nullptr, 0);
+  esp_err_t ret = httpd_resp_send(req, nullptr, 0);
+  char detail[32];
+  snprintf(detail, sizeof(detail), "body=%d B", len);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 204 : 500, detail);
+  return ret;
 }
 
 static esp_err_t updateInfoHandler(httpd_req_t* req) {
+  uint32_t startMs = millis();
   StaticJsonDocument<128> doc;
   doc["version"] = "1.0.0";
-  doc["device"] = "CableCar";
+  doc["device"] = g_hooks.deviceName;
   doc["ota_ready"] = true;
+
   char out[128];
   size_t outLen = serializeJson(doc, out, sizeof(out));
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-  return httpd_resp_send(req, out, outLen);
+  esp_err_t ret = httpd_resp_send(req, out, outLen);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500);
+  return ret;
 }
 
 static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
-  WifiManager.setOtaInProgress(true);
+  uint32_t startMs = millis();
+  g_wifiManager.setOtaInProgress(true);
 
   bool beginOk = false;
   if (updateCmd == U_SPIFFS) {
-    const esp_partition_t* spiffsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
-    beginOk = (spiffsPart != nullptr) && Update.begin(spiffsPart->size, U_SPIFFS);
+    const esp_partition_t* fsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "littlefs");
+    beginOk = (fsPart != nullptr) && Update.begin(fsPart->size, U_SPIFFS);
   } else {
     beginOk = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
   }
 
   if (!beginOk) {
     Update.printError(Serial);
-    WifiManager.setOtaInProgress(false);
+    g_wifiManager.setOtaInProgress(false);
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_send(req, "{\"success\":false,\"message\":\"Update begin failed\"}", HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Update begin failed\"}", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 400, updateCmd == U_SPIFFS ? "update begin failed: fs" : "update begin failed: flash");
+    return ret;
   }
 
   int remaining = req->content_len;
@@ -719,35 +679,43 @@ static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
     int read = httpd_req_recv(req, (char*)buf2, toRead);
     if (read <= 0) {
       Update.abort();
-      WifiManager.setOtaInProgress(false);
+      g_wifiManager.setOtaInProgress(false);
       setCorsHeaders(req);
       httpd_resp_set_status(req, "500 Internal Server Error");
-      return httpd_resp_send(req, "{\"success\":false,\"message\":\"Upload read failed\"}", HTTPD_RESP_USE_STRLEN);
+      esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Upload read failed\"}", HTTPD_RESP_USE_STRLEN);
+      logHttpRequest(req, startMs, 500, "update upload read failed");
+      return ret;
     }
     if (Update.write(buf2, read) != (size_t)read) {
       Update.printError(Serial);
       Update.abort();
-      WifiManager.setOtaInProgress(false);
+      g_wifiManager.setOtaInProgress(false);
       setCorsHeaders(req);
       httpd_resp_set_status(req, "500 Internal Server Error");
-      return httpd_resp_send(req, "{\"success\":false,\"message\":\"Update write failed\"}", HTTPD_RESP_USE_STRLEN);
+      esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Update write failed\"}", HTTPD_RESP_USE_STRLEN);
+      logHttpRequest(req, startMs, 500, "update write failed");
+      return ret;
     }
     remaining -= read;
   }
 
   bool ok = Update.end(true);
-  WifiManager.setOtaInProgress(false);
+  g_wifiManager.setOtaInProgress(false);
   if (!ok) {
     Update.printError(Serial);
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    return httpd_resp_send(req, "{\"success\":false,\"message\":\"Update finalize failed\"}", HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Update finalize failed\"}", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 400, "update finalize failed");
+    return ret;
   }
 
-  WifiManager.scheduleRestart(1000);
+  g_wifiManager.scheduleRestart(1000);
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
-  return httpd_resp_send(req, "{\"success\":true,\"message\":\"Update successful. Restarting...\"}", HTTPD_RESP_USE_STRLEN);
+  esp_err_t ret = httpd_resp_send(req, "{\"success\":true,\"message\":\"Update successful. Restarting...\"}", HTTPD_RESP_USE_STRLEN);
+  logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, updateCmd == U_SPIFFS ? "fs update ok" : "flash update ok");
+  return ret;
 }
 
 static esp_err_t firmwareUpdateHandler(httpd_req_t* req) { return performUpdate(req, U_FLASH); }
@@ -759,7 +727,7 @@ static void registerUri(const char* path, httpd_method_t method, esp_err_t (*han
   uri.method = method;
   uri.handler = handler;
   uri.user_ctx = nullptr;
-  httpd_register_uri_handler(webHttpd, &uri);
+  httpd_register_uri_handler(g_webHttpd, &uri);
 }
 
 static void registerWsUri(const char* path, esp_err_t (*handler)(httpd_req_t*)) {
@@ -769,17 +737,18 @@ static void registerWsUri(const char* path, esp_err_t (*handler)(httpd_req_t*)) 
   uri.handler = handler;
   uri.user_ctx = nullptr;
   uri.is_websocket = true;
-  httpd_register_uri_handler(webHttpd, &uri);
+  httpd_register_uri_handler(g_webHttpd, &uri);
 }
 
 static void startWebServer() {
-  if (webHttpd != nullptr) return;
+  if (g_webHttpd != nullptr) return;
+
   httpd_config_t configHttp = HTTPD_DEFAULT_CONFIG();
   configHttp.server_port = 80;
   configHttp.ctrl_port = 32768;
   configHttp.max_uri_handlers = 24;
 
-  if (httpd_start(&webHttpd, &configHttp) == ESP_OK) {
+  if (httpd_start(&g_webHttpd, &configHttp) == ESP_OK) {
     registerUri("/", HTTP_GET, indexHandler);
     registerUri("/index.html", HTTP_GET, indexHandler);
     registerUri("/ota.html", HTTP_GET, otaPageHandler);
@@ -792,6 +761,7 @@ static void startWebServer() {
     registerUri("/update", HTTP_POST, firmwareUpdateHandler);
     registerUri("/updatefs", HTTP_POST, fsUpdateHandler);
     registerWsUri("/ws", wsHandler);
+
     registerUri("/status", HTTP_OPTIONS, optionsHandler);
     registerUri("/networks", HTTP_OPTIONS, optionsHandler);
     registerUri("/credentials", HTTP_OPTIONS, optionsHandler);
@@ -803,60 +773,73 @@ static void startWebServer() {
   }
 }
 
-void setup() {
-  Serial.begin(115200);
-  Serial.println("Startup...");
-
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
-  }
-
-  ledcSetup(0, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(CH1, 0);
-  ledcSetup(1, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(CH2, 1);
-  ledcSetup(2, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(CH3, 2);
-  ledcSetup(3, LEDC_FREQ_HZ, LEDC_RES_BITS);
-  ledcAttachPin(CH4, 3);
-
-  bool connected = WifiManager.connectToWifi();
-  if (!connected) {
-    Serial.println("No WiFi... Starting AP");
-    WifiManager.startManagementAP();
-  }
-
-  IPAddress ip = WifiManager.getIP();
-  Serial.printf("IP Address: %s\n", ip.toString().c_str());
-
-  startWebServer();
-
-  WiFi.setSleep(false);
-  artudp.begin(ARTNET_PORT);
-
-  dmx_config_t dmx_config = DMX_CONFIG_DEFAULT;
-  const int personality_count = 1;
-  dmx_personality_t personalities[] = {
-    {1, "RX Only"}
-  };
-  dmx_driver_install(DMX_PORT, &dmx_config, personalities, personality_count);
-
-  xTaskCreatePinnedToCore(
-    controlTask,
-    "ControlTask",
-    4096,
-    nullptr,
-    1,
-    &controlTaskHandle,
-    1);
+void appInitRuntime(const AppRuntimeHooks& hooks) {
+  g_hooks = hooks;
 }
 
-void loop() {
-  WifiManager.check();
-  uint32_t now = millis();
-  if (now - lastWsPushMs >= WS_STATUS_PUSH_MS) {
-    wsBroadcastStatus();
-    lastWsPushMs = now;
+void appStartCommonServices() {
+  startWebServer();
+  WiFi.setSleep(false);
+  g_artudp.begin(ARTNET_PORT);
+
+  logFileReadPerf("/wifi-manager/index.html");
+  logFileReadPerf("/wifi-manager/index_led.html");
+  logFileReadPerf("/wifi-manager/settings.html");
+  logFileReadPerf("/wifi-manager/ota.html");
+}
+
+void appConnectWifi() {
+  bool connected = g_wifiManager.connectToWifi();
+  if (!connected) {
+    Serial.println("No WiFi... Starting AP");
+    g_wifiManager.startManagementAP();
   }
-  delay(1);
+
+  IPAddress ip = g_wifiManager.getIP();
+  Serial.printf("IP Address: %s\n", ip.toString().c_str());
+}
+
+void appCommonLoop(uint32_t wsStatusPushMs) {
+  if (g_hooks.pollInputs) {
+    g_hooks.pollInputs();
+  }
+
+  g_wifiManager.check();
+
+  uint32_t now = millis();
+  if (now - g_lastHealthLogMs >= HEALTH_LOG_INTERVAL_MS) {
+    wl_status_t wifiStatus = WiFi.status();
+    IPAddress ip = g_wifiManager.getIP();
+    char artSummary[256] = "";
+    if (g_hooks.buildHealthSummary) {
+      g_hooks.buildHealthSummary(artSummary, sizeof(artSummary));
+    }
+
+    if (artSummary[0] != '\0') {
+      Serial.printf("[HEALTH] up=%lu ms wifi=%d ip=%s rssi=%d heap=%lu rec_attempts=%lu rec_ok=%lu %s\n",
+                    (unsigned long)now,
+                    (int)wifiStatus,
+                    ip.toString().c_str(),
+                    (int)g_wifiManager.getRSSI(),
+                    (unsigned long)ESP.getFreeHeap(),
+                    (unsigned long)g_wifiManager.getReconnectAttempts(),
+                    (unsigned long)g_wifiManager.getReconnectSuccesses(),
+                    artSummary);
+    } else {
+      Serial.printf("[HEALTH] up=%lu ms wifi=%d ip=%s rssi=%d heap=%lu rec_attempts=%lu rec_ok=%lu\n",
+                    (unsigned long)now,
+                    (int)wifiStatus,
+                    ip.toString().c_str(),
+                    (int)g_wifiManager.getRSSI(),
+                    (unsigned long)ESP.getFreeHeap(),
+                    (unsigned long)g_wifiManager.getReconnectAttempts(),
+                    (unsigned long)g_wifiManager.getReconnectSuccesses());
+    }
+    g_lastHealthLogMs = now;
+  }
+
+  if (now - g_lastWsPushMs >= wsStatusPushMs) {
+    wsBroadcastStatus();
+    g_lastWsPushMs = now;
+  }
 }

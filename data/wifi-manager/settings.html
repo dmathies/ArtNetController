@@ -38,6 +38,10 @@
         --meter-bg: rgba(255,255,255,0.05);
         --meter-fill: linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96));
         --header-line: linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent);
+        --select-option-bg: var(--bg1);
+        --select-option-text: var(--text);
+        --select-option-active-bg: var(--accent-2);
+        --select-option-active-text: var(--text);
       }
       * { box-sizing: border-box; }
       html, body { height: 100%; }
@@ -274,10 +278,22 @@
         background: var(--input-bg);
         color: var(--text);
         outline: none;
+        color-scheme: dark;
       }
       .field input:focus, .field select:focus {
         background: var(--input-bg-focus);
         border-color: var(--line-strong);
+      }
+      .field select option {
+        background: var(--select-option-bg);
+        color: var(--select-option-text);
+      }
+      .field select option:hover,
+      .field select option:focus,
+      .field select option:checked,
+      .field select option:active {
+        background: var(--select-option-active-bg);
+        color: var(--select-option-active-text);
       }
       .field input::placeholder { color: var(--muted); }
       .inline-actions {
@@ -341,7 +357,8 @@
           '--button-bg-hover':'linear-gradient(135deg, #f7ddab, #b37734)',
           '--meter-bg':'rgba(255,255,255,0.05)',
           '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96))',
-          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent)'
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent)',
+          '--select-option-bg':'#1f1710','--select-option-text':'#f5ecde','--select-option-active-bg':'#946325','--select-option-active-text':'#f5ecde'
         },
         blue: {
           '--bg0':'#0b1018','--bg1':'#111a27','--bg2':'#18273a','--bg3':'#090d14',
@@ -356,7 +373,8 @@
           '--button-bg-hover':'linear-gradient(135deg, #d4efff, #4877b3)',
           '--meter-bg':'rgba(255,255,255,0.05)',
           '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.26), rgba(var(--accent-rgb),0.94))',
-          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)',
+          '--select-option-bg':'#111a27','--select-option-text':'#eef6ff','--select-option-active-bg':'#294c78','--select-option-active-text':'#eef6ff'
         },
         green: {
           '--bg0':'#0d1511','--bg1':'#15241d','--bg2':'#1d3329','--bg3':'#09100d',
@@ -371,7 +389,8 @@
           '--button-bg-hover':'linear-gradient(135deg, #d5f5df, #428565)',
           '--meter-bg':'rgba(255,255,255,0.05)',
           '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.28), rgba(var(--accent-rgb),0.96))',
-          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)',
+          '--select-option-bg':'#15241d','--select-option-text':'#edf8f0','--select-option-active-bg':'#2d7250','--select-option-active-text':'#edf8f0'
         }
       };
 
@@ -415,15 +434,15 @@
             ssid: json.ssid || "",
             password: json.password || "",
             hostname: json.hostname || "",
-            dmx_address: (json.dmx_address ?? 1),
-            dmx_universe: (json.dmx_universe ?? 0)
+            channel: (json.channel ?? json.dmx_address ?? 1),
+            universe: (json.universe ?? json.dmx_universe ?? 0)
           };
 
           document.getElementById("ssid").value = initialCreds.ssid || "";
           document.getElementById("password").value = initialCreds.password || "";
           document.getElementById("hostname").value = initialCreds.hostname || "";
-          document.getElementById("dmx-address").value = initialCreds.dmx_address;
-          document.getElementById("dmx-universe").value = initialCreds.dmx_universe;
+          document.getElementById("channel").value = initialCreds.channel;
+          document.getElementById("universe").value = initialCreds.universe;
 
           const sel = document.getElementById("network");
           if (!sel.disabled && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
@@ -494,21 +513,10 @@
         const sel = document.getElementById("network");
         const refreshBtn = document.getElementById("refresh-networks");
         try {
-          const res = await fetch(`${apiBase}/networks?details=1`, { method: "GET", cache: "no-store" });
+          const res = await fetch(`${apiBase}/networks?details=1&refresh=1`, { method: "GET", cache: "no-store" });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const body = await res.json();
           const list = Array.isArray(body.networks) ? body.networks : [];
-
-          if (body.scanning) {
-            sel.disabled = true;
-            networkScanInProgress = true;
-            if (refreshBtn) {
-              refreshBtn.disabled = true;
-              refreshBtn.textContent = "Scanning...";
-            }
-            setTimeout(fetchNetworks, 600);
-            return;
-          }
 
           renderNetworks(list);
         } catch (e) {
@@ -555,8 +563,8 @@
             ssid: document.getElementById("ssid").value,
             password: document.getElementById("password").value,
             hostname: document.getElementById("hostname").value,
-            dmx_address: Number(document.getElementById("dmx-address").value || "1"),
-            dmx_universe: Number(document.getElementById("dmx-universe").value || "0")
+            channel: Number(document.getElementById("channel").value || "1"),
+            universe: Number(document.getElementById("universe").value || "0")
           };
 
           const res = await fetch(`${apiBase}/credentials`, {
@@ -613,7 +621,7 @@
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
           <h1>Settings</h1>
-          <p class="subtitle">Wi-Fi, hostname and DMX / Art-Net configuration</p>
+          <p class="subtitle">Wi-Fi, hostname and Art-Net configuration</p>
         </div>
       </div>
       <div class="toolbar">
@@ -666,16 +674,16 @@
 
           <section class="section">
             <div class="section-head">
-              <h2 class="section-title">DMX / Art-Net</h2>
+              <h2 class="section-title">Art-Net Output</h2>
             </div>
             <div class="field-grid">
               <div class="field">
-                <label for="dmx-address">Address</label>
-                <input id="dmx-address" type="number" min="1" max="512" step="1" inputmode="numeric" placeholder="1 - 512" />
+                <label for="channel">Channel</label>
+                <input id="channel" type="number" min="1" max="512" step="1" inputmode="numeric" placeholder="1 - 512" />
               </div>
               <div class="field">
-                <label for="dmx-universe">Universe</label>
-                <input id="dmx-universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
+                <label for="universe">Universe</label>
+                <input id="universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
               </div>
             </div>
           </section>
