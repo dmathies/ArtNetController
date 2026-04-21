@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <WiFiUdp.h>
+#include <AsyncUDP.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
@@ -19,8 +19,6 @@ static constexpr int LEDC_FREQ_HZ = 1000;
 static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
 static constexpr uint32_t SOURCE_HOLD_MS = 1000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
-static constexpr uint32_t MAX_ARTNET_PACKETS_PER_LOOP = 64;
-static constexpr uint32_t ARTNET_DRAIN_BUDGET_MS = 8;
 
 #ifndef ARTNET_TIMING_LOG_ENABLE
 #define ARTNET_TIMING_LOG_ENABLE 0
@@ -32,6 +30,10 @@ static constexpr uint32_t ARTNET_INTERVAL_FREEZE_US = 100000;
 
 static TaskHandle_t controlTaskHandle = nullptr;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
+static AsyncUDP g_artudp;
+static bool g_artudpListening = false;
+static bool g_havePendingLedValues = false;
+static uint16_t g_pendingLedValues[4] = {0, 0, 0, 0};
 
 static float currentValues[4] = {0, 0, 0, 0};
 
@@ -300,106 +302,107 @@ static inline void writeValue(int ledcChannel, const uint8_t* data, uint16_t add
   setLedFloat(ledcChannel, (float)value / 65535.0f);
 }
 
-static void processArtnet(const ArtDmxPacket& a) {
-  appMarkArtnetActivity();
-  portENTER_CRITICAL(&statusMux);
-  artLastUniverseFlat = a.universe_flat;
-  portEXIT_CRITICAL(&statusMux);
-
-  uint16_t universe = g_cfg.artnetUniverse;
-  if (a.universe_flat != universe) {
-    portENTER_CRITICAL(&statusMux);
-    artDmxUniverseMismatchTotal++;
-    portEXIT_CRITICAL(&statusMux);
+static void startArtnetListener() {
+  if (g_artudpListening) {
     return;
   }
 
-  uint16_t addr = g_cfg.dmxStartAddress;
-  if (addr < 1 || addr + 7 > a.length) {
-    return;
-  }
-
-  addr -= 1;
-  writeValue(0, a.data, addr);
-  writeValue(1, a.data, addr + 2);
-  writeValue(2, a.data, addr + 4);
-  writeValue(3, a.data, addr + 6);
-
-  portENTER_CRITICAL(&statusMux);
-  artDmxUniverseMatchTotal++;
-  artDmxRxTotal++;
-  artDmxLastArrivalMs = millis();
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static void pollArtnet() {
-  static uint8_t artbuf[600];
-  static uint32_t lastRebindAttemptMs = 0;
-  static constexpr uint32_t ARTNET_IDLE_REBIND_MS = 10000;
-  static constexpr uint32_t ARTNET_REBIND_GUARD_MS = 3000;
-  WiFiUDP& artudp = appArtnetUdp();
-
-  uint32_t now = millis();
-  uint32_t lastUdpMsSnapshot;
-  portENTER_CRITICAL(&statusMux);
-  lastUdpMsSnapshot = artUdpLastPacketMs;
-  portEXIT_CRITICAL(&statusMux);
-
-  if (lastUdpMsSnapshot > 0 &&
-      (now - lastUdpMsSnapshot) >= ARTNET_IDLE_REBIND_MS &&
-      (now - lastRebindAttemptMs) >= ARTNET_REBIND_GUARD_MS) {
-    artudp.stop();
-    if (artudp.begin(6454)) {
-      portENTER_CRITICAL(&statusMux);
-      artUdpRebindTotal++;
-      portEXIT_CRITICAL(&statusMux);
-      Serial.println("[ARTNET] UDP rebind on idle timeout");
+  g_artudp.onPacket([](AsyncUDPPacket& packet) {
+    const uint8_t* data = packet.data();
+    const size_t len = packet.length();
+    if (!data || len == 0) {
+      return;
     }
-    lastRebindAttemptMs = now;
-  }
 
-  uint32_t startMs = millis();
-  uint32_t processed = 0;
-  int psize = artudp.parsePacket();
-  while (psize > 0 && processed < MAX_ARTNET_PACKETS_PER_LOOP) {
     uint32_t packetNowUs = micros();
-    IPAddress remoteIp = artudp.remoteIP();
-    uint16_t remotePort = artudp.remotePort();
+    IPAddress remoteIp = packet.remoteIP();
+    uint16_t remotePort = packet.remotePort();
+    uint32_t nowMs = millis();
+    uint16_t packetSize = (uint16_t)(len > 0xFFFFu ? 0xFFFFu : len);
 
     noteArtnetPacketTiming(packetNowUs);
     noteArtnetSource(remoteIp, remotePort);
+    noteArtnetSequence(data, (int)len);
 
+    ArtDmxPacket a = appParseArtDmx(data, (int)len);
     portENTER_CRITICAL(&statusMux);
     artUdpRxTotal++;
-    artUdpRxBytesTotal += (uint32_t)psize;
-    artUdpLastPacketMs = millis();
-    artUdpLastPacketSize = (uint16_t)psize;
+    artUdpRxBytesTotal += (uint32_t)len;
+    artUdpLastPacketMs = nowMs;
+    artUdpLastPacketSize = packetSize;
     artUdpLastRemoteIp = remoteIp;
     artUdpLastRemotePort = remotePort;
+
+    if (!a.ok) {
+      artDmxInvalidTotal++;
+      portEXIT_CRITICAL(&statusMux);
+      return;
+    }
+
+    artLastUniverseFlat = a.universe_flat;
+    artDmxRxTotal++;
+
+    uint16_t universe = g_cfg.artnetUniverse;
+    if (a.universe_flat != universe) {
+      artDmxUniverseMismatchTotal++;
+      portEXIT_CRITICAL(&statusMux);
+      return;
+    }
+
+    uint16_t addr = g_cfg.dmxStartAddress;
+    if (addr < 1 || addr + 7 > a.length) {
+      portEXIT_CRITICAL(&statusMux);
+      return;
+    }
+
+    addr -= 1;
+    uint16_t value0 = ((uint16_t)a.data[addr] << 8) | a.data[addr + 1];
+    uint16_t value1 = ((uint16_t)a.data[addr + 2] << 8) | a.data[addr + 3];
+    uint16_t value2 = ((uint16_t)a.data[addr + 4] << 8) | a.data[addr + 5];
+    uint16_t value3 = ((uint16_t)a.data[addr + 6] << 8) | a.data[addr + 7];
+
+    g_pendingLedValues[0] = value0;
+    g_pendingLedValues[1] = value1;
+    g_pendingLedValues[2] = value2;
+    g_pendingLedValues[3] = value3;
+    g_havePendingLedValues = true;
+    artDmxUniverseMatchTotal++;
+    artDmxLastArrivalMs = nowMs;
     portEXIT_CRITICAL(&statusMux);
+  });
 
-    int readLen = psize;
-    if (readLen > (int)sizeof(artbuf)) readLen = sizeof(artbuf);
+  g_artudpListening = g_artudp.listen(6454);
+  if (g_artudpListening) {
+    Serial.println("[ARTNET] AsyncUDP listening on :6454");
+  } else {
+    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+  }
+}
 
-    int n = artudp.read(artbuf, readLen);
-    if (n > 0) {
-      noteArtnetSequence(artbuf, n);
-      ArtDmxPacket a = appParseArtDmx(artbuf, n);
-      if (a.ok) {
-        processArtnet(a);
-      } else {
-        portENTER_CRITICAL(&statusMux);
-        artDmxInvalidTotal++;
-        portEXIT_CRITICAL(&statusMux);
-      }
-    }
+static void pollArtnet() {
+  if (!g_artudpListening) {
+    startArtnetListener();
+  }
 
-    psize = artudp.parsePacket();
-    processed++;
+  bool havePendingValues = false;
+  uint16_t values[4] = {0, 0, 0, 0};
+  portENTER_CRITICAL(&statusMux);
+  if (g_havePendingLedValues) {
+    values[0] = g_pendingLedValues[0];
+    values[1] = g_pendingLedValues[1];
+    values[2] = g_pendingLedValues[2];
+    values[3] = g_pendingLedValues[3];
+    g_havePendingLedValues = false;
+    havePendingValues = true;
+  }
+  portEXIT_CRITICAL(&statusMux);
 
-    if ((millis() - startMs) >= ARTNET_DRAIN_BUDGET_MS) {
-      break;
-    }
+  if (havePendingValues) {
+    setLedFloat(0, (float)values[0] / 65535.0f);
+    setLedFloat(1, (float)values[1] / 65535.0f);
+    setLedFloat(2, (float)values[2] / 65535.0f);
+    setLedFloat(3, (float)values[3] / 65535.0f);
+    appMarkArtnetActivity();
   }
 }
 

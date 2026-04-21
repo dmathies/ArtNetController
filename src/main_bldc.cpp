@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
-#include <WiFiUdp.h>
+#include <AsyncUDP.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 
@@ -28,11 +28,19 @@ static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
 static constexpr uint32_t MOTOR_TASK_DELAY_MS = 10;
 static constexpr uint32_t SOURCE_HOLD_MS = 1000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
-static constexpr uint32_t MAX_ARTNET_PACKETS_PER_LOOP = 64;
-static constexpr uint32_t ARTNET_DRAIN_BUDGET_MS = 8;
+static constexpr uint32_t ARTNET_HEALTH_LOG_INTERVAL_MS = 5000;
+static constexpr uint32_t STATUS_DIAGNOSTICS_REFRESH_MS = 2000;
 
 #ifndef ARTNET_TIMING_LOG_ENABLE
 #define ARTNET_TIMING_LOG_ENABLE 0
+#endif
+
+#ifndef ARTNET_HEALTH_LOG_ENABLE
+#define ARTNET_HEALTH_LOG_ENABLE 0
+#endif
+
+#ifndef BLDC_RX_LOG_ENABLE
+#define BLDC_RX_LOG_ENABLE 0
 #endif
 
 static constexpr uint32_t ARTNET_TIMING_LOG_WINDOW_MS = 3000;
@@ -103,9 +111,24 @@ struct StatusSnapshot {
   uint16_t motorTaskUtilPermille = 0;
 };
 
+struct CachedDiagnostics {
+  float boardTempC = NAN;
+  int32_t controlTaskStackHwm = -1;
+  int32_t motorTaskStackHwm = -1;
+  int32_t webTaskStackHwm = -1;
+  const char* controlTaskState = "unknown";
+  const char* motorTaskState = "unknown";
+  const char* webTaskState = "unknown";
+};
+
 static TaskHandle_t motorTaskHandle = nullptr;
 static TaskHandle_t controlTaskHandle = nullptr;
 static QueueHandle_t motorQueue = nullptr;
+static uint32_t g_lastArtnetHealthLogMs = 0;
+static AsyncUDP g_artudp;
+static bool g_artudpListening = false;
+static bool g_havePendingMotorRaw = false;
+static uint8_t g_pendingMotorRaw = 0;
 
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t g_motorRaw = 0;
@@ -127,6 +150,8 @@ static AppConfigCache g_cfg;
 static TaskMetrics g_controlTaskMetrics;
 static TaskMetrics g_motorTaskMetrics;
 static ArtnetTimingWindow g_artnetTiming;
+static CachedDiagnostics g_cachedDiagnostics;
+static uint32_t g_statusDiagnosticsBuiltMs = 0;
 
 static void noteArtnetPacketTiming(uint32_t nowUs) {
   ArtnetTimingWindow& t = g_artnetTiming;
@@ -269,6 +294,165 @@ static void logArtnetTimingWindowIfDue(uint32_t nowMs) {
 #endif
 }
 
+static void startArtnetListener() {
+  if (g_artudpListening) {
+    return;
+  }
+
+  g_artudp.onPacket([](AsyncUDPPacket& packet) {
+    const uint8_t* data = packet.data();
+    const size_t len = packet.length();
+    if (!data || len == 0) {
+      return;
+    }
+
+    const uint32_t nowMs = millis();
+    const uint32_t nowUs = micros();
+    const uint16_t packetSize = (uint16_t)(len > 0xFFFFu ? 0xFFFFu : len);
+    const IPAddress remoteIp = packet.remoteIP();
+    const uint16_t remotePort = packet.remotePort();
+    const uint16_t configuredUniverse = g_cfg.artnetUniverse;
+    const uint16_t configuredChannel = g_cfg.dmxStartAddress;
+
+    bool dmxOk = false;
+    bool universeMatch = false;
+    uint16_t universeFlat = 0;
+    uint8_t motorRaw = 0;
+
+    if (len >= 18 &&
+        memcmp(data, "Art-Net\0", 8) == 0 &&
+        data[8] == 0x00 &&
+        data[9] == 0x50) {
+      uint8_t subUni = data[14];
+      uint8_t net = data[15];
+      uint16_t dlen = ((uint16_t)data[16] << 8) | data[17];
+      if (dlen <= 512 && (18 + dlen) <= len) {
+        uint8_t subnet = (subUni >> 4) & 0x0F;
+        uint8_t uni = subUni & 0x0F;
+        universeFlat = ((uint16_t)net << 8) | ((uint16_t)subnet << 4) | uni;
+        dmxOk = true;
+        universeMatch = (universeFlat == configuredUniverse);
+        if (universeMatch && configuredChannel >= 1 && configuredChannel <= dlen) {
+          motorRaw = data[17 + configuredChannel];
+        }
+      }
+    }
+
+    portENTER_CRITICAL(&statusMux);
+    artUdpRxTotal++;
+    artUdpRxBytesTotal += (uint32_t)len;
+    artUdpLastPacketMs = nowMs;
+    artUdpLastPacketSize = packetSize;
+    artUdpLastRemoteIp = remoteIp;
+    artUdpLastRemotePort = remotePort;
+    if (!dmxOk) {
+      artDmxInvalidTotal++;
+    } else {
+      artDmxRxTotal++;
+      artLastUniverseFlat = universeFlat;
+      artDmxLastArrivalMs = nowMs;
+#if ARTNET_TIMING_LOG_ENABLE
+      noteArtnetPacketTiming(nowUs);
+      noteArtnetSource(remoteIp, remotePort);
+      noteArtnetSequence(data, (int)len);
+#endif
+      if (universeMatch) {
+        artDmxUniverseMatchTotal++;
+        if (configuredChannel >= 1) {
+          g_pendingMotorRaw = motorRaw;
+          g_havePendingMotorRaw = true;
+        }
+      } else {
+        artDmxUniverseMismatchTotal++;
+      }
+    }
+    portEXIT_CRITICAL(&statusMux);
+  });
+
+  g_artudpListening = g_artudp.listen(6454);
+  if (g_artudpListening) {
+    Serial.println("[ARTNET] AsyncUDP listening on :6454");
+  } else {
+    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+  }
+}
+
+static void logArtnetHealthIfDue(uint32_t nowMs) {
+#if !ARTNET_HEALTH_LOG_ENABLE
+  (void)nowMs;
+  return;
+#else
+  if ((nowMs - g_lastArtnetHealthLogMs) < ARTNET_HEALTH_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  uint32_t udpLastMsAgo;
+  uint32_t udpRx;
+  uint32_t udpBytes;
+  uint32_t udpRebinds;
+  uint16_t lastUni;
+  uint16_t lastSize;
+  uint16_t lastPort;
+  IPAddress lastIp;
+  uint32_t dmxRx;
+  uint32_t dmxMatch;
+  uint32_t dmxMismatch;
+  uint32_t dmxInvalid;
+  uint16_t ctrlUtilPermille;
+  uint16_t motorUtilPermille;
+  uint32_t ctrlLastMs;
+  uint32_t motorLastMs;
+  uint8_t motorRaw;
+
+  portENTER_CRITICAL(&statusMux);
+  udpLastMsAgo = (artUdpLastPacketMs == 0) ? 0xFFFFFFFFu : (nowMs - artUdpLastPacketMs);
+  udpRx = artUdpRxTotal;
+  udpBytes = artUdpRxBytesTotal;
+  udpRebinds = artUdpRebindTotal;
+  lastUni = artLastUniverseFlat;
+  lastSize = artUdpLastPacketSize;
+  lastPort = artUdpLastRemotePort;
+  lastIp = artUdpLastRemoteIp;
+  dmxRx = artDmxRxTotal;
+  dmxMatch = artDmxUniverseMatchTotal;
+  dmxMismatch = artDmxUniverseMismatchTotal;
+  dmxInvalid = artDmxInvalidTotal;
+  ctrlUtilPermille = g_controlTaskMetrics.utilPermille;
+  motorUtilPermille = g_motorTaskMetrics.utilPermille;
+  ctrlLastMs = g_controlTaskMetrics.lastLoopMs;
+  motorLastMs = g_motorTaskMetrics.lastLoopMs;
+  motorRaw = g_motorRaw;
+  portEXIT_CRITICAL(&statusMux);
+
+  uint32_t artLastMs = appGetLastArtnetMs();
+  uint32_t artLastMsAgo = (artLastMs == 0) ? 0xFFFFFFFFu : (nowMs - artLastMs);
+
+  Serial.printf("[ARTHEALTH] up=%lu udp_last=%ldms art_last=%ldms udp_rx=%lu dmx=%lu match=%lu mismatch=%lu invalid=%lu bytes=%lu from=%s:%u pkt=%u uni=%u rebind=%lu motor=%u ctrl=%.1f%%/%ldms motor=%.1f%%/%ldms heap=%lu\n",
+                (unsigned long)nowMs,
+                (long)(udpLastMsAgo == 0xFFFFFFFFu ? -1 : (int32_t)udpLastMsAgo),
+                (long)(artLastMsAgo == 0xFFFFFFFFu ? -1 : (int32_t)artLastMsAgo),
+                (unsigned long)udpRx,
+                (unsigned long)dmxRx,
+                (unsigned long)dmxMatch,
+                (unsigned long)dmxMismatch,
+                (unsigned long)dmxInvalid,
+                (unsigned long)udpBytes,
+                lastIp.toString().c_str(),
+                (unsigned int)lastPort,
+                (unsigned int)lastSize,
+                (unsigned int)lastUni,
+                (unsigned long)udpRebinds,
+                (unsigned int)motorRaw,
+                (float)ctrlUtilPermille / 10.0f,
+                (long)(ctrlLastMs == 0 ? -1 : (int32_t)(nowMs - ctrlLastMs)),
+                (float)motorUtilPermille / 10.0f,
+                (long)(motorLastMs == 0 ? -1 : (int32_t)(nowMs - motorLastMs)),
+                (unsigned long)ESP.getFreeHeap());
+
+  g_lastArtnetHealthLogMs = nowMs;
+#endif
+}
+
 static void recordTaskMetrics(TaskMetrics& metrics, uint32_t busyUs) {
   uint32_t nowUs = micros();
   uint32_t nowMs = millis();
@@ -332,10 +516,12 @@ static void enqueueMotor(uint8_t raw) {
 static void motorTask(void* parameter) {
   uint8_t currentRaw = 0;
 
+#if BLDC_RX_LOG_ENABLE
   bldc.onFrame = [](const uint8_t* f) {
     Serial.printf("[BLDC RX] %02X %02X %02X %02X %02X %02X %02X\n",
                   f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
   };
+#endif
 
   for (;;) {
     uint32_t workUs = 0;
@@ -362,109 +548,63 @@ static void motorTask(void* parameter) {
   }
 }
 
-static void processArtnet(const ArtDmxPacket& a, bool* haveLatestRaw, uint8_t* latestRaw) {
+static void pollArtnet() {
+  if (!g_artudpListening) {
+    startArtnetListener();
+  }
+
+  bool havePendingRaw = false;
+  uint8_t pendingRaw = 0;
   portENTER_CRITICAL(&statusMux);
-  artDmxRxTotal++;
-  artLastUniverseFlat = a.universe_flat;
+  if (g_havePendingMotorRaw) {
+    pendingRaw = g_pendingMotorRaw;
+    g_havePendingMotorRaw = false;
+    havePendingRaw = true;
+  }
   portEXIT_CRITICAL(&statusMux);
 
-  uint16_t universe = g_cfg.artnetUniverse;
-  if (a.universe_flat != universe) {
-    portENTER_CRITICAL(&statusMux);
-    artDmxUniverseMismatchTotal++;
-    portEXIT_CRITICAL(&statusMux);
+  if (havePendingRaw) {
+    enqueueMotor(pendingRaw);
+    appMarkArtnetActivity();
+  }
+}
+
+static CachedDiagnostics readCachedDiagnostics() {
+  CachedDiagnostics diagnostics;
+  portENTER_CRITICAL(&statusMux);
+  diagnostics = g_cachedDiagnostics;
+  portEXIT_CRITICAL(&statusMux);
+  return diagnostics;
+}
+
+static void refreshStatusDiagnosticsIfDue(uint32_t nowMs) {
+  uint32_t lastBuiltMs;
+  portENTER_CRITICAL(&statusMux);
+  lastBuiltMs = g_statusDiagnosticsBuiltMs;
+  portEXIT_CRITICAL(&statusMux);
+
+  if (lastBuiltMs != 0 && (nowMs - lastBuiltMs) < STATUS_DIAGNOSTICS_REFRESH_MS) {
     return;
   }
 
-  uint16_t channel = g_cfg.dmxStartAddress;
-  if (channel < 1 || channel > a.length) return;
-
-  if (haveLatestRaw && latestRaw) {
-    *latestRaw = a.data[channel - 1];
-    *haveLatestRaw = true;
+  CachedDiagnostics diagnostics;
+  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
+  diagnostics.boardTempC = appReadBoardTemperatureC();
+  if (controlTaskHandle) {
+    diagnostics.controlTaskState = taskStateToString(eTaskGetState(controlTaskHandle));
+    diagnostics.controlTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
   }
-  appMarkArtnetActivity();
+  if (motorTaskHandle) {
+    diagnostics.motorTaskState = taskStateToString(eTaskGetState(motorTaskHandle));
+    diagnostics.motorTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(motorTaskHandle);
+  }
+  diagnostics.webTaskState = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
+  diagnostics.webTaskStackHwm = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
 
   portENTER_CRITICAL(&statusMux);
-  artDmxUniverseMatchTotal++;
-  artDmxLastArrivalMs = millis();
+  g_cachedDiagnostics = diagnostics;
+  g_statusDiagnosticsBuiltMs = nowMs;
   portEXIT_CRITICAL(&statusMux);
-}
-
-static void pollArtnet() {
-  static uint8_t artbuf[600];
-  static uint32_t lastRebindAttemptMs = 0;
-  static constexpr uint32_t ARTNET_IDLE_REBIND_MS = 10000;
-  static constexpr uint32_t ARTNET_REBIND_GUARD_MS = 3000;
-  WiFiUDP& artudp = appArtnetUdp();
-
-  uint32_t now = millis();
-  uint32_t lastUdpMsSnapshot;
-  portENTER_CRITICAL(&statusMux);
-  lastUdpMsSnapshot = artUdpLastPacketMs;
-  portEXIT_CRITICAL(&statusMux);
-
-  if (lastUdpMsSnapshot > 0 &&
-      (now - lastUdpMsSnapshot) >= ARTNET_IDLE_REBIND_MS &&
-      (now - lastRebindAttemptMs) >= ARTNET_REBIND_GUARD_MS) {
-    artudp.stop();
-    if (artudp.begin(6454)) {
-      portENTER_CRITICAL(&statusMux);
-      artUdpRebindTotal++;
-      portEXIT_CRITICAL(&statusMux);
-      Serial.println("[ARTNET] UDP rebind on idle timeout");
-    }
-    lastRebindAttemptMs = now;
-  }
-
-  uint32_t startMs = millis();
-  uint32_t processed = 0;
-  bool haveLatestRaw = false;
-  uint8_t latestRaw = 0;
-  int psize = artudp.parsePacket();
-  while (psize > 0 && processed < MAX_ARTNET_PACKETS_PER_LOOP) {
-    uint32_t packetNowUs = micros();
-    IPAddress remoteIp = artudp.remoteIP();
-    uint16_t remotePort = artudp.remotePort();
-
-    noteArtnetPacketTiming(packetNowUs);
-    noteArtnetSource(remoteIp, remotePort);
-
-    portENTER_CRITICAL(&statusMux);
-    artUdpRxTotal++;
-    artUdpRxBytesTotal += (uint32_t)psize;
-    artUdpLastPacketMs = millis();
-    artUdpLastPacketSize = (uint16_t)psize;
-    artUdpLastRemoteIp = remoteIp;
-    artUdpLastRemotePort = remotePort;
-    portEXIT_CRITICAL(&statusMux);
-
-    int readLen = psize;
-    if (readLen > (int)sizeof(artbuf)) readLen = sizeof(artbuf);
-
-    int n = artudp.read(artbuf, readLen);
-    if (n > 0) {
-      noteArtnetSequence(artbuf, n);
-      ArtDmxPacket a = appParseArtDmx(artbuf, n);
-      if (a.ok) {
-        processArtnet(a, &haveLatestRaw, &latestRaw);
-      } else {
-        portENTER_CRITICAL(&statusMux);
-        artDmxInvalidTotal++;
-        portEXIT_CRITICAL(&statusMux);
-      }
-    }
-    psize = artudp.parsePacket();
-    processed++;
-
-    if ((millis() - startMs) >= ARTNET_DRAIN_BUDGET_MS) {
-      break;
-    }
-  }
-
-  if (haveLatestRaw) {
-    enqueueMotor(latestRaw);
-  }
 }
 
 static void controlTask(void* parameter) {
@@ -476,6 +616,7 @@ static void controlTask(void* parameter) {
     pollArtnet();
     recordTaskMetrics(g_controlTaskMetrics, micros() - busyStartUs);
     logArtnetTimingWindowIfDue(millis());
+    logArtnetHealthIfDue(millis());
     vTaskDelay(pdMS_TO_TICKS(CONTROL_TASK_DELAY_MS));
   }
 }
@@ -504,9 +645,9 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   StatusSnapshot s = readStatusSnapshot();
   uint32_t now = millis();
   uint32_t artAge = (s.lastArtMs == 0) ? 0xFFFFFFFFu : (now - s.lastArtMs);
-  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
   AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
   WifiManagerClass& wifiManager = appWifiManager();
+  CachedDiagnostics diagnostics = readCachedDiagnostics();
   IPAddress ip = wifiManager.getIP();
   char ipBuf[16];
   char macBuf[18];
@@ -523,18 +664,18 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["wifi_mac"] = macBuf;
   j["free_heap"] = ESP.getFreeHeap();
   j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["board_temp_c"] = appReadBoardTemperatureC();
+  j["board_temp_c"] = diagnostics.boardTempC;
   j["reset_reason"] = appResetReasonToString(esp_reset_reason());
-  j["task_control_state"] = taskStateToString(eTaskGetState(controlTaskHandle));
-  j["task_control_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  j["task_control_state"] = diagnostics.controlTaskState;
+  j["task_control_stack_hwm"] = diagnostics.controlTaskStackHwm;
   j["task_control_last_ms_ago"] = (s.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.controlTaskLastLoopMs);
   j["task_control_util_pct"] = (float)s.controlTaskUtilPermille / 10.0f;
-  j["task_motor_state"] = taskStateToString(eTaskGetState(motorTaskHandle));
-  j["task_motor_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(motorTaskHandle);
+  j["task_motor_state"] = diagnostics.motorTaskState;
+  j["task_motor_stack_hwm"] = diagnostics.motorTaskStackHwm;
   j["task_motor_last_ms_ago"] = (s.motorTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.motorTaskLastLoopMs);
   j["task_motor_util_pct"] = (float)s.motorTaskUtilPermille / 10.0f;
-  j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
-  j["task_web_stack_hwm"] = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+  j["task_web_state"] = diagnostics.webTaskState;
+  j["task_web_stack_hwm"] = diagnostics.webTaskStackHwm;
   j["task_web_last_ms_ago"] = (webTaskStats.lastActiveMs == 0) ? -1 : (int32_t)(now - webTaskStats.lastActiveMs);
   j["task_web_util_pct"] = (float)webTaskStats.utilPermille / 10.0f;
 
@@ -550,6 +691,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
 }
 
 static size_t buildHealthSummary(char* out, size_t outSize) {
+  refreshStatusDiagnosticsIfDue(millis());
   StatusSnapshot s = readStatusSnapshot();
   uint32_t now = millis();
   int32_t lastMsAgo = (s.artDmxLastArrivalMs == 0) ? -1 : (int32_t)(now - s.artDmxLastArrivalMs);
@@ -621,6 +763,7 @@ void setup() {
 
   bldc.begin();
   applyStartValue(g_cfg.startValue);
+  refreshStatusDiagnosticsIfDue(millis());
 
   appInitRuntime({
     "/wifi-manager/index.html",
@@ -634,11 +777,14 @@ void setup() {
   appStartCommonServices();
 
   motorQueue = xQueueCreate(1, sizeof(MotorCmd));
+  // Keep application work off core 0 so the ESP32 WiFi/lwIP stack can service
+  // HTTP and UDP traffic without competing with our control loop.
   xTaskCreatePinnedToCore(motorTask, "MotorTask", 4096, nullptr, 2, &motorTaskHandle, 1);
-  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, nullptr, 1, &controlTaskHandle, 0);
+  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, nullptr, 1, &controlTaskHandle, 1);
 }
 
 void loop() {
+  refreshStatusDiagnosticsIfDue(millis());
   appCommonLoop(WS_STATUS_PUSH_MS);
   delay(1);
 }

@@ -40,6 +40,7 @@ public:
 
   void sendSpeed(uint8_t step /*0..60*/) {
     if (step > 60) step = 60;
+    Serial1.printf("[BLDC TX] speed %u\n", (unsigned)step);
     sendRaw(CMD_SPEED, step, 0, 0);
   }
 

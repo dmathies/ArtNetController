@@ -522,10 +522,10 @@
       let statusPollInFlight = false;
       let statusPollTimer = null;
       let lastStatusUpdateMs = 0;
-      const STATUS_POLL_ACTIVE_MS = 3000;
-      const STATUS_POLL_HIDDEN_MS = 5000;
-      const STATUS_FETCH_TIMEOUT_MS = 3000;
-      const STATUS_WS_STALE_MS = 6000;
+      const STATUS_POLL_ACTIVE_MS = 500;
+      const STATUS_POLL_HIDDEN_MS = 2000;
+      const STATUS_FETCH_TIMEOUT_MS = 1500;
+      const STATUS_WS_STALE_MS = 4000;
 
       function applyStatus(s) {
         lastStatusUpdateMs = Date.now();
@@ -582,40 +582,37 @@
       }
 
       function connectStatusWebSocket() {
-        if (statusSocket && (statusSocket.readyState === WebSocket.OPEN || statusSocket.readyState === WebSocket.CONNECTING)) return;
-
-        const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-        statusSocket = new WebSocket(`${proto}://${window.location.host}/ws`);
-
-        statusSocket.onopen = () => {
-          wsConnected = true;
-          if (wsReconnectTimer) {
-            clearTimeout(wsReconnectTimer);
-            wsReconnectTimer = null;
-          }
-          try { statusSocket.send('status'); } catch (e) {}
-        };
-
-        statusSocket.onmessage = (ev) => {
-          try {
-            applyStatus(JSON.parse(ev.data));
-          } catch (e) {}
-        };
-
-        statusSocket.onclose = () => {
+        if (statusSocket) {
+          try { statusSocket.close(); } catch (e) {}
+          statusSocket = null;
+        }
+        wsConnected = false;
+        const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        try {
+          statusSocket = new WebSocket(`${proto}${location.host}/ws`);
+          statusSocket.onopen = () => {
+            wsConnected = true;
+            lastStatusUpdateMs = Date.now();
+            if (statusPollTimer) clearTimeout(statusPollTimer);
+          };
+          statusSocket.onmessage = (event) => {
+            try {
+              applyStatus(JSON.parse(event.data));
+            } catch (e) {
+            }
+          };
+          statusSocket.onclose = () => {
+            wsConnected = false;
+            statusSocket = null;
+            scheduleNextStatusPoll(250);
+          };
+          statusSocket.onerror = () => {
+            wsConnected = false;
+          };
+        } catch (e) {
           wsConnected = false;
-          if (!wsReconnectTimer) {
-            wsReconnectTimer = setTimeout(() => {
-              wsReconnectTimer = null;
-              connectStatusWebSocket();
-            }, 1500);
-          }
-          scheduleNextStatusPoll(500);
-        };
-
-        statusSocket.onerror = () => {
-          if (statusSocket) statusSocket.close();
-        };
+          statusSocket = null;
+        }
       }
 
       async function pollStatus() {

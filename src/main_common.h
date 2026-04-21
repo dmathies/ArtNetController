@@ -1,7 +1,6 @@
 #pragma once
 
 #include <Arduino.h>
-#include <WiFiUdp.h>
 #include <esp_http_server.h>
 
 #include "WifiManager.h"
@@ -28,7 +27,6 @@ struct AppTaskRuntimeStats {
 
 Configuration& appConfig();
 WifiManagerClass& appWifiManager();
-WiFiUDP& appArtnetUdp();
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len);
 void appMarkArtnetActivity();

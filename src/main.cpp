@@ -1,12 +1,15 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WebServer.h>
+#include <ESPAsyncWebServer.h>
 #include <esp_http_server.h>
 #include <LittleFS.h>
 #include <Update.h>
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <ArduinoJson.h>
+#include <lwip/sockets.h>
+#include <lwip/tcp.h>
 #include <cctype>
 #include <cstring>
 
@@ -22,9 +25,18 @@ static constexpr size_t HTTP_FILE_CHUNK_SIZE = 1024;
 static constexpr size_t HTTP_FILE_DIRECT_SEND_LIMIT = 32768;
 static constexpr size_t STATUS_JSON_BUFFER_SIZE = 2048;
 static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
+static constexpr uint32_t STATUS_CACHE_REFRESH_MS = 100;
 
 #ifndef WEB_DEBUG_LOG
 #define WEB_DEBUG_LOG 0
+#endif
+
+#ifndef WEB_SOCKET_ENABLE
+#define WEB_SOCKET_ENABLE 1
+#endif
+
+#ifndef HTTP_TIMING_LOG_ENABLE
+#define HTTP_TIMING_LOG_ENABLE 1
 #endif
 
 #ifndef HEALTH_LOG_ENABLE
@@ -52,8 +64,10 @@ static AppRuntimeHooks g_hooks = {
 
 static httpd_handle_t g_webHttpd = nullptr;
 static TaskHandle_t g_webTaskHandle = nullptr;
-static WiFiUDP g_artudp;
-
+static WebServer g_webServer(80);
+static AsyncWebServer g_asyncWebServer(80);
+static AsyncWebSocket g_statusWs("/ws");
+static bool g_webServerStarted = false;
 static portMUX_TYPE g_statusMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_lastArtMs = 0;
 static uint32_t g_webTaskLastActiveMs = 0;
@@ -69,6 +83,13 @@ static uint32_t g_lastWsPingMs = 0;
 static uint32_t g_lastHealthLogMs = 0;
 static portMUX_TYPE g_fileSendMux = portMUX_INITIALIZER_UNLOCKED;
 static int g_activeFileSends = 0;
+static portMUX_TYPE g_httpSockMux = portMUX_INITIALIZER_UNLOCKED;
+static int g_httpSockFds[MAX_WS_CLIENTS + 8] = {-1};
+static uint32_t g_httpSockOpenMs[MAX_WS_CLIENTS + 8] = {0};
+static char g_statusJsonCache[STATUS_JSON_BUFFER_SIZE];
+static size_t g_statusJsonCacheLen = 0;
+static uint32_t g_statusJsonCacheBuiltMs = 0;
+static bool g_asyncUpdateOk = false;
 
 struct PendingWsFrame {
   int fd;
@@ -130,7 +151,6 @@ static void logFileReadPerf(const char* path) {
 
 Configuration& appConfig() { return g_config; }
 WifiManagerClass& appWifiManager() { return g_wifiManager; }
-WiFiUDP& appArtnetUdp() { return g_artudp; }
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
   ArtDmxPacket r;
@@ -255,13 +275,116 @@ static void setCorsHeaders(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
 }
 
+static void setConnectionCloseHeader(httpd_req_t* req) {
+  httpd_resp_set_hdr(req, "Connection", "close");
+}
+
+static void noteHttpSocketOpen(int sockfd) {
+  portENTER_CRITICAL(&g_httpSockMux);
+  for (size_t i = 0; i < (sizeof(g_httpSockFds) / sizeof(g_httpSockFds[0])); i++) {
+    if (g_httpSockFds[i] == sockfd || g_httpSockFds[i] < 0) {
+      g_httpSockFds[i] = sockfd;
+      g_httpSockOpenMs[i] = millis();
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_httpSockMux);
+}
+
+static void noteHttpSocketClose(int sockfd) {
+  portENTER_CRITICAL(&g_httpSockMux);
+  for (size_t i = 0; i < (sizeof(g_httpSockFds) / sizeof(g_httpSockFds[0])); i++) {
+    if (g_httpSockFds[i] == sockfd) {
+      g_httpSockFds[i] = -1;
+      g_httpSockOpenMs[i] = 0;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_httpSockMux);
+}
+
+static uint32_t getHttpSocketAgeMs(int sockfd) {
+  uint32_t ageMs = 0xFFFFFFFFu;
+  uint32_t nowMs = millis();
+  portENTER_CRITICAL(&g_httpSockMux);
+  for (size_t i = 0; i < (sizeof(g_httpSockFds) / sizeof(g_httpSockFds[0])); i++) {
+    if (g_httpSockFds[i] == sockfd) {
+      ageMs = (g_httpSockOpenMs[i] == 0) ? 0xFFFFFFFFu : (nowMs - g_httpSockOpenMs[i]);
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_httpSockMux);
+  return ageMs;
+}
+
+static esp_err_t onHttpSocketOpen(httpd_handle_t hd, int sockfd) {
+  (void)hd;
+  int flag = 1;
+  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)) != 0) {
+    return ESP_FAIL;
+  }
+  noteHttpSocketOpen(sockfd);
+  return ESP_OK;
+}
+
+static void onHttpSocketClose(httpd_handle_t hd, int sockfd) {
+  (void)hd;
+  noteHttpSocketClose(sockfd);
+}
+
 static esp_err_t optionsHandler(httpd_req_t* req) {
   uint32_t startMs = millis();
   setCorsHeaders(req);
+  setConnectionCloseHeader(req);
   httpd_resp_set_status(req, "204 No Content");
   esp_err_t ret = httpd_resp_send(req, nullptr, 0);
   logHttpRequest(req, startMs, ret == ESP_OK ? 204 : 500);
   return ret;
+}
+
+static void logHttpTimingBreakdown(httpd_req_t* req,
+                                   const char* tag,
+                                   uint32_t totalMs,
+                                   uint32_t prepMs,
+                                   uint32_t sendMs,
+                                   int statusCode,
+                                   int sendResult) {
+#if !HTTP_TIMING_LOG_ENABLE
+  (void)req;
+  (void)tag;
+  (void)totalMs;
+  (void)prepMs;
+  (void)sendMs;
+  (void)statusCode;
+  (void)sendResult;
+#else
+  int fd = req ? httpd_req_to_sockfd(req) : -1;
+  uint32_t sockAgeMs = (fd >= 0) ? getHttpSocketAgeMs(fd) : 0xFFFFFFFFu;
+  Serial.printf("[HTIM] %s %s %s fd=%d age=%ld status=%d total=%lu prep=%lu send=%lu ret=%d\n",
+                tag,
+                req ? httpMethodToString(req->method) : "?",
+                req ? req->uri : "?",
+                fd,
+                (long)(sockAgeMs == 0xFFFFFFFFu ? -1 : (int32_t)sockAgeMs),
+                statusCode,
+                (unsigned long)totalMs,
+                (unsigned long)prepMs,
+                (unsigned long)sendMs,
+                sendResult);
+#endif
+}
+
+static bool requestAcceptsGzip(httpd_req_t* req) {
+  if (!req) return false;
+  size_t len = httpd_req_get_hdr_value_len(req, "Accept-Encoding");
+  if (len == 0 || len > 255) return false;
+
+  char value[256];
+  if (httpd_req_get_hdr_value_str(req, "Accept-Encoding", value, sizeof(value)) != ESP_OK) {
+    return false;
+  }
+
+  return strstr(value, "gzip") != nullptr;
 }
 
 static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* contentType) {
@@ -271,7 +394,19 @@ static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* cont
   g_activeFileSends++;
   portEXIT_CRITICAL(&g_fileSendMux);
 
-  File file = LittleFS.open(path, FILE_READ);
+  String resolvedPath = path;
+  bool servingGzip = false;
+  if (requestAcceptsGzip(req)) {
+    String gzPath = resolvedPath + ".gz";
+    File gzFile = LittleFS.open(gzPath, FILE_READ);
+    if (gzFile && !gzFile.isDirectory()) {
+      resolvedPath = gzPath;
+      servingGzip = true;
+      gzFile.close();
+    }
+  }
+
+  File file = LittleFS.open(resolvedPath.c_str(), FILE_READ);
   if (!file || file.isDirectory()) {
     httpd_resp_set_status(req, "404 Not Found");
     esp_err_t ret = httpd_resp_send(req, "Not Found", HTTPD_RESP_USE_STRLEN);
@@ -297,6 +432,11 @@ static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* cont
 
   httpd_resp_set_type(req, contentType);
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  setConnectionCloseHeader(req);
+  if (servingGzip) {
+    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Vary", "Accept-Encoding");
+  }
   esp_err_t ret = ESP_OK;
   size_t totalSent = 0;
   uint32_t readMs = 0;
@@ -340,8 +480,9 @@ static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* cont
 
   const uint32_t totalMs = millis() - startMs;
   if (WEB_DEBUG_LOG || sendMs >= SLOW_FS_SEND_MS || totalMs >= SLOW_FS_TOTAL_MS) {
-    Serial.printf("[FS] %s read=%lu ms send=%lu ms total=%lu ms size=%lu\n",
+    Serial.printf("[FS] %s%s read=%lu ms send=%lu ms total=%lu ms size=%lu\n",
                   path,
+                  servingGzip ? " (gzip)" : "",
                   (unsigned long)readMs,
                   (unsigned long)sendMs,
                   (unsigned long)totalMs,
@@ -351,14 +492,22 @@ static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* cont
   char detail[128];
   snprintf(detail,
            sizeof(detail),
-           "%s, %lu/%lu B, heap=%lu, err=%d",
+           "%s%s, %lu/%lu B, heap=%lu, err=%d",
            path,
+           servingGzip ? " (gzip)" : "",
            (unsigned long)totalSent,
            (unsigned long)size,
            (unsigned long)ESP.getFreeHeap(),
            (int)ret);
   file.close();
   free(buf);
+  logHttpTimingBreakdown(req,
+                         "fs",
+                         millis() - startMs,
+                         readMs,
+                         sendMs,
+                         ret == ESP_OK ? 200 : 500,
+                         (int)ret);
   logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
 
   portENTER_CRITICAL(&g_fileSendMux);
@@ -400,14 +549,64 @@ static esp_err_t statusHandler(httpd_req_t* req) {
   }
 
   char out[STATUS_JSON_BUFFER_SIZE];
-  size_t outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
+  size_t outLen = 0;
+  uint32_t prepStartMs = millis();
+  if (!details) {
+    portENTER_CRITICAL(&g_statusMux);
+    outLen = g_statusJsonCacheLen;
+    if (outLen > sizeof(out)) outLen = sizeof(out);
+    if (outLen > 0) {
+      memcpy(out, g_statusJsonCache, outLen);
+    }
+    portEXIT_CRITICAL(&g_statusMux);
+  }
+
+  if (outLen == 0) {
+    outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
+    if (!details && outLen > 0 && outLen <= sizeof(g_statusJsonCache)) {
+      portENTER_CRITICAL(&g_statusMux);
+      memcpy(g_statusJsonCache, out, outLen);
+      g_statusJsonCacheLen = outLen;
+      g_statusJsonCacheBuiltMs = millis();
+      portEXIT_CRITICAL(&g_statusMux);
+    }
+  }
+  uint32_t prepMs = millis() - prepStartMs;
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  setConnectionCloseHeader(req);
+  uint32_t sendStartMs = millis();
   esp_err_t ret = httpd_resp_send(req, out, outLen);
+  uint32_t sendMs = millis() - sendStartMs;
   char detail[48];
   snprintf(detail, sizeof(detail), "details=%d, %lu B", details ? 1 : 0, (unsigned long)outLen);
+  logHttpTimingBreakdown(req,
+                         "status",
+                         millis() - startMs,
+                         prepMs,
+                         sendMs,
+                         ret == ESP_OK ? 200 : 500,
+                         (int)ret);
   logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
+  return ret;
+}
+
+static esp_err_t notFoundHandler(httpd_req_t* req, httpd_err_code_t error) {
+  (void)error;
+  uint32_t startMs = millis();
+  setConnectionCloseHeader(req);
+  uint32_t sendStartMs = millis();
+  esp_err_t ret = httpd_resp_send_404(req);
+  uint32_t sendMs = millis() - sendStartMs;
+  logHttpTimingBreakdown(req,
+                         "404",
+                         millis() - startMs,
+                         0,
+                         sendMs,
+                         404,
+                         (int)ret);
+  logHttpRequest(req, startMs, 404, "not found");
   return ret;
 }
 
@@ -448,6 +647,16 @@ static int wsCopyClients(int* out, int maxCount) {
   portENTER_CRITICAL(&g_wsClientMux);
   for (int i = 0; i < MAX_WS_CLIENTS && count < maxCount; i++) {
     if (g_wsClientFds[i] >= 0) out[count++] = g_wsClientFds[i];
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+  return count;
+}
+
+static int wsClientCount() {
+  int count = 0;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] >= 0) count++;
   }
   portEXIT_CRITICAL(&g_wsClientMux);
   return count;
@@ -526,10 +735,54 @@ static esp_err_t buildStatusPayload(uint8_t** payloadOut, size_t* lenOut) {
   char* out = (char*)malloc(STATUS_JSON_BUFFER_SIZE);
   if (!out) return ESP_ERR_NO_MEM;
 
-  size_t outLen = g_hooks.buildStatusJson(out, STATUS_JSON_BUFFER_SIZE, false);
+  size_t outLen = 0;
+  portENTER_CRITICAL(&g_statusMux);
+  outLen = g_statusJsonCacheLen;
+  if (outLen > STATUS_JSON_BUFFER_SIZE) outLen = STATUS_JSON_BUFFER_SIZE;
+  if (outLen > 0) {
+    memcpy(out, g_statusJsonCache, outLen);
+  }
+  portEXIT_CRITICAL(&g_statusMux);
+
+  if (outLen == 0) {
+    outLen = g_hooks.buildStatusJson(out, STATUS_JSON_BUFFER_SIZE, false);
+    if (outLen > 0 && outLen <= sizeof(g_statusJsonCache)) {
+      portENTER_CRITICAL(&g_statusMux);
+      memcpy(g_statusJsonCache, out, outLen);
+      g_statusJsonCacheLen = outLen;
+      g_statusJsonCacheBuiltMs = millis();
+      portEXIT_CRITICAL(&g_statusMux);
+    }
+  }
+
   *payloadOut = (uint8_t*)out;
   *lenOut = outLen;
   return ESP_OK;
+}
+
+static void refreshStatusCacheIfDue(uint32_t nowMs) {
+  if (!g_hooks.buildStatusJson) return;
+
+  uint32_t lastBuiltMs = 0;
+  portENTER_CRITICAL(&g_statusMux);
+  lastBuiltMs = g_statusJsonCacheBuiltMs;
+  portEXIT_CRITICAL(&g_statusMux);
+
+  if (lastBuiltMs != 0 && (nowMs - lastBuiltMs) < STATUS_CACHE_REFRESH_MS) {
+    return;
+  }
+
+  char out[STATUS_JSON_BUFFER_SIZE];
+  size_t outLen = g_hooks.buildStatusJson(out, sizeof(out), false);
+  if (outLen == 0 || outLen > sizeof(g_statusJsonCache)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&g_statusMux);
+  memcpy(g_statusJsonCache, out, outLen);
+  g_statusJsonCacheLen = outLen;
+  g_statusJsonCacheBuiltMs = nowMs;
+  portEXIT_CRITICAL(&g_statusMux);
 }
 
 static void wsSendStatusWork(void* arg) {
@@ -594,9 +847,13 @@ static void wsBroadcastStatus() {
     return;
   }
 
-  uint32_t startMs = millis();
   int clients[MAX_WS_CLIENTS];
   int count = wsCopyClients(clients, MAX_WS_CLIENTS);
+  if (count <= 0) {
+    return;
+  }
+
+  uint32_t startMs = millis();
   int failed = 0;
   for (int i = 0; i < count; i++) {
     if (wsSendStatusToClient(clients[i]) != ESP_OK) {
@@ -975,6 +1232,744 @@ static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
 static esp_err_t firmwareUpdateHandler(httpd_req_t* req) { return performUpdate(req, U_FLASH); }
 static esp_err_t fsUpdateHandler(httpd_req_t* req) { return performUpdate(req, U_SPIFFS); }
 
+static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json = false) {
+  if (!response) return;
+  response->addHeader("Access-Control-Allow-Origin", "*");
+  response->addHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
+  response->addHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (json) {
+    response->addHeader("Cache-Control", "no-store");
+    response->setContentType("application/json");
+  }
+}
+
+static bool asyncRequestAcceptsGzip(AsyncWebServerRequest* request) {
+  if (!request || !request->hasHeader("Accept-Encoding")) return false;
+  const AsyncWebHeader* hdr = request->getHeader("Accept-Encoding");
+  return hdr && hdr->value().indexOf("gzip") >= 0;
+}
+
+static void asyncSendOptions(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  AsyncWebServerResponse* response = request->beginResponse(204);
+  asyncAddCommonHeaders(response);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void asyncSendFsFile(AsyncWebServerRequest* request, const char* path, const char* contentType) {
+  uint32_t startMs = millis();
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends++;
+  portEXIT_CRITICAL(&g_fileSendMux);
+
+  String resolvedPath = path;
+  bool servingGzip = false;
+  if (asyncRequestAcceptsGzip(request)) {
+    String gzPath = resolvedPath + ".gz";
+    File gzFile = LittleFS.open(gzPath, FILE_READ);
+    if (gzFile && !gzFile.isDirectory()) {
+      resolvedPath = gzPath;
+      servingGzip = true;
+      gzFile.close();
+    }
+  }
+
+  if (!LittleFS.exists(resolvedPath)) {
+    AsyncWebServerResponse* response = request->beginResponse(404, "text/plain", "Not Found");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    portENTER_CRITICAL(&g_fileSendMux);
+    g_activeFileSends--;
+    portEXIT_CRITICAL(&g_fileSendMux);
+    return;
+  }
+
+  AsyncWebServerResponse* response = request->beginResponse(LittleFS, resolvedPath, contentType);
+  asyncAddCommonHeaders(response);
+  if (servingGzip) {
+    response->addHeader("Content-Encoding", "gzip");
+    response->addHeader("Vary", "Accept-Encoding");
+  }
+  request->send(response);
+  uint32_t totalMs = millis() - startMs;
+  noteWebTaskWorkUs(totalMs * 1000UL);
+  if (HTTP_TIMING_LOG_ENABLE) {
+    Serial.printf("[HTIM] fs-async GET %s status=200 total=%lu prep=0 send=%lu ret=0\n",
+                  path,
+                  (unsigned long)totalMs,
+                  (unsigned long)totalMs);
+  }
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends--;
+  portEXIT_CRITICAL(&g_fileSendMux);
+}
+
+static void asyncStatusHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  bool details = false;
+  if (request->hasParam("details")) {
+    String value = request->getParam("details")->value();
+    details = (value == "1" || value == "true");
+  }
+
+  char out[STATUS_JSON_BUFFER_SIZE];
+  size_t outLen = 0;
+  if (!details) {
+    portENTER_CRITICAL(&g_statusMux);
+    outLen = g_statusJsonCacheLen;
+    if (outLen > sizeof(out)) outLen = sizeof(out);
+    if (outLen > 0) memcpy(out, g_statusJsonCache, outLen);
+    portEXIT_CRITICAL(&g_statusMux);
+  }
+  if (outLen == 0 && g_hooks.buildStatusJson) {
+    outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
+    if (!details && outLen > 0 && outLen <= sizeof(g_statusJsonCache)) {
+      portENTER_CRITICAL(&g_statusMux);
+      memcpy(g_statusJsonCache, out, outLen);
+      g_statusJsonCacheLen = outLen;
+      g_statusJsonCacheBuiltMs = millis();
+      portEXIT_CRITICAL(&g_statusMux);
+    }
+  }
+
+  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", String(out).substring(0, outLen));
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  uint32_t totalMs = millis() - startMs;
+  noteWebTaskWorkUs(totalMs * 1000UL);
+  if (HTTP_TIMING_LOG_ENABLE) {
+    Serial.printf("[HTIM] status-async GET /status status=200 total=%lu prep=0 send=%lu ret=0\n",
+                  (unsigned long)totalMs,
+                  (unsigned long)totalMs);
+  }
+}
+
+static void asyncNetworksHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  bool details = false;
+  bool refresh = false;
+  if (request->hasParam("details")) {
+    String value = request->getParam("details")->value();
+    details = (value == "1" || value == "true");
+  }
+  if (request->hasParam("refresh")) {
+    String value = request->getParam("refresh")->value();
+    refresh = (value == "1" || value == "true");
+  }
+  if (request->hasParam("scan")) {
+    String value = request->getParam("scan")->value();
+    refresh = (value == "1" || value == "true");
+  }
+  if (details && !refresh) refresh = true;
+  String payload = g_wifiManager.getNetworksPayload(details, refresh);
+  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", payload);
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void asyncCredentialsGetHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  DynamicJsonDocument doc(1024);
+  int channel = g_config.getDMXAddress();
+  int universe = g_config.getDMXUniverse();
+  doc["ssid"] = g_config.getSSID();
+  doc["hostname"] = g_config.getHostname();
+  doc["password"] = g_config.getPass();
+  doc["dhcp"] = g_config.getDhcpEnabled();
+  doc["ip"] = g_config.getStaticIP();
+  doc["gateway"] = g_config.getGateway();
+  doc["subnet"] = g_config.getSubnet();
+  doc["dns1"] = g_config.getDNS1();
+  doc["dns2"] = g_config.getDNS2();
+  doc["start_value"] = g_config.getStartValue();
+  doc["channel"] = channel;
+  doc["universe"] = universe;
+  doc["dmx_address"] = channel;
+  doc["dmx_universe"] = universe;
+  String out;
+  serializeJson(doc, out);
+  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", out);
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void asyncCredentialsPutBody(AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+  if (!index) {
+    char* body = (char*)malloc(total + 1);
+    if (!body) return;
+    request->_tempObject = body;
+  }
+  char* body = (char*)request->_tempObject;
+  if (!body) return;
+  memcpy(body + index, data, len);
+  if (index + len == total) {
+    body[total] = '\0';
+  }
+}
+
+static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  char* body = (char*)request->_tempObject;
+  if (!body) {
+    AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, body);
+  free(body);
+  request->_tempObject = nullptr;
+  if (err) {
+    AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  auto invalidTextField = [](const char* value, bool allowEmpty, size_t maxLen) {
+    if (!value) return !allowEmpty;
+    size_t llen = strlen(value);
+    if (llen == 0) return !allowEmpty;
+    if (llen > maxLen) return true;
+    for (size_t i = 0; i < llen; i++) {
+      unsigned char ch = (unsigned char)value[i];
+      if (ch < 32 || ch == 127) return true;
+    }
+    return false;
+  };
+
+  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
+  float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
+
+  if (ssidValue && invalidTextField(ssidValue, false, 32)) {
+    AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "Invalid SSID");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+  if (hostnameValue && invalidTextField(hostnameValue, true, 63)) {
+    AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "Invalid hostname");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
+  if (doc.containsKey("password")) g_config.writePass(passwordValue);
+  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
+  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
+  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
+  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
+  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
+  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
+  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
+  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
+  if (doc.containsKey("channel")) {
+    int channel = doc["channel"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  } else if (doc.containsKey("dmx_address")) {
+    int channel = doc["dmx_address"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  }
+  if (doc.containsKey("universe")) {
+    int universe = doc["universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  } else if (doc.containsKey("dmx_universe")) {
+    int universe = doc["dmx_universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  }
+
+  g_wifiManager.scheduleRestart(1000);
+  AsyncWebServerResponse* response = request->beginResponse(204);
+  asyncAddCommonHeaders(response);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void asyncUpdateInfoHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  StaticJsonDocument<128> doc;
+  doc["version"] = "1.0.0";
+  doc["device"] = g_hooks.deviceName;
+  doc["ota_ready"] = true;
+  String out;
+  serializeJson(doc, out);
+  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", out);
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void asyncHandleUpdateBody(AsyncWebServerRequest* request, int updateCmd, uint8_t* data, size_t len, size_t index, size_t total) {
+  if (!index) {
+    g_asyncUpdateOk = false;
+    g_wifiManager.setOtaInProgress(true);
+    bool beginOk = false;
+    if (updateCmd == U_SPIFFS) {
+      const esp_partition_t* fsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "littlefs");
+      beginOk = (fsPart != nullptr) && Update.begin(fsPart->size, U_SPIFFS);
+    } else {
+      beginOk = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+    }
+    if (!beginOk) {
+      Update.printError(Serial);
+      return;
+    }
+  }
+  if (Update.write(data, len) != len) {
+    Update.printError(Serial);
+    return;
+  }
+  if (index + len == total) {
+    g_asyncUpdateOk = Update.end(true);
+    if (!g_asyncUpdateOk) Update.printError(Serial);
+  }
+  (void)request;
+}
+
+static void asyncHandleUpdateRequest(AsyncWebServerRequest* request, int updateCmd) {
+  uint32_t startMs = millis();
+  g_wifiManager.setOtaInProgress(false);
+  AsyncWebServerResponse* response;
+  if (g_asyncUpdateOk) {
+    response = request->beginResponse(200, "application/json", "{\"success\":true,\"message\":\"Update successful. Restarting...\"}");
+    g_wifiManager.scheduleRestart(1000);
+  } else {
+    response = request->beginResponse(400, "application/json", "{\"success\":false,\"message\":\"Update failed\"}");
+  }
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+  (void)updateCmd;
+}
+
+static void asyncNotFoundHandler(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  AsyncWebServerResponse* response = request->beginResponse(404, "text/plain", "Not Found");
+  asyncAddCommonHeaders(response);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static String buildAsyncStatusPayload() {
+  char out[STATUS_JSON_BUFFER_SIZE];
+  size_t outLen = 0;
+  portENTER_CRITICAL(&g_statusMux);
+  outLen = g_statusJsonCacheLen;
+  if (outLen > sizeof(out)) outLen = sizeof(out);
+  if (outLen > 0) memcpy(out, g_statusJsonCache, outLen);
+  portEXIT_CRITICAL(&g_statusMux);
+
+  if (outLen == 0 && g_hooks.buildStatusJson) {
+    outLen = g_hooks.buildStatusJson(out, sizeof(out), false);
+    if (outLen > 0 && outLen <= sizeof(g_statusJsonCache)) {
+      portENTER_CRITICAL(&g_statusMux);
+      memcpy(g_statusJsonCache, out, outLen);
+      g_statusJsonCacheLen = outLen;
+      g_statusJsonCacheBuiltMs = millis();
+      portEXIT_CRITICAL(&g_statusMux);
+    }
+  }
+
+  return String(out).substring(0, outLen);
+}
+
+static void asyncBroadcastStatusIfDue(uint32_t nowMs, uint32_t wsStatusPushMs) {
+  if (!WEB_SOCKET_ENABLE || wsStatusPushMs == 0) return;
+  if (g_statusWs.count() == 0) return;
+  if ((nowMs - g_lastWsPushMs) < wsStatusPushMs) return;
+
+  String payload = buildAsyncStatusPayload();
+  if (payload.length() == 0) return;
+
+  uint32_t startMs = millis();
+  g_statusWs.textAll(payload);
+  g_statusWs.cleanupClients();
+  g_lastWsPushMs = nowMs;
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void onAsyncWsEvent(AsyncWebSocket* server,
+                           AsyncWebSocketClient* client,
+                           AwsEventType type,
+                           void* arg,
+                           uint8_t* data,
+                           size_t len) {
+  (void)server;
+  (void)arg;
+  uint32_t startMs = millis();
+  switch (type) {
+    case WS_EVT_CONNECT: {
+      String payload = buildAsyncStatusPayload();
+      if (payload.length() > 0 && client) {
+        client->text(payload);
+      }
+      break;
+    }
+    case WS_EVT_DATA: {
+      if (client && len > 0) {
+        String msg;
+        msg.reserve(len);
+        for (size_t i = 0; i < len; i++) msg += (char)data[i];
+        if (msg == "status" || msg == "ping") {
+          String payload = buildAsyncStatusPayload();
+          if (payload.length() > 0) {
+            client->text(payload);
+          }
+        }
+      }
+      break;
+    }
+    case WS_EVT_PONG:
+    case WS_EVT_ERROR:
+    case WS_EVT_DISCONNECT:
+    default:
+      break;
+  }
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webSetCommonHeaders(bool json = false) {
+  g_webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  g_webServer.sendHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
+  g_webServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+  g_webServer.sendHeader("Cache-Control", "no-store");
+  g_webServer.sendHeader("Connection", "close");
+  g_webServer.client().setNoDelay(true);
+  if (json) {
+    g_webServer.sendHeader("Content-Type", "application/json");
+  }
+}
+
+static bool webRequestAcceptsGzip() {
+  if (!g_webServer.hasHeader("Accept-Encoding")) return false;
+  return g_webServer.header("Accept-Encoding").indexOf("gzip") >= 0;
+}
+
+static void webSendOptions() {
+  uint32_t startMs = millis();
+  webSetCommonHeaders();
+  g_webServer.send(204, "text/plain", "");
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webSendFsFile(const char* path, const char* contentType) {
+  uint32_t startMs = millis();
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends++;
+  portEXIT_CRITICAL(&g_fileSendMux);
+
+  String resolvedPath = path;
+  bool servingGzip = false;
+  if (webRequestAcceptsGzip()) {
+    String gzPath = resolvedPath + ".gz";
+    File gzFile = LittleFS.open(gzPath, FILE_READ);
+    if (gzFile && !gzFile.isDirectory()) {
+      resolvedPath = gzPath;
+      servingGzip = true;
+      gzFile.close();
+    }
+  }
+
+  File file = LittleFS.open(resolvedPath.c_str(), FILE_READ);
+  if (!file || file.isDirectory()) {
+    webSetCommonHeaders();
+    g_webServer.send(404, "text/plain", "Not Found");
+    portENTER_CRITICAL(&g_fileSendMux);
+    g_activeFileSends--;
+    portEXIT_CRITICAL(&g_fileSendMux);
+    return;
+  }
+
+  const size_t size = file.size();
+  webSetCommonHeaders();
+  if (servingGzip) {
+    g_webServer.sendHeader("Content-Encoding", "gzip");
+    g_webServer.sendHeader("Vary", "Accept-Encoding");
+  }
+
+  uint32_t readMs = 0;
+  uint32_t sendMs = 0;
+  size_t sent = 0;
+  uint32_t t0 = millis();
+  sent = g_webServer.streamFile(file, contentType);
+  sendMs = millis() - t0;
+
+  const uint32_t totalMs = millis() - startMs;
+  if (HTTP_TIMING_LOG_ENABLE) {
+    Serial.printf("[HTIM] fs-web GET %s status=%d total=%lu prep=%lu send=%lu ret=%d\n",
+                  path,
+                  sent == size ? 200 : 500,
+                  (unsigned long)totalMs,
+                  (unsigned long)readMs,
+                  (unsigned long)sendMs,
+                  sent == size ? 0 : -1);
+  }
+  if (WEB_DEBUG_LOG || sendMs >= SLOW_FS_SEND_MS || totalMs >= SLOW_FS_TOTAL_MS) {
+    Serial.printf("[FS] %s%s read=%lu ms send=%lu ms total=%lu ms size=%lu\n",
+                  path,
+                  servingGzip ? " (gzip)" : "",
+                  (unsigned long)readMs,
+                  (unsigned long)sendMs,
+                  (unsigned long)totalMs,
+                  (unsigned long)size);
+  }
+  noteWebTaskWorkUs(totalMs * 1000UL);
+
+  file.close();
+  portENTER_CRITICAL(&g_fileSendMux);
+  g_activeFileSends--;
+  portEXIT_CRITICAL(&g_fileSendMux);
+}
+
+static void webStatusHandler() {
+  uint32_t startMs = millis();
+  bool details = false;
+  if (g_webServer.hasArg("details")) {
+    String value = g_webServer.arg("details");
+    details = (value == "1" || value == "true");
+  }
+
+  char out[STATUS_JSON_BUFFER_SIZE];
+  size_t outLen = 0;
+  uint32_t prepStartMs = millis();
+  if (!details) {
+    portENTER_CRITICAL(&g_statusMux);
+    outLen = g_statusJsonCacheLen;
+    if (outLen > sizeof(out)) outLen = sizeof(out);
+    if (outLen > 0) memcpy(out, g_statusJsonCache, outLen);
+    portEXIT_CRITICAL(&g_statusMux);
+  }
+  if (outLen == 0 && g_hooks.buildStatusJson) {
+    outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
+    if (!details && outLen > 0 && outLen <= sizeof(g_statusJsonCache)) {
+      portENTER_CRITICAL(&g_statusMux);
+      memcpy(g_statusJsonCache, out, outLen);
+      g_statusJsonCacheLen = outLen;
+      g_statusJsonCacheBuiltMs = millis();
+      portEXIT_CRITICAL(&g_statusMux);
+    }
+  }
+  uint32_t prepMs = millis() - prepStartMs;
+  webSetCommonHeaders(true);
+  uint32_t sendStartMs = millis();
+  g_webServer.send(200, "application/json", String(out).substring(0, outLen));
+  uint32_t sendMs = millis() - sendStartMs;
+  uint32_t totalMs = millis() - startMs;
+  if (HTTP_TIMING_LOG_ENABLE) {
+    Serial.printf("[HTIM] status-web GET /status status=200 total=%lu prep=%lu send=%lu ret=0\n",
+                  (unsigned long)totalMs,
+                  (unsigned long)prepMs,
+                  (unsigned long)sendMs);
+  }
+  noteWebTaskWorkUs(totalMs * 1000UL);
+}
+
+static void webNetworksHandler() {
+  uint32_t startMs = millis();
+  bool details = false;
+  bool refresh = false;
+  if (g_webServer.hasArg("details")) {
+    String value = g_webServer.arg("details");
+    details = (value == "1" || value == "true");
+  }
+  if (g_webServer.hasArg("refresh")) {
+    String value = g_webServer.arg("refresh");
+    refresh = (value == "1" || value == "true");
+  }
+  if (g_webServer.hasArg("scan")) {
+    String value = g_webServer.arg("scan");
+    refresh = (value == "1" || value == "true");
+  }
+  if (details && !refresh) refresh = true;
+  String payload = g_wifiManager.getNetworksPayload(details, refresh);
+  webSetCommonHeaders(true);
+  g_webServer.send(200, "application/json", payload);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webCredentialsGetHandler() {
+  uint32_t startMs = millis();
+  DynamicJsonDocument doc(1024);
+  int channel = g_config.getDMXAddress();
+  int universe = g_config.getDMXUniverse();
+  doc["ssid"] = g_config.getSSID();
+  doc["hostname"] = g_config.getHostname();
+  doc["password"] = g_config.getPass();
+  doc["dhcp"] = g_config.getDhcpEnabled();
+  doc["ip"] = g_config.getStaticIP();
+  doc["gateway"] = g_config.getGateway();
+  doc["subnet"] = g_config.getSubnet();
+  doc["dns1"] = g_config.getDNS1();
+  doc["dns2"] = g_config.getDNS2();
+  doc["start_value"] = g_config.getStartValue();
+  doc["channel"] = channel;
+  doc["universe"] = universe;
+  doc["dmx_address"] = channel;
+  doc["dmx_universe"] = universe;
+  String out;
+  serializeJson(doc, out);
+  webSetCommonHeaders(true);
+  g_webServer.send(200, "application/json", out);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webCredentialsPutHandler() {
+  uint32_t startMs = millis();
+  String body = g_webServer.arg("plain");
+  if (body.length() <= 0 || body.length() > 1024) {
+    webSetCommonHeaders();
+    g_webServer.send(400, "text/plain", "");
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    webSetCommonHeaders();
+    g_webServer.send(400, "text/plain", "");
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  auto invalidTextField = [](const char* value, bool allowEmpty, size_t maxLen) {
+    if (!value) return !allowEmpty;
+    size_t len = strlen(value);
+    if (len == 0) return !allowEmpty;
+    if (len > maxLen) return true;
+    for (size_t i = 0; i < len; i++) {
+      unsigned char ch = (unsigned char)value[i];
+      if (ch < 32 || ch == 127) return true;
+    }
+    return false;
+  };
+
+  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
+  float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
+
+  if (ssidValue && invalidTextField(ssidValue, false, 32)) {
+    webSetCommonHeaders();
+    g_webServer.send(400, "text/plain", "Invalid SSID");
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+  if (hostnameValue && invalidTextField(hostnameValue, true, 63)) {
+    webSetCommonHeaders();
+    g_webServer.send(400, "text/plain", "Invalid hostname");
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
+
+  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
+  if (doc.containsKey("password")) g_config.writePass(passwordValue);
+  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
+  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
+  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
+  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
+  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
+  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
+  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
+  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
+  if (doc.containsKey("channel")) {
+    int channel = doc["channel"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  } else if (doc.containsKey("dmx_address")) {
+    int channel = doc["dmx_address"].as<int>();
+    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+  }
+  if (doc.containsKey("universe")) {
+    int universe = doc["universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  } else if (doc.containsKey("dmx_universe")) {
+    int universe = doc["dmx_universe"].as<int>();
+    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+  }
+
+  g_wifiManager.scheduleRestart(1000);
+  webSetCommonHeaders();
+  g_webServer.send(204, "text/plain", "");
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webUpdateInfoHandler() {
+  uint32_t startMs = millis();
+  StaticJsonDocument<128> doc;
+  doc["version"] = "1.0.0";
+  doc["device"] = g_hooks.deviceName;
+  doc["ota_ready"] = true;
+  String out;
+  serializeJson(doc, out);
+  webSetCommonHeaders(true);
+  g_webServer.send(200, "application/json", out);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
+static void webHandleUpdatePost(int updateCmd) {
+  uint32_t startMs = millis();
+  bool ok = !Update.hasError();
+  g_wifiManager.setOtaInProgress(false);
+  webSetCommonHeaders(true);
+  if (ok) {
+    g_webServer.send(200, "application/json", "{\"success\":true,\"message\":\"Update successful. Restarting...\"}");
+    g_wifiManager.scheduleRestart(1000);
+  } else {
+    g_webServer.send(400, "application/json", "{\"success\":false,\"message\":\"Update failed\"}");
+  }
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+  (void)updateCmd;
+}
+
+static void webHandleUpdateUpload(int updateCmd) {
+  HTTPUpload& upload = g_webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    g_wifiManager.setOtaInProgress(true);
+    bool beginOk = false;
+    if (updateCmd == U_SPIFFS) {
+      const esp_partition_t* fsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "littlefs");
+      beginOk = (fsPart != nullptr) && Update.begin(fsPart->size, U_SPIFFS);
+    } else {
+      beginOk = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+    }
+    if (!beginOk) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (!Update.end(true)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    g_wifiManager.setOtaInProgress(false);
+  }
+}
+
+static void webNotFoundHandler() {
+  uint32_t startMs = millis();
+  webSetCommonHeaders();
+  g_webServer.send(404, "text/plain", "Not Found");
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+}
+
 static void registerUri(const char* path, httpd_method_t method, esp_err_t (*handler)(httpd_req_t*)) {
   httpd_uri_t uri = {};
   uri.uri = path;
@@ -995,38 +1990,64 @@ static void registerWsUri(const char* path, esp_err_t (*handler)(httpd_req_t*)) 
 }
 
 static void startWebServer() {
-  if (g_webHttpd != nullptr) return;
+  if (g_webServerStarted) return;
+  Serial.printf("[HTTPCFG] backend=async-webserver timing=%d ws=%d prio=async-tcp core=%d sockets=na backlog=na\n",
+                HTTP_TIMING_LOG_ENABLE,
+                WEB_SOCKET_ENABLE,
+                CONFIG_ASYNC_TCP_RUNNING_CORE);
 
-  httpd_config_t configHttp = HTTPD_DEFAULT_CONFIG();
-  configHttp.stack_size = 8192;
-  configHttp.server_port = 80;
-  configHttp.ctrl_port = 32768;
-  configHttp.max_uri_handlers = 24;
-
-  if (httpd_start(&g_webHttpd, &configHttp) == ESP_OK) {
-    g_webTaskHandle = xTaskGetHandle("httpd");
-    registerUri("/", HTTP_GET, indexHandler);
-    registerUri("/index.html", HTTP_GET, indexHandler);
-    registerUri("/ota.html", HTTP_GET, otaPageHandler);
-    registerUri("/settings.html", HTTP_GET, settingHandler);
-    registerUri("/status", HTTP_GET, statusHandler);
-    registerUri("/networks", HTTP_GET, networksHandler);
-    registerUri("/credentials", HTTP_GET, credentialsGetHandler);
-    registerUri("/credentials", HTTP_PUT, credentialsPutHandler);
-    registerUri("/update", HTTP_GET, updateInfoHandler);
-    registerUri("/update", HTTP_POST, firmwareUpdateHandler);
-    registerUri("/updatefs", HTTP_POST, fsUpdateHandler);
-    registerWsUri("/ws", wsHandler);
-
-    registerUri("/status", HTTP_OPTIONS, optionsHandler);
-    registerUri("/networks", HTTP_OPTIONS, optionsHandler);
-    registerUri("/credentials", HTTP_OPTIONS, optionsHandler);
-    registerUri("/update", HTTP_OPTIONS, optionsHandler);
-    registerUri("/updatefs", HTTP_OPTIONS, optionsHandler);
-    Serial.println("Native HTTP server started on :80");
-  } else {
-    Serial.println("Failed to start native HTTP server");
+  g_asyncWebServer.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    asyncSendFsFile(request, g_hooks.indexPagePath, "text/html");
+  });
+  g_asyncWebServer.on("/index.html", HTTP_GET, [](AsyncWebServerRequest* request) {
+    asyncSendFsFile(request, g_hooks.indexPagePath, "text/html");
+  });
+  g_asyncWebServer.on("/ota.html", HTTP_GET, [](AsyncWebServerRequest* request) {
+    asyncSendFsFile(request, "/wifi-manager/ota.html", "text/html");
+  });
+  g_asyncWebServer.on("/settings.html", HTTP_GET, [](AsyncWebServerRequest* request) {
+    asyncSendFsFile(request, "/wifi-manager/settings.html", "text/html");
+  });
+  g_asyncWebServer.on("/status", HTTP_GET, asyncStatusHandler);
+  g_asyncWebServer.on("/networks", HTTP_GET, asyncNetworksHandler);
+  g_asyncWebServer.on("/credentials", HTTP_GET, asyncCredentialsGetHandler);
+  g_asyncWebServer.on(
+      "/credentials",
+      HTTP_PUT,
+      asyncCredentialsPutHandler,
+      nullptr,
+      asyncCredentialsPutBody);
+  g_asyncWebServer.on("/update", HTTP_GET, asyncUpdateInfoHandler);
+  g_asyncWebServer.on(
+      "/update",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { asyncHandleUpdateRequest(request, U_FLASH); },
+      [](AsyncWebServerRequest* request, String, size_t index, uint8_t* data, size_t len, bool final) {
+        size_t total = final ? index + len : index + len;
+        asyncHandleUpdateBody(request, U_FLASH, data, len, index, total);
+      });
+  g_asyncWebServer.on(
+      "/updatefs",
+      HTTP_POST,
+      [](AsyncWebServerRequest* request) { asyncHandleUpdateRequest(request, U_SPIFFS); },
+      [](AsyncWebServerRequest* request, String, size_t index, uint8_t* data, size_t len, bool final) {
+        size_t total = final ? index + len : index + len;
+        asyncHandleUpdateBody(request, U_SPIFFS, data, len, index, total);
+      });
+  g_asyncWebServer.on("/status", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.on("/networks", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.on("/credentials", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.on("/update", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.on("/updatefs", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.onNotFound(asyncNotFoundHandler);
+  if (WEB_SOCKET_ENABLE) {
+    g_statusWs.onEvent(onAsyncWsEvent);
+    g_asyncWebServer.addHandler(&g_statusWs);
   }
+  g_asyncWebServer.begin();
+  g_webServerStarted = true;
+  g_webTaskHandle = nullptr;
+  Serial.println("ESPAsyncWebServer started on :80");
 }
 
 static void logStoredConfig() {
@@ -1061,9 +2082,6 @@ static void logStoredConfig() {
 }
 
 TaskHandle_t appGetWebServerTaskHandle() {
-  if (g_webTaskHandle == nullptr) {
-    g_webTaskHandle = xTaskGetHandle("httpd");
-  }
   return g_webTaskHandle;
 }
 
@@ -1083,7 +2101,6 @@ void appInitRuntime(const AppRuntimeHooks& hooks) {
 void appStartCommonServices() {
   startWebServer();
   WiFi.setSleep(false);
-  g_artudp.begin(ARTNET_PORT);
 
 #if FS_BENCHMARK_LOG_ENABLE
   logFileReadPerf("/wifi-manager/index.html");
@@ -1113,6 +2130,8 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
   g_wifiManager.check();
 
   uint32_t now = millis();
+  refreshStatusCacheIfDue(now);
+  asyncBroadcastStatusIfDue(now, wsStatusPushMs);
 #if HEALTH_LOG_ENABLE
   if (now - g_lastHealthLogMs >= HEALTH_LOG_INTERVAL_MS) {
     wl_status_t wifiStatus = WiFi.status();
@@ -1148,21 +2167,5 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
   (void)g_lastHealthLogMs;
 #endif
 
-  if (now - g_lastWsPushMs >= wsStatusPushMs) {
-    wsBroadcastStatus();
-    g_lastWsPushMs = now;
-  }
-
-  // Send WS PING every 30s to keep TCP connections alive and evict dead clients
-  static constexpr uint32_t WS_PING_INTERVAL_MS = 30000;
-  if (now - g_lastWsPingMs >= WS_PING_INTERVAL_MS) {
-    int clients[MAX_WS_CLIENTS];
-    int count = wsCopyClients(clients, MAX_WS_CLIENTS);
-    for (int i = 0; i < count; i++) {
-      if (wsQueuePingToClient(clients[i]) != ESP_OK) {
-        wsRemoveClient(clients[i]);
-      }
-    }
-    g_lastWsPingMs = now;
-  }
+  (void)wsStatusPushMs;
 }
