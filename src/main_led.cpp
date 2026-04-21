@@ -7,18 +7,37 @@
 
 #include "main_common.h"
 
-static constexpr int CH1 = 1;
-static constexpr int CH2 = 2;
-static constexpr int CH3 = 3;
-static constexpr int CH4 = 21;
+#ifndef LED_PWM_PIN_1
+#define LED_PWM_PIN_1 1
+#endif
+
+#ifndef LED_PWM_PIN_2
+#define LED_PWM_PIN_2 2
+#endif
+
+#ifndef LED_PWM_PIN_3
+#define LED_PWM_PIN_3 3
+#endif
+
+#ifndef LED_PWM_PIN_4
+#define LED_PWM_PIN_4 21
+#endif
+
+static constexpr int CH1 = LED_PWM_PIN_1;
+static constexpr int CH2 = LED_PWM_PIN_2;
+static constexpr int CH3 = LED_PWM_PIN_3;
+static constexpr int CH4 = LED_PWM_PIN_4;
 
 static constexpr int LEDC_RES_BITS = 12;
 static constexpr int LEDC_MAX_DUTY = (1 << LEDC_RES_BITS) - 1;
 static constexpr int LEDC_FREQ_HZ = 1000;
 
 static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
+static constexpr uint32_t CONTROL_TASK_IDLE_WAIT_MS = 20;
 static constexpr uint32_t SOURCE_HOLD_MS = 1000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
+static constexpr UBaseType_t CONTROL_TASK_PRIORITY = 2;
+static constexpr BaseType_t CONTROL_TASK_CORE = 1;
 
 #ifndef ARTNET_TIMING_LOG_ENABLE
 #define ARTNET_TIMING_LOG_ENABLE 0
@@ -369,6 +388,10 @@ static void startArtnetListener() {
     artDmxUniverseMatchTotal++;
     artDmxLastArrivalMs = nowMs;
     portEXIT_CRITICAL(&statusMux);
+
+    if (controlTaskHandle) {
+      xTaskNotifyGive(controlTaskHandle);
+    }
   });
 
   g_artudpListening = g_artudp.listen(6454);
@@ -409,6 +432,7 @@ static void pollArtnet() {
 static void controlTask(void* parameter) {
   (void)parameter;
   for (;;) {
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONTROL_TASK_IDLE_WAIT_MS));
     uint32_t loopNowUs = micros();
     noteControlLoopTiming(loopNowUs);
     uint32_t busyStartUs = micros();
@@ -570,7 +594,13 @@ void setup() {
   appConnectWifi();
   appStartCommonServices();
 
-  xTaskCreatePinnedToCore(controlTask, "ControlTask", 4096, nullptr, 1, &controlTaskHandle, 0);
+  xTaskCreatePinnedToCore(controlTask,
+                          "ControlTask",
+                          4096,
+                          nullptr,
+                          CONTROL_TASK_PRIORITY,
+                          &controlTaskHandle,
+                          CONTROL_TASK_CORE);
 
 }
 

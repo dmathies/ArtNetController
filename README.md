@@ -58,12 +58,19 @@ Source entry point: `src/main_led.cpp`
 - Reads four consecutive 16-bit values starting at the configured start address
 - Drives four PWM outputs (12-bit resolution)
 
-Current LED pin mapping in code:
+Default LED pin mapping in code:
 
 - `LED 0 -> GPIO1`
 - `LED 1 -> GPIO2`
 - `LED 2 -> GPIO3`
 - `LED 3 -> GPIO21`
+
+For `nodemcu-32s_led`, the build overrides the mapping to avoid the serial console pins and to let the onboard LED act as `LED 3`:
+
+- `LED 0 -> GPIO16`
+- `LED 1 -> GPIO17`
+- `LED 2 -> GPIO21`
+- `LED 3 -> GPIO2` (onboard LED on many NodeMCU-32S boards)
 
 
 ## Project Layout
