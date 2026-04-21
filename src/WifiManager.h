@@ -23,6 +23,8 @@ class WifiManagerClass {
 		String getHostname();
 		String getSSID();
 		String getMacAddress();
+		const char* getHostnameCStr() const;
+		void getMacAddress(char* out, size_t outSize) const;
 		int8_t getRSSI();
 		IPAddress getIP();
 
@@ -62,6 +64,7 @@ class WifiManagerClass {
 		String getAvailableNetworks();
 		void requestRestart(unsigned long delayMs);
 		void cleanupBeforeRestart();
+		void ensureReconnectAttempt();
 		void pollNetworkScan();
 		void startNetworkScan();
 		void runNetworkScanTask();

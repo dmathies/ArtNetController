@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
+#include <LittleFS.h>
 #include <esp_wifi.h>
 
 #include "Configuration.h"
@@ -32,7 +33,12 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 }
 
 void WifiManagerClass::check() {
-	if (!_connected && WiFi.status() == WL_CONNECTED) {
+	wl_status_t status = WiFi.status();
+	if (status == WL_CONNECTED) {
+		_ip = WiFi.localIP();
+	}
+
+	if (!_connected && status == WL_CONNECTED) {
 		_connected = true;
 		_reconnectSuccesses++;
 		_lastReconnectSuccessMs = millis();
@@ -46,17 +52,10 @@ void WifiManagerClass::check() {
 		ESP.restart();
 	}
 
-	if (!_otaInProgress && _connected && millis() > _nextReconnectCheck) {
-		if (WiFi.status() != WL_CONNECTED) {
-			_connected = false;
-
-			Serial.println("WiFi connection lost. Attempting to reconnect.");
-			_reconnectAttempts++;
-			_lastReconnectAttemptMs = millis();
-
-			WiFi.reconnect();
+	if (!_otaInProgress && millis() > _nextReconnectCheck) {
+		if (status != WL_CONNECTED) {
+			ensureReconnectAttempt();
 		}
-
 		_nextReconnectCheck = millis() + _reconnectIntervalCheck;
 	}
 }
@@ -70,7 +69,14 @@ String WifiManagerClass::getNetworksPayload(bool details, bool refresh) {
 	bool isScanning = false;
 
 	if (details) {
-		return String("{\"scanning\":") + (isScanning ? "true" : "false") + ",\"networks\":" + _networks + "}";
+		String payload;
+		payload.reserve(_networks.length() + 32);
+		payload = "{\"scanning\":";
+		payload += isScanning ? "true" : "false";
+		payload += ",\"networks\":";
+		payload += _networks;
+		payload += "}";
+		return payload;
 	}
 
 	return _networks;
@@ -100,8 +106,39 @@ void WifiManagerClass::cleanupBeforeRestart() {
 	
 	// Fully deinitialize WiFi driver
 	esp_wifi_deinit();
+
+	// Ensure filesystem metadata is committed before the software reset.
+	LittleFS.end();
 	
 	Serial.println("Cleanup complete");
+}
+
+void WifiManagerClass::ensureReconnectAttempt() {
+	if (_ssid.length() == 0) {
+		return;
+	}
+
+	_connected = false;
+	_reconnectAttempts++;
+	_lastReconnectAttemptMs = millis();
+
+	wifi_mode_t mode = WiFi.getMode();
+	if (mode == WIFI_MODE_AP) {
+		WiFi.mode(WIFI_MODE_APSTA);
+	} else if (mode == WIFI_MODE_NULL) {
+		WiFi.mode(WIFI_MODE_STA);
+	}
+
+	WiFi.setSleep(WIFI_PS_NONE);
+	esp_wifi_set_ps(WIFI_PS_NONE);
+
+	Serial.println("WiFi not connected. Attempting to reconnect.");
+	if (WiFi.reconnect()) {
+		return;
+	}
+
+	String pass = _config.getPass();
+	WiFi.begin(_ssid.c_str(), pass.c_str());
 }
 
 void WifiManagerClass::startNetworkScan() {
@@ -169,7 +206,8 @@ String WifiManagerClass::getAvailableNetworks() {
 	}
 
 	String json = "[";
-	String separator = "";
+	json.reserve((networks * 34) + 2);
+	bool first = true;
 
 	// If negative value is returned from the scan we will
 	// just return the empty list as the loop will not
@@ -178,8 +216,11 @@ String WifiManagerClass::getAvailableNetworks() {
 		String network = "\"" + WiFi.SSID(i) + "\"";
 
 		if (json.indexOf(network) == -1) {
-			json += separator + network;
-			separator = ",";
+			if (!first) {
+				json += ",";
+			}
+			json += network;
+			first = false;
 		}
 	}
 
@@ -311,16 +352,44 @@ String WifiManagerClass::getHostname() {
 	return _hostname;
 }
 
+const char* WifiManagerClass::getHostnameCStr() const {
+	return _hostname.c_str();
+}
+
 String WifiManagerClass::getSSID() {
 	return _ssid;
 }
 
-String WifiManagerClass::getMacAddress() {
-	String mac = WiFi.macAddress();
-	if (mac == "" || mac == "00:00:00:00:00:00") {
-		mac = WiFi.softAPmacAddress();
+void WifiManagerClass::getMacAddress(char* out, size_t outSize) const {
+	if (!out || outSize == 0) return;
+
+	uint8_t mac[6] = {0};
+	esp_err_t err = esp_wifi_get_mac(WIFI_IF_STA, mac);
+	if (err != ESP_OK ||
+	    (mac[0] == 0 && mac[1] == 0 && mac[2] == 0 && mac[3] == 0 && mac[4] == 0 && mac[5] == 0)) {
+		err = esp_wifi_get_mac(WIFI_IF_AP, mac);
 	}
-	return mac;
+
+	if (err != ESP_OK) {
+		out[0] = '\0';
+		return;
+	}
+
+	snprintf(out,
+	         outSize,
+	         "%02X:%02X:%02X:%02X:%02X:%02X",
+	         mac[0],
+	         mac[1],
+	         mac[2],
+	         mac[3],
+	         mac[4],
+	         mac[5]);
+}
+
+String WifiManagerClass::getMacAddress() {
+	char mac[18];
+	getMacAddress(mac, sizeof(mac));
+	return String(mac);
 }
 
 int8_t WifiManagerClass::getRSSI() {

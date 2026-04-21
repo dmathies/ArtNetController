@@ -6,6 +6,7 @@
 class Configuration {
 	protected:
 		void initFileSystem();
+		void ensureDefaultFile(const char *path, const char *defaultValue);
 
 		void writeFile(fs::FS &fs, const char *path, const char *message);
 		String readFile(fs::FS &fs, const char *path);
@@ -21,6 +22,7 @@ class Configuration {
 		const char *subnetPath;
 		const char *dns1Path;
 		const char *dns2Path;
+		const char *startValuePath;
 
 		bool fsInitialized;
 
@@ -38,6 +40,7 @@ class Configuration {
 		void writeSubnet(const char *subnet);
 		void writeDNS1(const char *dns1);
 		void writeDNS2(const char *dns2);
+		void writeStartValue(float value);
 
         String getSSID();
 		String getPass();
@@ -50,6 +53,7 @@ class Configuration {
 		String getSubnet();
 		String getDNS1();
 		String getDNS2();
+		float getStartValue();
 };
 
 #endif

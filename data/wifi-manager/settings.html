@@ -418,10 +418,24 @@
       let initialCreds = null;
       let networkHandlerAttached = false;
       let networkScanInProgress = false;
+      let credentialsLoaded = false;
+
+      function setSaveEnabled(enabled) {
+        const saveBtn = document.getElementById("save");
+        if (saveBtn) saveBtn.disabled = !enabled;
+      }
 
       function optionExists(sel, value) {
         for (const o of sel.options) if (o.value === value) return true;
         return false;
+      }
+
+      function getSelectedNetworkValue() {
+        const sel = document.getElementById("network");
+        if (!sel) return "";
+        const value = (sel.value || "").trim();
+        if (!value) return "";
+        return optionExists(sel, value) ? value : "";
       }
 
       async function loadCredentials() {
@@ -441,7 +455,8 @@
             dns1: json.dns1 || "",
             dns2: json.dns2 || "",
             channel: (json.channel ?? json.dmx_address ?? 1),
-            universe: (json.universe ?? json.dmx_universe ?? 0)
+            universe: (json.universe ?? json.dmx_universe ?? 0),
+            start_value: (json.start_value ?? 0)
           };
 
           document.getElementById("ssid").value = initialCreds.ssid || "";
@@ -455,7 +470,10 @@
           document.getElementById("dns2").value = initialCreds.dns2 || "";
           document.getElementById("channel").value = initialCreds.channel;
           document.getElementById("universe").value = initialCreds.universe;
+          document.getElementById("start_value").value = initialCreds.start_value;
           toggleIpMode(document.getElementById("ip_mode").value);
+          credentialsLoaded = true;
+          setSaveEnabled(true);
 
           const sel = document.getElementById("network");
           if (!sel.disabled && initialCreds.ssid && optionExists(sel, initialCreds.ssid)) {
@@ -467,6 +485,9 @@
         } catch (e) {
           toggleIpMode(document.getElementById("ip_mode").value);
           toggleCustomSsid("");
+          credentialsLoaded = false;
+          setSaveEnabled(false);
+          setTimeout(() => alert("Failed to load current settings. Save is disabled to avoid overwriting them with blanks."), 0);
         }
       }
 
@@ -579,6 +600,12 @@
         if (loaderWrap) loaderWrap.style.display = "flex";
 
         try {
+          if (!credentialsLoaded || !initialCreds) {
+            if (loaderWrap) loaderWrap.style.display = "none";
+            setTimeout(() => alert("Current settings have not finished loading yet."), 0);
+            return;
+          }
+
           const ipMode = document.getElementById("ip_mode").value;
           const dhcp = ipMode !== "static";
           const ip = document.getElementById("static_ip").value.trim();
@@ -586,6 +613,10 @@
           const subnet = document.getElementById("subnet").value.trim();
           const dns1 = document.getElementById("dns1").value.trim();
           const dns2 = document.getElementById("dns2").value.trim();
+          const selectedNetwork = getSelectedNetworkValue();
+          const manualSsid = document.getElementById("ssid").value.trim();
+          const ssid = (selectedNetwork || manualSsid || initialCreds.ssid || "").trim();
+          const hostname = (document.getElementById("hostname").value.trim() || initialCreds.hostname || "").trim();
 
           if (!dhcp && (!ip || !gateway || !subnet)) {
             if (loaderWrap) loaderWrap.style.display = "none";
@@ -593,10 +624,16 @@
             return;
           }
 
+          if (!ssid) {
+            if (loaderWrap) loaderWrap.style.display = "none";
+            setTimeout(() => alert("SSID is required."), 0);
+            return;
+          }
+
           const payload = {
-            ssid: document.getElementById("ssid").value,
+            ssid,
             password: document.getElementById("password").value,
-            hostname: document.getElementById("hostname").value,
+            hostname,
             dhcp,
             ip,
             gateway,
@@ -604,7 +641,8 @@
             dns1,
             dns2,
             channel: Number(document.getElementById("channel").value || "1"),
-            universe: Number(document.getElementById("universe").value || "0")
+            universe: Number(document.getElementById("universe").value || "0"),
+            start_value: Number(document.getElementById("start_value").value || "0")
           };
 
           const res = await fetch(`${apiBase}/credentials`, {
@@ -631,6 +669,7 @@
       }
 
       document.addEventListener("DOMContentLoaded", () => {
+        setSaveEnabled(false);
         document.getElementById("save").addEventListener("click", saveAndReboot);
         document.getElementById("refresh-networks").addEventListener("click", refreshNetworks);
         document.getElementById("ip_mode").addEventListener("change", (e) => toggleIpMode(e.target.value));
@@ -726,6 +765,10 @@
               <div class="field">
                 <label for="universe">Universe</label>
                 <input id="universe" type="number" min="0" max="32767" step="1" inputmode="numeric" placeholder="0" />
+              </div>
+              <div class="field">
+                <label for="start_value">Start Value</label>
+                <input id="start_value" type="number" step="any" inputmode="decimal" placeholder="0" />
               </div>
             </div>
           </section>

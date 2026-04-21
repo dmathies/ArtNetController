@@ -21,6 +21,11 @@ struct AppRuntimeHooks {
   void (*pollInputs)();
 };
 
+struct AppTaskRuntimeStats {
+  uint32_t lastActiveMs = 0;
+  uint16_t utilPermille = 0;
+};
+
 Configuration& appConfig();
 WifiManagerClass& appWifiManager();
 WiFiUDP& appArtnetUdp();
@@ -29,8 +34,10 @@ ArtDmxPacket appParseArtDmx(const uint8_t* p, int len);
 void appMarkArtnetActivity();
 uint32_t appGetLastArtnetMs();
 TaskHandle_t appGetWebServerTaskHandle();
+AppTaskRuntimeStats appGetWebTaskRuntimeStats();
 
 const char* appResetReasonToString(esp_reset_reason_t reason);
+float appReadBoardTemperatureC();
 
 void appInitRuntime(const AppRuntimeHooks& hooks);
 void appStartCommonServices();

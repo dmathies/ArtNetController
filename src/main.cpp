@@ -7,6 +7,7 @@
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <ArduinoJson.h>
+#include <cctype>
 #include <cstring>
 
 #include "main_common.h"
@@ -19,6 +20,7 @@ static constexpr uint32_t SLOW_FS_SEND_MS = 500;
 static constexpr uint32_t SLOW_FS_TOTAL_MS = 1000;
 static constexpr size_t HTTP_FILE_CHUNK_SIZE = 1024;
 static constexpr size_t HTTP_FILE_DIRECT_SEND_LIMIT = 32768;
+static constexpr size_t STATUS_JSON_BUFFER_SIZE = 2048;
 static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
 
 #ifndef WEB_DEBUG_LOG
@@ -31,6 +33,10 @@ static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
 
 #ifndef FS_BENCHMARK_LOG_ENABLE
 #define FS_BENCHMARK_LOG_ENABLE 0
+#endif
+
+#ifndef CONFIG_DEBUG_LOG_ENABLE
+#define CONFIG_DEBUG_LOG_ENABLE 0
 #endif
 
 Configuration g_config;
@@ -50,13 +56,50 @@ static WiFiUDP g_artudp;
 
 static portMUX_TYPE g_statusMux = portMUX_INITIALIZER_UNLOCKED;
 static uint32_t g_lastArtMs = 0;
+static uint32_t g_webTaskLastActiveMs = 0;
+static uint32_t g_webTaskWindowStartUs = 0;
+static uint32_t g_webTaskBusyUsAccum = 0;
+static uint16_t g_webTaskUtilPermille = 0;
 
 static portMUX_TYPE g_wsClientMux = portMUX_INITIALIZER_UNLOCKED;
 static int g_wsClientFds[MAX_WS_CLIENTS] = {-1, -1, -1, -1, -1, -1};
+static bool g_wsClientPending[MAX_WS_CLIENTS] = {false, false, false, false, false, false};
 static uint32_t g_lastWsPushMs = 0;
+static uint32_t g_lastWsPingMs = 0;
 static uint32_t g_lastHealthLogMs = 0;
 static portMUX_TYPE g_fileSendMux = portMUX_INITIALIZER_UNLOCKED;
 static int g_activeFileSends = 0;
+
+struct PendingWsFrame {
+  int fd;
+  size_t len;
+  uint8_t* payload;
+};
+
+struct PendingWsPing {
+  int fd;
+};
+
+static void noteWebTaskWorkUs(uint32_t busyUs) {
+  uint32_t nowUs = micros();
+  uint32_t nowMs = millis();
+
+  portENTER_CRITICAL(&g_statusMux);
+  g_webTaskLastActiveMs = nowMs;
+  if (g_webTaskWindowStartUs == 0) {
+    g_webTaskWindowStartUs = nowUs;
+  }
+  g_webTaskBusyUsAccum += busyUs;
+
+  uint32_t elapsedUs = nowUs - g_webTaskWindowStartUs;
+  if (elapsedUs >= 1000000UL) {
+    uint32_t permille = (g_webTaskBusyUsAccum * 1000UL) / elapsedUs;
+    g_webTaskUtilPermille = (uint16_t)(permille > 1000UL ? 1000UL : permille);
+    g_webTaskBusyUsAccum = 0;
+    g_webTaskWindowStartUs = nowUs;
+  }
+  portEXIT_CRITICAL(&g_statusMux);
+}
 
 static void logFileReadPerf(const char* path) {
   File f = LittleFS.open(path, FILE_READ);
@@ -142,6 +185,17 @@ const char* appResetReasonToString(esp_reset_reason_t reason) {
   }
 }
 
+float appReadBoardTemperatureC() {
+#if defined(ARDUINO_ARCH_ESP32)
+  float celsius = temperatureRead();
+  if (isnan(celsius) || isinf(celsius)) return NAN;
+  if (celsius < -100.0f || celsius > 150.0f) return NAN;
+  return celsius;
+#else
+  return NAN;
+#endif
+}
+
 static const char* httpMethodToString(int method) {
   switch (method) {
     case HTTP_GET: return "GET";
@@ -168,14 +222,14 @@ static bool shouldLogRequest(httpd_req_t* req, uint32_t durationMs, int statusCo
 }
 
 static void logHttpRequest(httpd_req_t* req, uint32_t startMs, int statusCode, const char* detail = nullptr) {
+  uint32_t durationMs = millis() - startMs;
+  noteWebTaskWorkUs(durationMs * 1000UL);
 #if !WEB_DEBUG_LOG
   (void)req;
-  (void)startMs;
   (void)statusCode;
   (void)detail;
   return;
 #else
-  uint32_t durationMs = millis() - startMs;
   if (!shouldLogRequest(req, durationMs, statusCode)) return;
 
   if (detail && detail[0] != '\0') {
@@ -345,20 +399,12 @@ static esp_err_t statusHandler(httpd_req_t* req) {
     }
   }
 
-  char* out = (char*)malloc(2048);
-  if (!out) {
-    httpd_resp_set_status(req, "500 Internal Server Error");
-    esp_err_t ret = httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
-    logHttpRequest(req, startMs, 500, "status buffer alloc failed");
-    return ret;
-  }
-
-  size_t outLen = g_hooks.buildStatusJson(out, 2048, details);
+  char out[STATUS_JSON_BUFFER_SIZE];
+  size_t outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
   esp_err_t ret = httpd_resp_send(req, out, outLen);
-  free(out);
   char detail[48];
   snprintf(detail, sizeof(detail), "details=%d, %lu B", details ? 1 : 0, (unsigned long)outLen);
   logHttpRequest(req, startMs, ret == ESP_OK ? 200 : 500, detail);
@@ -377,6 +423,7 @@ static void wsAddClient(int fd) {
   for (int i = 0; i < MAX_WS_CLIENTS; i++) {
     if (g_wsClientFds[i] < 0) {
       g_wsClientFds[i] = fd;
+      g_wsClientPending[i] = false;
       break;
     }
   }
@@ -389,6 +436,7 @@ static void wsRemoveClient(int fd) {
   for (int i = 0; i < MAX_WS_CLIENTS; i++) {
     if (g_wsClientFds[i] == fd) {
       g_wsClientFds[i] = -1;
+      g_wsClientPending[i] = false;
       break;
     }
   }
@@ -405,17 +453,134 @@ static int wsCopyClients(int* out, int maxCount) {
   return count;
 }
 
+static bool wsTryMarkPending(int fd) {
+  bool marked = false;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] == fd) {
+      if (!g_wsClientPending[i]) {
+        g_wsClientPending[i] = true;
+        marked = true;
+      }
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+  return marked;
+}
+
+static void wsClearPending(int fd) {
+  if (fd < 0) return;
+  portENTER_CRITICAL(&g_wsClientMux);
+  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
+    if (g_wsClientFds[i] == fd) {
+      g_wsClientPending[i] = false;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&g_wsClientMux);
+}
+
+static void freePendingWsFrame(PendingWsFrame* pending) {
+  if (!pending) return;
+  free(pending->payload);
+  free(pending);
+}
+
+static void wsSendPingWork(void* arg) {
+  PendingWsPing* pending = (PendingWsPing*)arg;
+  if (!pending) return;
+
+  if (httpd_ws_get_fd_info(g_webHttpd, pending->fd) == HTTPD_WS_CLIENT_WEBSOCKET) {
+    httpd_ws_frame_t ping = {};
+    ping.type = HTTPD_WS_TYPE_PING;
+    if (httpd_ws_send_frame_async(g_webHttpd, pending->fd, &ping) != ESP_OK) {
+      wsRemoveClient(pending->fd);
+    }
+  } else {
+    wsRemoveClient(pending->fd);
+  }
+
+  free(pending);
+}
+
+static esp_err_t wsQueuePingToClient(int fd) {
+  if (httpd_ws_get_fd_info(g_webHttpd, fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+    wsRemoveClient(fd);
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  PendingWsPing* pending = (PendingWsPing*)calloc(1, sizeof(PendingWsPing));
+  if (!pending) return ESP_ERR_NO_MEM;
+
+  pending->fd = fd;
+  esp_err_t ret = httpd_queue_work(g_webHttpd, wsSendPingWork, pending);
+  if (ret != ESP_OK) {
+    free(pending);
+  }
+  return ret;
+}
+
+static esp_err_t buildStatusPayload(uint8_t** payloadOut, size_t* lenOut) {
+  if (!payloadOut || !lenOut || !g_hooks.buildStatusJson) return ESP_ERR_INVALID_ARG;
+  char* out = (char*)malloc(STATUS_JSON_BUFFER_SIZE);
+  if (!out) return ESP_ERR_NO_MEM;
+
+  size_t outLen = g_hooks.buildStatusJson(out, STATUS_JSON_BUFFER_SIZE, false);
+  *payloadOut = (uint8_t*)out;
+  *lenOut = outLen;
+  return ESP_OK;
+}
+
+static void wsSendStatusWork(void* arg) {
+  PendingWsFrame* pending = (PendingWsFrame*)arg;
+  if (!pending) return;
+
+  if (httpd_ws_get_fd_info(g_webHttpd, pending->fd) == HTTPD_WS_CLIENT_WEBSOCKET) {
+    httpd_ws_frame_t frame = {};
+    frame.type = HTTPD_WS_TYPE_TEXT;
+    frame.payload = pending->payload;
+    frame.len = pending->len;
+    if (httpd_ws_send_frame_async(g_webHttpd, pending->fd, &frame) != ESP_OK) {
+      wsRemoveClient(pending->fd);
+    }
+  } else {
+    wsRemoveClient(pending->fd);
+  }
+
+  wsClearPending(pending->fd);
+  freePendingWsFrame(pending);
+}
+
 static esp_err_t wsSendStatusToClient(int fd) {
   if (!g_hooks.buildStatusJson) return ESP_FAIL;
-  char* out = (char*)malloc(2048);
-  if (!out) return ESP_ERR_NO_MEM;
-  size_t outLen = g_hooks.buildStatusJson(out, 2048, false);
-  httpd_ws_frame_t frame = {};
-  frame.type = HTTPD_WS_TYPE_TEXT;
-  frame.payload = (uint8_t*)out;
-  frame.len = outLen;
-  esp_err_t ret = httpd_ws_send_frame_async(g_webHttpd, fd, &frame);
-  free(out);
+  if (httpd_ws_get_fd_info(g_webHttpd, fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+    wsRemoveClient(fd);
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!wsTryMarkPending(fd)) {
+    return ESP_OK;
+  }
+
+  PendingWsFrame* pending = (PendingWsFrame*)calloc(1, sizeof(PendingWsFrame));
+  if (!pending) {
+    wsClearPending(fd);
+    return ESP_ERR_NO_MEM;
+  }
+
+  esp_err_t ret = buildStatusPayload(&pending->payload, &pending->len);
+  if (ret != ESP_OK) {
+    wsClearPending(fd);
+    freePendingWsFrame(pending);
+    return ret;
+  }
+
+  pending->fd = fd;
+  ret = httpd_queue_work(g_webHttpd, wsSendStatusWork, pending);
+  if (ret != ESP_OK) {
+    wsClearPending(fd);
+    freePendingWsFrame(pending);
+  }
   return ret;
 }
 
@@ -441,6 +606,7 @@ static void wsBroadcastStatus() {
   }
 
   uint32_t durationMs = millis() - startMs;
+  noteWebTaskWorkUs(durationMs * 1000UL);
 #if WEB_DEBUG_LOG
   if (failed > 0 || durationMs >= SLOW_WS_BROADCAST_MS) {
     Serial.printf("[WS] broadcast clients=%d failed=%d in %lu ms heap=%lu\n",
@@ -563,6 +729,7 @@ static esp_err_t credentialsGetHandler(httpd_req_t* req) {
   doc["subnet"] = g_config.getSubnet();
   doc["dns1"] = g_config.getDNS1();
   doc["dns2"] = g_config.getDNS2();
+  doc["start_value"] = g_config.getStartValue();
   doc["channel"] = channel;
   doc["universe"] = universe;
   doc["dmx_address"] = channel;
@@ -590,14 +757,23 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return ret;
   }
 
-  String body;
-  body.reserve(len + 1);
+  char* body = (char*)malloc(len + 1);
+  if (!body) {
+    setCorsHeaders(req);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    esp_err_t ret = httpd_resp_send(req, "", 0);
+    logHttpRequest(req, startMs, 500, "request body alloc failed");
+    return ret;
+  }
+
   int remaining = len;
+  int offset = 0;
   char buf[256];
   while (remaining > 0) {
     int toRead = remaining > (int)sizeof(buf) ? (int)sizeof(buf) : remaining;
     int read = httpd_req_recv(req, buf, toRead);
     if (read <= 0) {
+      free(body);
       setCorsHeaders(req);
       httpd_resp_set_status(req, "500 Internal Server Error");
       esp_err_t ret = httpd_resp_send(req, "", 0);
@@ -605,16 +781,16 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
       return ret;
     }
 
-    char tmp[257];
-    memcpy(tmp, buf, read);
-    tmp[read] = '\0';
-    body += tmp;
+    memcpy(body + offset, buf, read);
+    offset += read;
     remaining -= read;
   }
+  body[offset] = '\0';
 
   DynamicJsonDocument doc(1024);
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
+    free(body);
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
     esp_err_t ret = httpd_resp_send(req, "", 0);
@@ -622,15 +798,58 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return ret;
   }
 
-  if (doc.containsKey("ssid")) g_config.writeSSID(doc["ssid"].as<const char*>());
-  if (doc.containsKey("password")) g_config.writePass(doc["password"].as<const char*>());
-  if (doc.containsKey("hostname")) g_config.writeHostname(doc["hostname"].as<const char*>());
-  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(doc["dhcp"].as<bool>());
+  auto invalidTextField = [](const char* value, bool allowEmpty, size_t maxLen) {
+    if (!value) return !allowEmpty;
+    size_t len = strlen(value);
+    if (len == 0) return !allowEmpty;
+    if (len > maxLen) return true;
+    for (size_t i = 0; i < len; i++) {
+      unsigned char ch = (unsigned char)value[i];
+      if (ch < 32 || ch == 127) return true;
+    }
+    return false;
+  };
+
+  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
+  float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
+#if CONFIG_DEBUG_LOG_ENABLE
+  Serial.printf("[CFG PUT] ssid=\"%s\" hostname=\"%s\" pass_len=%u dhcp=%d start=%.6g\n",
+                ssidValue ? ssidValue : "(null)",
+                hostnameValue ? hostnameValue : "(null)",
+                (unsigned int)(passwordValue ? strlen(passwordValue) : 0),
+                dhcpValue ? 1 : 0,
+                (double)startValue);
+#endif
+  if (ssidValue && invalidTextField(ssidValue, false, 32)) {
+    setCorsHeaders(req);
+    httpd_resp_set_status(req, "400 Bad Request");
+    esp_err_t ret = httpd_resp_send(req, "Invalid SSID", HTTPD_RESP_USE_STRLEN);
+    free(body);
+    logHttpRequest(req, startMs, 400, "invalid ssid");
+    return ret;
+  }
+  if (hostnameValue && invalidTextField(hostnameValue, true, 63)) {
+    setCorsHeaders(req);
+    httpd_resp_set_status(req, "400 Bad Request");
+    esp_err_t ret = httpd_resp_send(req, "Invalid hostname", HTTPD_RESP_USE_STRLEN);
+    free(body);
+    logHttpRequest(req, startMs, 400, "invalid hostname");
+    return ret;
+  }
+
+  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
+  if (doc.containsKey("password")) g_config.writePass(passwordValue);
+  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
+  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
   if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
   if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
   if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
   if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
   if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
+  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
 
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
@@ -648,6 +867,16 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
   }
 
+#if CONFIG_DEBUG_LOG_ENABLE
+  Serial.printf("[CFG VERIFY] ssid=\"%s\" hostname=\"%s\" pass_len=%u dhcp=%d start=%.6g\n",
+                g_config.getSSID().c_str(),
+                g_config.getHostname().c_str(),
+                (unsigned int)g_config.getPass().length(),
+                g_config.getDhcpEnabled() ? 1 : 0,
+                (double)g_config.getStartValue());
+#endif
+
+  free(body);
   g_wifiManager.scheduleRestart(1000);
   setCorsHeaders(req);
   httpd_resp_set_status(req, "204 No Content");
@@ -769,6 +998,7 @@ static void startWebServer() {
   if (g_webHttpd != nullptr) return;
 
   httpd_config_t configHttp = HTTPD_DEFAULT_CONFIG();
+  configHttp.stack_size = 8192;
   configHttp.server_port = 80;
   configHttp.ctrl_port = 32768;
   configHttp.max_uri_handlers = 24;
@@ -799,11 +1029,51 @@ static void startWebServer() {
   }
 }
 
+static void logStoredConfig() {
+#if CONFIG_DEBUG_LOG_ENABLE
+  String ssid = g_config.getSSID();
+  String hostname = g_config.getHostname();
+  String ip = g_config.getStaticIP();
+  String gateway = g_config.getGateway();
+  String subnet = g_config.getSubnet();
+  String dns1 = g_config.getDNS1();
+  String dns2 = g_config.getDNS2();
+  bool dhcp = g_config.getDhcpEnabled();
+  int channel = g_config.getDMXAddress();
+  int universe = g_config.getDMXUniverse();
+  float startValue = g_config.getStartValue();
+  size_t passLen = g_config.getPass().length();
+
+  Serial.printf("[CFG] ssid=\"%s\" hostname=\"%s\" pass_len=%u dhcp=%d ip=\"%s\" gw=\"%s\" subnet=\"%s\" dns1=\"%s\" dns2=\"%s\" channel=%d universe=%d start=%.6g\n",
+                ssid.c_str(),
+                hostname.c_str(),
+                (unsigned int)passLen,
+                dhcp ? 1 : 0,
+                ip.c_str(),
+                gateway.c_str(),
+                subnet.c_str(),
+                dns1.c_str(),
+                dns2.c_str(),
+                channel,
+                universe,
+                (double)startValue);
+#endif
+}
+
 TaskHandle_t appGetWebServerTaskHandle() {
   if (g_webTaskHandle == nullptr) {
     g_webTaskHandle = xTaskGetHandle("httpd");
   }
   return g_webTaskHandle;
+}
+
+AppTaskRuntimeStats appGetWebTaskRuntimeStats() {
+  AppTaskRuntimeStats stats;
+  portENTER_CRITICAL(&g_statusMux);
+  stats.lastActiveMs = g_webTaskLastActiveMs;
+  stats.utilPermille = g_webTaskUtilPermille;
+  portEXIT_CRITICAL(&g_statusMux);
+  return stats;
 }
 
 void appInitRuntime(const AppRuntimeHooks& hooks) {
@@ -824,6 +1094,7 @@ void appStartCommonServices() {
 }
 
 void appConnectWifi() {
+  logStoredConfig();
   bool connected = g_wifiManager.connectToWifi();
   if (!connected) {
     Serial.println("No WiFi... Starting AP");
@@ -880,5 +1151,18 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
   if (now - g_lastWsPushMs >= wsStatusPushMs) {
     wsBroadcastStatus();
     g_lastWsPushMs = now;
+  }
+
+  // Send WS PING every 30s to keep TCP connections alive and evict dead clients
+  static constexpr uint32_t WS_PING_INTERVAL_MS = 30000;
+  if (now - g_lastWsPingMs >= WS_PING_INTERVAL_MS) {
+    int clients[MAX_WS_CLIENTS];
+    int count = wsCopyClients(clients, MAX_WS_CLIENTS);
+    for (int i = 0; i < count; i++) {
+      if (wsQueuePingToClient(clients[i]) != ESP_OK) {
+        wsRemoveClient(clients[i]);
+      }
+    }
+    g_lastWsPingMs = now;
   }
 }

@@ -211,8 +211,13 @@
       }
       .layout {
         display: grid;
+        gap: 18px;
+      }
+      .row-split {
+        display: grid;
         grid-template-columns: minmax(320px, 1.15fr) minmax(280px, 0.85fr);
         gap: 18px;
+        align-items: start;
       }
       .stack { display: grid; gap: 18px; }
       .hero-grid {
@@ -322,14 +327,15 @@
         font-size: 11px;
         color: var(--muted);
         text-transform: uppercase;
+      }
       .kv-pairs {
         display: grid;
         gap: 8px;
       }
       .kv-row {
-        display: flex;
+        display: grid;
+        grid-template-columns: var(--kv-label-width, 72px) minmax(0, 1fr);
         align-items: baseline;
-        justify-content: space-between;
         gap: 12px;
       }
       .kv-key {
@@ -344,9 +350,6 @@
         font-weight: 800;
         text-align: right;
         word-break: break-word;
-      }
-        letter-spacing: 0.08em;
-        font-weight: 800;
       }
       .status-row {
         display: grid;
@@ -385,7 +388,7 @@
         color: var(--text);
       }
       @media (max-width: 920px) {
-        .layout { grid-template-columns: 1fr; }
+        .row-split { grid-template-columns: 1fr; }
       }
       @media (max-width: 760px) {
         .page { padding: 12px; }
@@ -528,7 +531,7 @@
         lastStatusUpdateMs = Date.now();
         const motorValue = Number(s.motor_value ?? NaN);
         const motorValueEl = document.getElementById('motorValue');
-        if (motorValueEl) motorValueEl.innerText = isFinite(motorValue) ? String(Math.round(motorValue)) : '-';
+        if (motorValueEl) motorValueEl.innerText = isFinite(motorValue) ? String(Math.round(motorValue)/10.0) : '-';
 
         const art = Number(s.art_age_ms ?? NaN);
         const wifiRssi = Number(s.wifi_rssi ?? NaN);
@@ -536,7 +539,7 @@
         const wifiMac = typeof s.wifi_mac === 'string' && s.wifi_mac.length ? s.wifi_mac : '-';
         const freeHeap = Number(s.free_heap ?? NaN);
         const minFreeHeap = Number(s.min_free_heap ?? NaN);
-        const resetReason = typeof s.reset_reason === 'string' ? s.reset_reason : '-';
+        const boardTempC = Number(s.board_temp_c ?? NaN);
         const rssiInfo = getRssiInfo(wifiRssi);
         updateDashboardTitle(s.hostname);
         document.getElementById('artAge').innerText = isFinite(art) ? art : '-';
@@ -549,7 +552,7 @@
         document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
         document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
         document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
-        document.getElementById('resetReason').innerText = resetReason.replace(/_/g, ' ');
+        document.getElementById('boardTemp').innerText = isFinite(boardTempC) ? `${boardTempC.toFixed(1)} deg C` : '-';
         applyTask(
           'controlTask',
           s.task_control_state,
@@ -618,7 +621,8 @@
       async function pollStatus() {
         if (wsConnected) {
           if (lastStatusUpdateMs > 0 && (Date.now() - lastStatusUpdateMs) > STATUS_WS_STALE_MS) {
-            // If WS appears stuck but still open, use HTTP poll as a recovery path.
+            // WS appears stuck — close it to trigger onclose → reconnect
+            if (statusSocket) { statusSocket.close(); }
           } else {
             scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
             return;
@@ -700,7 +704,7 @@
     </header>
 
     <main class="layout">
-      <section class="stack">
+      <section class="row-split">
         <article class="card">
           <div class="card-inner">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
@@ -724,12 +728,25 @@
 
         <article class="card">
           <div class="card-inner">
+            <h2 class="card-title">Motor Output</h2>
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:1fr;">
+              <div class="meta">
+                <span class="label">Output Value</span>
+                <div id="motorValue" class="value mono">0</div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="stack">
+        <article class="card">
+          <div class="card-inner">
             <h2 class="card-title">System</h2>
             <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
               <div class="meta"><span class="label">Wi-Fi RSSI</span><div id="wifiRssi" class="value mono">-</div><div class="rssi-wrap"><div class="rssi-bar"><div id="wifiRssiMarker" class="rssi-marker"></div></div><div class="rssi-scale"><span>Weak</span><span>Fair</span><span>Good</span></div><div id="wifiRssiQuality" class="rssi-note">Unknown</div></div></div>
-              <div class="meta"><span class="label">Network</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">IP</span><span id="wifiIp" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MAC</span><span id="wifiMac" class="kv-val mono">-</span></div></div></div>
-              <div class="meta"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div></div></div>
-              <div class="meta"><span class="label">Reset Reason</span><div id="resetReason" class="value">-</div></div>
+              <div class="meta" style="--kv-label-width:56px;"><span class="label">Network</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">IP</span><span id="wifiIp" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MAC</span><span id="wifiMac" class="kv-val mono">-</span></div></div></div>
+              <div class="meta" style="--kv-label-width:56px;"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MCU</span><span id="boardTemp" class="kv-val mono">-</span></div></div></div>
             </div>
           </div>
         </article>
@@ -745,20 +762,6 @@
           </div>
         </article>
       </section>
-
-      <aside class="stack">
-        <article class="card">
-          <div class="card-inner">
-            <h2 class="card-title">BLDC Output</h2>
-            <div class="meta-grid" style="margin-top:16px;grid-template-columns:1fr;">
-              <div class="meta">
-                <span class="label">Output Value</span>
-                <div id="motorValue" class="value mono">0</div>
-              </div>
-            </div>
-          </div>
-        </article>
-      </aside>
     </main>
   </div>
 </div>

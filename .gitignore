@@ -5,3 +5,5 @@
 .vscode/ipch
 .pio-core/*
 
+all_files_concatenated.txt
+.gitignore

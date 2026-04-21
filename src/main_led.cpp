@@ -22,6 +22,14 @@ static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
 static constexpr uint32_t MAX_ARTNET_PACKETS_PER_LOOP = 64;
 static constexpr uint32_t ARTNET_DRAIN_BUDGET_MS = 8;
 
+#ifndef ARTNET_TIMING_LOG_ENABLE
+#define ARTNET_TIMING_LOG_ENABLE 0
+#endif
+
+static constexpr uint32_t ARTNET_TIMING_LOG_WINDOW_MS = 3000;
+static constexpr uint32_t ARTNET_INTERVAL_WARN_US = 40000;
+static constexpr uint32_t ARTNET_INTERVAL_FREEZE_US = 100000;
+
 static TaskHandle_t controlTaskHandle = nullptr;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -30,6 +38,7 @@ static float currentValues[4] = {0, 0, 0, 0};
 struct AppConfigCache {
   uint16_t dmxStartAddress = 1;
   uint16_t artnetUniverse = 0;
+  float startValue = 0.0f;
 };
 
 struct TaskMetrics {
@@ -37,6 +46,35 @@ struct TaskMetrics {
   uint32_t windowStartUs = 0;
   uint32_t busyUsAccum = 0;
   uint16_t utilPermille = 0;
+};
+
+struct ArtnetTimingWindow {
+  uint32_t windowStartMs = 0;
+  uint32_t lastPacketUs = 0;
+  uint32_t lastControlLoopUs = 0;
+
+  uint32_t packetCount = 0;
+  uint64_t intervalSumUs = 0;
+  uint32_t intervalMinUs = 0xFFFFFFFFu;
+  uint32_t intervalMaxUs = 0;
+  uint32_t intervalWarnCount = 0;
+  uint32_t intervalFreezeCount = 0;
+
+  uint32_t seqEnabledPackets = 0;
+  uint32_t seqDiscontCount = 0;
+  uint32_t seqRepeatCount = 0;
+  uint32_t seqBackwardCount = 0;
+  uint8_t lastSeq = 0;
+  bool haveLastSeq = false;
+
+  uint32_t sourceSwitchCount = 0;
+  uint64_t lastSourceKey = 0;
+
+  uint32_t loopSamples = 0;
+  uint64_t loopPeriodSumUs = 0;
+  uint32_t loopPeriodMinUs = 0xFFFFFFFFu;
+  uint32_t loopPeriodMaxUs = 0;
+  uint32_t loopLateCount = 0;
 };
 
 struct StatusSnapshot {
@@ -66,6 +104,145 @@ static uint16_t artUdpLastRemotePort = 0;
 static IPAddress artUdpLastRemoteIp(0, 0, 0, 0);
 static AppConfigCache g_cfg;
 static TaskMetrics g_controlTaskMetrics;
+static ArtnetTimingWindow g_artnetTiming;
+
+static void noteArtnetPacketTiming(uint32_t nowUs) {
+  ArtnetTimingWindow& t = g_artnetTiming;
+  if (t.lastPacketUs != 0) {
+    uint32_t dtUs = nowUs - t.lastPacketUs;
+    t.intervalSumUs += dtUs;
+    if (dtUs < t.intervalMinUs) t.intervalMinUs = dtUs;
+    if (dtUs > t.intervalMaxUs) t.intervalMaxUs = dtUs;
+    if (dtUs >= ARTNET_INTERVAL_WARN_US) t.intervalWarnCount++;
+    if (dtUs >= ARTNET_INTERVAL_FREEZE_US) t.intervalFreezeCount++;
+  }
+  t.lastPacketUs = nowUs;
+  t.packetCount++;
+}
+
+static void noteArtnetSource(IPAddress remoteIp, uint16_t remotePort) {
+  ArtnetTimingWindow& t = g_artnetTiming;
+  uint32_t ipRaw = ((uint32_t)remoteIp[0] << 24) |
+                   ((uint32_t)remoteIp[1] << 16) |
+                   ((uint32_t)remoteIp[2] << 8) |
+                   (uint32_t)remoteIp[3];
+  uint64_t key = (((uint64_t)ipRaw) << 16) | (uint64_t)remotePort;
+  if (t.lastSourceKey != 0 && t.lastSourceKey != key) {
+    t.sourceSwitchCount++;
+  }
+  t.lastSourceKey = key;
+}
+
+static void noteArtnetSequence(const uint8_t* p, int len) {
+  if (len < 18) return;
+  if (memcmp(p, "Art-Net\0", 8) != 0) return;
+  if (!(p[8] == 0x00 && p[9] == 0x50)) return;
+
+  uint8_t seq = p[12];
+  if (seq == 0) {
+    return;
+  }
+
+  ArtnetTimingWindow& t = g_artnetTiming;
+  t.seqEnabledPackets++;
+
+  if (t.haveLastSeq) {
+    uint8_t expected = (uint8_t)(t.lastSeq + 1);
+    if (seq == t.lastSeq) {
+      t.seqRepeatCount++;
+    } else if (seq != expected) {
+      t.seqDiscontCount++;
+      if ((uint8_t)(seq - t.lastSeq) > 128U) {
+        t.seqBackwardCount++;
+      }
+    }
+  }
+
+  t.lastSeq = seq;
+  t.haveLastSeq = true;
+}
+
+static void noteControlLoopTiming(uint32_t nowUs) {
+  ArtnetTimingWindow& t = g_artnetTiming;
+  if (t.lastControlLoopUs != 0) {
+    uint32_t dtUs = nowUs - t.lastControlLoopUs;
+    t.loopPeriodSumUs += dtUs;
+    if (dtUs < t.loopPeriodMinUs) t.loopPeriodMinUs = dtUs;
+    if (dtUs > t.loopPeriodMaxUs) t.loopPeriodMaxUs = dtUs;
+    if (dtUs >= 10000U) t.loopLateCount++;
+    t.loopSamples++;
+  }
+  t.lastControlLoopUs = nowUs;
+}
+
+static void logArtnetTimingWindowIfDue(uint32_t nowMs) {
+#if ARTNET_TIMING_LOG_ENABLE
+  ArtnetTimingWindow& t = g_artnetTiming;
+  if (t.windowStartMs == 0) {
+    t.windowStartMs = nowMs;
+    return;
+  }
+  if ((nowMs - t.windowStartMs) < ARTNET_TIMING_LOG_WINDOW_MS) {
+    return;
+  }
+
+  uint32_t windowMs = nowMs - t.windowStartMs;
+  float pktHz = (windowMs > 0) ? ((float)t.packetCount * 1000.0f / (float)windowMs) : 0.0f;
+  float avgIatMs = (t.packetCount > 1) ? ((float)t.intervalSumUs / (float)(t.packetCount - 1) / 1000.0f) : -1.0f;
+  float minIatMs = (t.intervalMinUs == 0xFFFFFFFFu) ? -1.0f : ((float)t.intervalMinUs / 1000.0f);
+  float maxIatMs = (t.intervalMaxUs == 0) ? -1.0f : ((float)t.intervalMaxUs / 1000.0f);
+  float avgLoopMs = (t.loopSamples > 0) ? ((float)t.loopPeriodSumUs / (float)t.loopSamples / 1000.0f) : -1.0f;
+  float minLoopMs = (t.loopPeriodMinUs == 0xFFFFFFFFu) ? -1.0f : ((float)t.loopPeriodMinUs / 1000.0f);
+  float maxLoopMs = (t.loopPeriodMaxUs == 0) ? -1.0f : ((float)t.loopPeriodMaxUs / 1000.0f);
+  float ctrlUtilPct;
+  portENTER_CRITICAL(&statusMux);
+  ctrlUtilPct = (float)g_controlTaskMetrics.utilPermille / 10.0f;
+  portEXIT_CRITICAL(&statusMux);
+  uint32_t idleGapMs = (t.lastPacketUs == 0) ? 0xFFFFFFFFu : ((micros() - t.lastPacketUs) / 1000U);
+
+  Serial.printf("[ARTTIM] win=%lums hz=%.1f iat_ms=%.2f/%.2f/%.2f warn40=%lu freeze100=%lu idle=%lums loop_ms=%.2f/%.2f/%.2f late10=%lu util=%.1f\n",
+                (unsigned long)windowMs,
+                pktHz,
+                minIatMs,
+                avgIatMs,
+                maxIatMs,
+                (unsigned long)t.intervalWarnCount,
+                (unsigned long)t.intervalFreezeCount,
+                (unsigned long)idleGapMs,
+                minLoopMs,
+                avgLoopMs,
+                maxLoopMs,
+                (unsigned long)t.loopLateCount,
+                ctrlUtilPct);
+
+  Serial.printf("[ARTSRC] seq_on=%lu seq_disc=%lu seq_rep=%lu seq_back=%lu src_sw=%lu\n",
+                (unsigned long)t.seqEnabledPackets,
+                (unsigned long)t.seqDiscontCount,
+                (unsigned long)t.seqRepeatCount,
+                (unsigned long)t.seqBackwardCount,
+                (unsigned long)t.sourceSwitchCount);
+
+  t.windowStartMs = nowMs;
+  t.packetCount = 0;
+  t.intervalSumUs = 0;
+  t.intervalMinUs = 0xFFFFFFFFu;
+  t.intervalMaxUs = 0;
+  t.intervalWarnCount = 0;
+  t.intervalFreezeCount = 0;
+  t.seqEnabledPackets = 0;
+  t.seqDiscontCount = 0;
+  t.seqRepeatCount = 0;
+  t.seqBackwardCount = 0;
+  t.sourceSwitchCount = 0;
+  t.loopSamples = 0;
+  t.loopPeriodSumUs = 0;
+  t.loopPeriodMinUs = 0xFFFFFFFFu;
+  t.loopPeriodMaxUs = 0;
+  t.loopLateCount = 0;
+#else
+  (void)nowMs;
+#endif
+}
 
 static void recordTaskMetrics(TaskMetrics& metrics, uint32_t busyUs) {
   uint32_t nowUs = micros();
@@ -110,6 +287,12 @@ static void setLedFloat(int ledcChannel, float brightness01) {
   portENTER_CRITICAL(&statusMux);
   currentValues[ledcChannel] = brightness01;
   portEXIT_CRITICAL(&statusMux);
+}
+
+static void applyStartValue(float value) {
+  for (int i = 0; i < 4; i++) {
+    setLedFloat(i, value);
+  }
 }
 
 static inline void writeValue(int ledcChannel, const uint8_t* data, uint16_t addr) {
@@ -179,8 +362,12 @@ static void pollArtnet() {
   uint32_t processed = 0;
   int psize = artudp.parsePacket();
   while (psize > 0 && processed < MAX_ARTNET_PACKETS_PER_LOOP) {
+    uint32_t packetNowUs = micros();
     IPAddress remoteIp = artudp.remoteIP();
     uint16_t remotePort = artudp.remotePort();
+
+    noteArtnetPacketTiming(packetNowUs);
+    noteArtnetSource(remoteIp, remotePort);
 
     portENTER_CRITICAL(&statusMux);
     artUdpRxTotal++;
@@ -196,6 +383,7 @@ static void pollArtnet() {
 
     int n = artudp.read(artbuf, readLen);
     if (n > 0) {
+      noteArtnetSequence(artbuf, n);
       ArtDmxPacket a = appParseArtDmx(artbuf, n);
       if (a.ok) {
         processArtnet(a);
@@ -218,9 +406,12 @@ static void pollArtnet() {
 static void controlTask(void* parameter) {
   (void)parameter;
   for (;;) {
+    uint32_t loopNowUs = micros();
+    noteControlLoopTiming(loopNowUs);
     uint32_t busyStartUs = micros();
     pollArtnet();
     recordTaskMetrics(g_controlTaskMetrics, micros() - busyStartUs);
+    logArtnetTimingWindowIfDue(millis());
     vTaskDelay(pdMS_TO_TICKS(CONTROL_TASK_DELAY_MS));
   }
 }
@@ -242,20 +433,28 @@ static StatusSnapshot readStatusSnapshot() {
 }
 
 static size_t buildStatusJson(char* out, size_t outSize, bool details) {
-  DynamicJsonDocument j(1024);
+  StaticJsonDocument<1024> j;
   StatusSnapshot snapshot = readStatusSnapshot();
   uint32_t now = millis();
   uint32_t artAge = (snapshot.lastArtMs == 0) ? 0xFFFFFFFFu : (now - snapshot.lastArtMs);
   TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
+  AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
+  WifiManagerClass& wifiManager = appWifiManager();
+  IPAddress ip = wifiManager.getIP();
+  char ipBuf[16];
+  char macBuf[18];
+  snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  wifiManager.getMacAddress(macBuf, sizeof(macBuf));
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
-  j["wifi_rssi"] = appWifiManager().getRSSI();
-  j["hostname"] = appWifiManager().getHostname();
-  j["wifi_ip"] = appWifiManager().getIP().toString();
-  j["wifi_mac"] = appWifiManager().getMacAddress();
+  j["wifi_rssi"] = wifiManager.getRSSI();
+  j["hostname"] = wifiManager.getHostnameCStr();
+  j["wifi_ip"] = ipBuf;
+  j["wifi_mac"] = macBuf;
   j["free_heap"] = ESP.getFreeHeap();
   j["min_free_heap"] = ESP.getMinFreeHeap();
+  j["board_temp_c"] = appReadBoardTemperatureC();
   j["reset_reason"] = appResetReasonToString(esp_reset_reason());
   j["task_control_state"] = taskStateToString(eTaskGetState(controlTaskHandle));
   j["task_control_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
@@ -263,8 +462,8 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["task_control_util_pct"] = (float)snapshot.controlTaskUtilPermille / 10.0f;
   j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
   j["task_web_stack_hwm"] = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
-  j["task_web_last_ms_ago"] = -1;
-  j["task_web_util_pct"] = -1;
+  j["task_web_last_ms_ago"] = (webTaskStats.lastActiveMs == 0) ? -1 : (int32_t)(now - webTaskStats.lastActiveMs);
+  j["task_web_util_pct"] = (float)webTaskStats.utilPermille / 10.0f;
 
   j["led_value0"] = snapshot.ledValues[0];
   j["led_value1"] = snapshot.ledValues[1];
@@ -354,6 +553,8 @@ void setup() {
 
   g_cfg.dmxStartAddress = appConfig().getDMXAddress();
   g_cfg.artnetUniverse = appConfig().getDMXUniverse();
+  g_cfg.startValue = appConfig().getStartValue();
+  applyStartValue(g_cfg.startValue);
 
   appInitRuntime({
     "/wifi-manager/index_led.html",
