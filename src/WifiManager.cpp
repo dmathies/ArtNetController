@@ -17,6 +17,7 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 	_connected = false;
 	_restartAtMs = 0;
 	_restartPending = false;
+	_managementApActive = false;
 	_scanInProgress = false;
 	_scanRequested = false;
 	_scanHasResult = false;
@@ -29,7 +30,8 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 
 	_networks = "";
 	_hostname = "";
-	_ssid = "";
+	_stationSsid = "";
+	_apSsid = "";
 }
 
 void WifiManagerClass::check() {
@@ -52,7 +54,7 @@ void WifiManagerClass::check() {
 		ESP.restart();
 	}
 
-	if (!_otaInProgress && millis() > _nextReconnectCheck) {
+	if (!_otaInProgress && !_managementApActive && millis() > _nextReconnectCheck) {
 		if (status != WL_CONNECTED) {
 			ensureReconnectAttempt();
 		}
@@ -114,7 +116,7 @@ void WifiManagerClass::cleanupBeforeRestart() {
 }
 
 void WifiManagerClass::ensureReconnectAttempt() {
-	if (_ssid.length() == 0) {
+	if (_stationSsid.length() == 0) {
 		return;
 	}
 
@@ -133,12 +135,13 @@ void WifiManagerClass::ensureReconnectAttempt() {
 	esp_wifi_set_ps(WIFI_PS_NONE);
 
 	Serial.println("WiFi not connected. Attempting to reconnect.");
-	if (WiFi.reconnect()) {
+	String currentTarget = WiFi.SSID();
+	if (currentTarget == _stationSsid && WiFi.reconnect()) {
 		return;
 	}
 
 	String pass = _config.getPass();
-	WiFi.begin(_ssid.c_str(), pass.c_str());
+	WiFi.begin(_stationSsid.c_str(), pass.c_str());
 }
 
 void WifiManagerClass::startNetworkScan() {
@@ -231,11 +234,13 @@ String WifiManagerClass::getAvailableNetworks() {
 }
 
 bool WifiManagerClass::connectToWifi() {
-	_ssid = _config.getSSID();
+	_stationSsid = _config.getSSID();
 	_hostname = _config.getHostname();
 	String pass = _config.getPass();
+	_managementApActive = false;
+	_apSsid = "";
 
-	if (_ssid == "") {
+	if (_stationSsid == "") {
 		Serial.println("No connection information specified");
 
 		return false;
@@ -300,7 +305,7 @@ bool WifiManagerClass::connectToWifi() {
 
 	Serial.println("Connecting to WiFi...");
 
-	WiFi.begin(_ssid.c_str(), pass.c_str());
+	WiFi.begin(_stationSsid.c_str(), pass.c_str());
 
 	_connected = waitForConnection();
 	WiFi.setSleep(WIFI_PS_NONE);
@@ -334,15 +339,44 @@ bool WifiManagerClass::waitForConnection() {
 void WifiManagerClass::startManagementAP() {
 	const char *ssid="WIFI-MANAGER";
 
+	if (_managementApActive) {
+		IPAddress currentApIp = WiFi.softAPIP();
+		if (currentApIp != IPAddress((uint32_t)0)) {
+			_ip = currentApIp;
+			return;
+		}
+		_managementApActive = false;
+	}
+
 	Serial.println("Starting Management AP");
-	WiFi.mode(WIFI_MODE_APSTA);
+	WiFi.softAPdisconnect(true);
+	if (WiFi.getMode() != WIFI_MODE_APSTA) {
+		WiFi.mode(WIFI_MODE_APSTA);
+	}
 	WiFi.setSleep(WIFI_PS_NONE);
 	esp_wifi_set_ps(WIFI_PS_NONE);
+	delay(100);
 
-	WiFi.softAP(ssid);
+	bool apOk = WiFi.softAP(ssid);
+	if (!apOk || WiFi.softAPIP() == IPAddress((uint32_t)0)) {
+		Serial.println("Initial AP start failed, retrying WiFi AP setup");
+		WiFi.mode(WIFI_MODE_NULL);
+		delay(100);
+		WiFi.mode(WIFI_MODE_APSTA);
+		WiFi.setSleep(WIFI_PS_NONE);
+		esp_wifi_set_ps(WIFI_PS_NONE);
+		delay(100);
+		apOk = WiFi.softAP(ssid);
+	}
 
-	_ssid = WiFi.softAPSSID();
+	_managementApActive = apOk && (WiFi.softAPIP() != IPAddress((uint32_t)0));
+	_apSsid = _managementApActive ? WiFi.softAPSSID() : "";
 	_ip = WiFi.softAPIP();
+
+	if (!_managementApActive) {
+		Serial.println("Management AP failed to start");
+		return;
+	}
 
 	Serial.println("Server IP Address:");
 	Serial.println(_ip);
@@ -357,7 +391,15 @@ const char* WifiManagerClass::getHostnameCStr() const {
 }
 
 String WifiManagerClass::getSSID() {
-	return _ssid;
+	if (_connected) {
+		return _stationSsid;
+	}
+
+	if (_managementApActive) {
+		return _apSsid;
+	}
+
+	return _stationSsid;
 }
 
 void WifiManagerClass::getMacAddress(char* out, size_t outSize) const {

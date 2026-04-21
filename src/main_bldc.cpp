@@ -9,11 +9,11 @@
 #include "bldc_uart.h"
 
 #ifndef BLDC_UART_TX_PIN
-#define BLDC_UART_TX_PIN 33
+#define BLDC_UART_TX_PIN 27
 #endif
 
 #ifndef BLDC_UART_RX_PIN
-#define BLDC_UART_RX_PIN 32
+#define BLDC_UART_RX_PIN 14
 #endif
 
 #ifndef BLDC_UART_OE_PIN
@@ -362,7 +362,7 @@ static void motorTask(void* parameter) {
   }
 }
 
-static void processArtnet(const ArtDmxPacket& a) {
+static void processArtnet(const ArtDmxPacket& a, bool* haveLatestRaw, uint8_t* latestRaw) {
   portENTER_CRITICAL(&statusMux);
   artDmxRxTotal++;
   artLastUniverseFlat = a.universe_flat;
@@ -379,8 +379,10 @@ static void processArtnet(const ArtDmxPacket& a) {
   uint16_t channel = g_cfg.dmxStartAddress;
   if (channel < 1 || channel > a.length) return;
 
-  uint8_t raw = a.data[channel - 1];
-  enqueueMotor(raw);
+  if (haveLatestRaw && latestRaw) {
+    *latestRaw = a.data[channel - 1];
+    *haveLatestRaw = true;
+  }
   appMarkArtnetActivity();
 
   portENTER_CRITICAL(&statusMux);
@@ -417,6 +419,8 @@ static void pollArtnet() {
 
   uint32_t startMs = millis();
   uint32_t processed = 0;
+  bool haveLatestRaw = false;
+  uint8_t latestRaw = 0;
   int psize = artudp.parsePacket();
   while (psize > 0 && processed < MAX_ARTNET_PACKETS_PER_LOOP) {
     uint32_t packetNowUs = micros();
@@ -443,7 +447,7 @@ static void pollArtnet() {
       noteArtnetSequence(artbuf, n);
       ArtDmxPacket a = appParseArtDmx(artbuf, n);
       if (a.ok) {
-        processArtnet(a);
+        processArtnet(a, &haveLatestRaw, &latestRaw);
       } else {
         portENTER_CRITICAL(&statusMux);
         artDmxInvalidTotal++;
@@ -456,6 +460,10 @@ static void pollArtnet() {
     if ((millis() - startMs) >= ARTNET_DRAIN_BUDGET_MS) {
       break;
     }
+  }
+
+  if (haveLatestRaw) {
+    enqueueMotor(latestRaw);
   }
 }
 

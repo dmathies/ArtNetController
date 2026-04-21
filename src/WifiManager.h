@@ -44,13 +44,15 @@ class WifiManagerClass {
 
 		String _networks;
 		String _hostname;
-		String _ssid;
+		String _stationSsid;
+		String _apSsid;
 
 		IPAddress _ip;
 
 		unsigned long _nextReconnectCheck;
 		unsigned long _restartAtMs;
 		bool _restartPending;
+		bool _managementApActive;
 		bool _scanInProgress;
 		bool _scanRequested;
 		bool _scanHasResult;
