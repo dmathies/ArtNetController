@@ -26,7 +26,9 @@ exclude_dirs = {
 exclude_files = {
     'package-lock.json',
     '.gitlab-ci.yml',
-    'lint-report.json'
+    'lint-report.json',
+    'concatinator.py',
+    'all_files_concatenated.txt',
 }
 
 output_file = 'all_files_concatenated.txt'
