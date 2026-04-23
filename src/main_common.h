@@ -5,6 +5,8 @@
 
 #include "WifiManager.h"
 
+constexpr uint16_t APP_ARTNET_PORT = 6454;
+
 struct ArtDmxPacket {
   bool ok = false;
   uint16_t universe_flat = 0;
@@ -37,6 +39,7 @@ AppTaskRuntimeStats appGetWebTaskRuntimeStats();
 const char* appResetReasonToString(esp_reset_reason_t reason);
 float appReadBoardTemperatureC();
 
+void appInitializeBaseRuntime();
 void appInitRuntime(const AppRuntimeHooks& hooks);
 void appStartCommonServices();
 void appConnectWifi();
