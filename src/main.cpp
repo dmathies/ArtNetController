@@ -15,7 +15,7 @@
 
 #include "main_common.h"
 
-static constexpr uint16_t ARTNET_PORT = 6454;
+
 static constexpr int MAX_WS_CLIENTS = 6;
 static constexpr uint32_t SLOW_HTTP_MS = 100;
 static constexpr uint32_t SLOW_WS_BROADCAST_MS = 50;
@@ -2092,6 +2092,24 @@ AppTaskRuntimeStats appGetWebTaskRuntimeStats() {
   stats.utilPermille = g_webTaskUtilPermille;
   portEXIT_CRITICAL(&g_statusMux);
   return stats;
+}
+
+
+void appInitializeBaseRuntime() {
+  Serial.begin(115200);
+
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && (ARDUINO_USB_CDC_ON_BOOT == 1)
+  uint32_t serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart) < 1500) {
+    delay(10);
+  }
+#endif
+
+  Serial.println("Startup...");
+
+  if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+    Serial.println("LittleFS mount failed");
+  }
 }
 
 void appInitRuntime(const AppRuntimeHooks& hooks) {
