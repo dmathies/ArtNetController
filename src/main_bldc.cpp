@@ -2,10 +2,10 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <AsyncUDP.h>
-#include <LittleFS.h>
 #include <ArduinoJson.h>
 
 #include "main_common.h"
+#include "runtime_metrics.h"
 #include "bldc_uart.h"
 
 #ifndef BLDC_UART_TX_PIN
@@ -58,42 +58,6 @@ struct AppConfigCache {
   uint16_t dmxStartAddress = 1;
   uint16_t artnetUniverse = 0;
   float startValue = 0.0f;
-};
-
-struct TaskMetrics {
-  uint32_t lastLoopMs = 0;
-  uint32_t windowStartUs = 0;
-  uint32_t busyUsAccum = 0;
-  uint16_t utilPermille = 0;
-};
-
-struct ArtnetTimingWindow {
-  uint32_t windowStartMs = 0;
-  uint32_t lastPacketUs = 0;
-  uint32_t lastControlLoopUs = 0;
-
-  uint32_t packetCount = 0;
-  uint64_t intervalSumUs = 0;
-  uint32_t intervalMinUs = 0xFFFFFFFFu;
-  uint32_t intervalMaxUs = 0;
-  uint32_t intervalWarnCount = 0;
-  uint32_t intervalFreezeCount = 0;
-
-  uint32_t seqEnabledPackets = 0;
-  uint32_t seqDiscontCount = 0;
-  uint32_t seqRepeatCount = 0;
-  uint32_t seqBackwardCount = 0;
-  uint8_t lastSeq = 0;
-  bool haveLastSeq = false;
-
-  uint32_t sourceSwitchCount = 0;
-  uint64_t lastSourceKey = 0;
-
-  uint32_t loopSamples = 0;
-  uint64_t loopPeriodSumUs = 0;
-  uint32_t loopPeriodMinUs = 0xFFFFFFFFu;
-  uint32_t loopPeriodMaxUs = 0;
-  uint32_t loopLateCount = 0;
 };
 
 struct StatusSnapshot {
@@ -153,75 +117,6 @@ static ArtnetTimingWindow g_artnetTiming;
 static CachedDiagnostics g_cachedDiagnostics;
 static uint32_t g_statusDiagnosticsBuiltMs = 0;
 
-static void noteArtnetPacketTiming(uint32_t nowUs) {
-  ArtnetTimingWindow& t = g_artnetTiming;
-  if (t.lastPacketUs != 0) {
-    uint32_t dtUs = nowUs - t.lastPacketUs;
-    t.intervalSumUs += dtUs;
-    if (dtUs < t.intervalMinUs) t.intervalMinUs = dtUs;
-    if (dtUs > t.intervalMaxUs) t.intervalMaxUs = dtUs;
-    if (dtUs >= ARTNET_INTERVAL_WARN_US) t.intervalWarnCount++;
-    if (dtUs >= ARTNET_INTERVAL_FREEZE_US) t.intervalFreezeCount++;
-  }
-  t.lastPacketUs = nowUs;
-  t.packetCount++;
-}
-
-static void noteArtnetSource(IPAddress remoteIp, uint16_t remotePort) {
-  ArtnetTimingWindow& t = g_artnetTiming;
-  uint32_t ipRaw = ((uint32_t)remoteIp[0] << 24) |
-                   ((uint32_t)remoteIp[1] << 16) |
-                   ((uint32_t)remoteIp[2] << 8) |
-                   (uint32_t)remoteIp[3];
-  uint64_t key = (((uint64_t)ipRaw) << 16) | (uint64_t)remotePort;
-  if (t.lastSourceKey != 0 && t.lastSourceKey != key) {
-    t.sourceSwitchCount++;
-  }
-  t.lastSourceKey = key;
-}
-
-static void noteArtnetSequence(const uint8_t* p, int len) {
-  if (len < 18) return;
-  if (memcmp(p, "Art-Net\0", 8) != 0) return;
-  if (!(p[8] == 0x00 && p[9] == 0x50)) return;
-
-  uint8_t seq = p[12];
-  if (seq == 0) {
-    return;
-  }
-
-  ArtnetTimingWindow& t = g_artnetTiming;
-  t.seqEnabledPackets++;
-
-  if (t.haveLastSeq) {
-    uint8_t expected = (uint8_t)(t.lastSeq + 1);
-    if (seq == t.lastSeq) {
-      t.seqRepeatCount++;
-    } else if (seq != expected) {
-      t.seqDiscontCount++;
-      if ((uint8_t)(seq - t.lastSeq) > 128U) {
-        t.seqBackwardCount++;
-      }
-    }
-  }
-
-  t.lastSeq = seq;
-  t.haveLastSeq = true;
-}
-
-static void noteControlLoopTiming(uint32_t nowUs) {
-  ArtnetTimingWindow& t = g_artnetTiming;
-  if (t.lastControlLoopUs != 0) {
-    uint32_t dtUs = nowUs - t.lastControlLoopUs;
-    t.loopPeriodSumUs += dtUs;
-    if (dtUs < t.loopPeriodMinUs) t.loopPeriodMinUs = dtUs;
-    if (dtUs > t.loopPeriodMaxUs) t.loopPeriodMaxUs = dtUs;
-    if (dtUs >= 10000U) t.loopLateCount++;
-    t.loopSamples++;
-  }
-  t.lastControlLoopUs = nowUs;
-}
-
 static void logArtnetTimingWindowIfDue(uint32_t nowMs) {
 #if ARTNET_TIMING_LOG_ENABLE
   ArtnetTimingWindow& t = g_artnetTiming;
@@ -272,23 +167,7 @@ static void logArtnetTimingWindowIfDue(uint32_t nowMs) {
                 (unsigned long)t.seqBackwardCount,
                 (unsigned long)t.sourceSwitchCount);
 
-  t.windowStartMs = nowMs;
-  t.packetCount = 0;
-  t.intervalSumUs = 0;
-  t.intervalMinUs = 0xFFFFFFFFu;
-  t.intervalMaxUs = 0;
-  t.intervalWarnCount = 0;
-  t.intervalFreezeCount = 0;
-  t.seqEnabledPackets = 0;
-  t.seqDiscontCount = 0;
-  t.seqRepeatCount = 0;
-  t.seqBackwardCount = 0;
-  t.sourceSwitchCount = 0;
-  t.loopSamples = 0;
-  t.loopPeriodSumUs = 0;
-  t.loopPeriodMinUs = 0xFFFFFFFFu;
-  t.loopPeriodMaxUs = 0;
-  t.loopLateCount = 0;
+  resetArtnetTimingWindow(t, nowMs);
 #else
   (void)nowMs;
 #endif
@@ -352,9 +231,9 @@ static void startArtnetListener() {
       artLastUniverseFlat = universeFlat;
       artDmxLastArrivalMs = nowMs;
 #if ARTNET_TIMING_LOG_ENABLE
-      noteArtnetPacketTiming(nowUs);
-      noteArtnetSource(remoteIp, remotePort);
-      noteArtnetSequence(data, (int)len);
+      noteArtnetPacketTiming(g_artnetTiming, nowUs, ARTNET_INTERVAL_WARN_US, ARTNET_INTERVAL_FREEZE_US);
+      noteArtnetSource(g_artnetTiming, remoteIp, remotePort);
+      noteArtnetSequence(g_artnetTiming, data, (int)len);
 #endif
       if (universeMatch) {
         artDmxUniverseMatchTotal++;
@@ -369,9 +248,9 @@ static void startArtnetListener() {
     portEXIT_CRITICAL(&statusMux);
   });
 
-  g_artudpListening = g_artudp.listen(6454);
+  g_artudpListening = g_artudp.listen(APP_ARTNET_PORT);
   if (g_artudpListening) {
-    Serial.println("[ARTNET] AsyncUDP listening on :6454");
+    Serial.printf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
   } else {
     Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
   }
@@ -453,39 +332,6 @@ static void logArtnetHealthIfDue(uint32_t nowMs) {
 #endif
 }
 
-static void recordTaskMetrics(TaskMetrics& metrics, uint32_t busyUs) {
-  uint32_t nowUs = micros();
-  uint32_t nowMs = millis();
-
-  portENTER_CRITICAL(&statusMux);
-  if (metrics.windowStartUs == 0) {
-    metrics.windowStartUs = nowUs;
-  }
-
-  metrics.lastLoopMs = nowMs;
-  metrics.busyUsAccum += busyUs;
-
-  uint32_t elapsedUs = nowUs - metrics.windowStartUs;
-  if (elapsedUs >= 1000000UL) {
-    uint32_t permille = (metrics.busyUsAccum * 1000UL) / elapsedUs;
-    metrics.utilPermille = (uint16_t)(permille > 1000UL ? 1000UL : permille);
-    metrics.busyUsAccum = 0;
-    metrics.windowStartUs = nowUs;
-  }
-  portEXIT_CRITICAL(&statusMux);
-}
-
-static const char* taskStateToString(eTaskState state) {
-  switch (state) {
-    case eRunning: return "running";
-    case eReady: return "ready";
-    case eBlocked: return "blocked";
-    case eSuspended: return "suspended";
-    case eDeleted: return "deleted";
-    default: return "unknown";
-  }
-}
-
 static inline uint8_t rawToStep(uint8_t raw) {
   return (uint8_t)((((uint16_t)raw) * 60U + 127U) / 255U);
 }
@@ -544,7 +390,7 @@ static void motorTask(void* parameter) {
     workUs += micros() - t1;
 
     // Queue wait time is idle time and must not be counted as task busy load.
-    recordTaskMetrics(g_motorTaskMetrics, workUs);
+    recordTaskMetrics(g_motorTaskMetrics, statusMux, workUs);
   }
 }
 
@@ -611,10 +457,10 @@ static void controlTask(void* parameter) {
   (void)parameter;
   for (;;) {
     uint32_t loopNowUs = micros();
-    noteControlLoopTiming(loopNowUs);
+    noteControlLoopTiming(g_artnetTiming, loopNowUs);
     uint32_t busyStartUs = micros();
     pollArtnet();
-    recordTaskMetrics(g_controlTaskMetrics, micros() - busyStartUs);
+    recordTaskMetrics(g_controlTaskMetrics, statusMux, micros() - busyStartUs);
     logArtnetTimingWindowIfDue(millis());
     logArtnetHealthIfDue(millis());
     vTaskDelay(pdMS_TO_TICKS(CONTROL_TASK_DELAY_MS));
@@ -737,20 +583,7 @@ static size_t buildHealthSummary(char* out, size_t outSize) {
 }
 
 void setup() {
-  Serial.begin(115200);
-
-#if defined(ARDUINO_USB_CDC_ON_BOOT) && (ARDUINO_USB_CDC_ON_BOOT == 1)
-  uint32_t serialWaitStart = millis();
-  while (!Serial && (millis() - serialWaitStart) < 1500) {
-    delay(10);
-  }
-#endif
-
-  Serial.println("Startup...");
-
-  if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
-    Serial.println("LittleFS mount failed");
-  }
+  appInitializeBaseRuntime();
 
   if (UART_OE >= 0) {
     pinMode(UART_OE, OUTPUT);

@@ -22,13 +22,14 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 	_scanRequested = false;
 	_scanHasResult = false;
 	_otaInProgress = false;
+	_scanStartedAtMs = 0;
 	_scanTaskHandle = nullptr;
 	_reconnectAttempts = 0;
 	_reconnectSuccesses = 0;
 	_lastReconnectAttemptMs = 0;
 	_lastReconnectSuccessMs = 0;
 
-	_networks = "";
+	_networks = "[]";
 	_hostname = "";
 	_stationSsid = "";
 	_apSsid = "";
@@ -39,6 +40,8 @@ void WifiManagerClass::check() {
 	if (status == WL_CONNECTED) {
 		_ip = WiFi.localIP();
 	}
+
+	pollNetworkScan();
 
 	if (!_connected && status == WL_CONNECTED) {
 		_connected = true;
@@ -64,11 +67,12 @@ void WifiManagerClass::check() {
 
 String WifiManagerClass::getNetworksPayload(bool details, bool refresh) {
 	if (!_otaInProgress && refresh) {
-		_networks = getAvailableNetworks();
-		_scanHasResult = true;
+		startNetworkScan();
 	}
 
-	bool isScanning = false;
+	pollNetworkScan();
+
+	bool isScanning = _scanRequested || _scanInProgress;
 
 	if (details) {
 		String payload;
@@ -145,7 +149,7 @@ void WifiManagerClass::ensureReconnectAttempt() {
 }
 
 void WifiManagerClass::startNetworkScan() {
-	if (_scanInProgress || _scanRequested) return;
+	if (_scanInProgress || _scanRequested || _otaInProgress) return;
 	_scanHasResult = false;
 	_scanRequested = true;
 }
@@ -157,57 +161,73 @@ void WifiManagerClass::networkScanTaskEntry(void* parameter) {
 }
 
 void WifiManagerClass::runNetworkScanTask() {
-	// _networks = getAvailableNetworks();
+	Serial.println("Scanning networks...");
+
+	wifi_mode_t mode = WiFi.getMode();
+	if (mode == WIFI_MODE_AP) {
+		WiFi.mode(WIFI_MODE_APSTA);
+		WiFi.setSleep(WIFI_PS_NONE);
+		esp_wifi_set_ps(WIFI_PS_NONE);
+	} else if (mode == WIFI_MODE_NULL) {
+		WiFi.mode(WIFI_MODE_STA);
+		WiFi.setSleep(WIFI_PS_NONE);
+		esp_wifi_set_ps(WIFI_PS_NONE);
+	}
+
+	int scanResult = WiFi.scanNetworks(false, false);
+	if (scanResult < 0) {
+		Serial.printf("WiFi scan failed (%d)\n", scanResult);
+		_networks = "[]";
+	} else {
+		_networks = buildNetworksJson(scanResult);
+		WiFi.scanDelete();
+		Serial.println("scan complete...");
+	}
+
 	_scanInProgress = false;
 	_scanHasResult = true;
 	_scanTaskHandle = nullptr;
 }
 
 void WifiManagerClass::pollNetworkScan() {
-	if (!_scanRequested || _scanInProgress) return;
-
-	_scanRequested = false;
-	_scanInProgress = true;
-	Serial.println("Starting WiFi scan...");
-
-	if (_scanTaskHandle != nullptr) {
+	if (_otaInProgress) {
 		return;
 	}
 
-	BaseType_t taskOk = xTaskCreatePinnedToCore(
-		networkScanTaskEntry,
-		"WifiScanTask",
-		4096,
-		this,
-		1,
-		&_scanTaskHandle,
-		1);
+	if (_scanRequested && !_scanInProgress) {
+		if (_scanTaskHandle != nullptr) {
+			return;
+		}
 
-	if (taskOk != pdPASS) {
-		Serial.println("Failed to start WiFi scan task");
+		_scanRequested = false;
 		_scanInProgress = false;
-		_scanHasResult = true;
-		_scanTaskHandle = nullptr;
+		_scanStartedAtMs = millis();
+		Serial.println("Starting WiFi scan...");
+
+		BaseType_t taskOk = xTaskCreatePinnedToCore(
+			networkScanTaskEntry,
+			"WifiScanTask",
+			6144,
+			this,
+			1,
+			&_scanTaskHandle,
+			1);
+
+		if (taskOk != pdPASS) {
+			Serial.println("Failed to start WiFi scan task");
+			_networks = "[]";
+			_scanInProgress = false;
+			_scanHasResult = true;
+			_scanTaskHandle = nullptr;
+			return;
+		}
+
+		_scanInProgress = true;
+		return;
 	}
 }
 
-String WifiManagerClass::getAvailableNetworks() {
-	Serial.print("Scanning networks...");
-
-	// Ensure STA is enabled so scanning works in AP management mode.
-	wifi_mode_t mode = WiFi.getMode();
-	if (mode == WIFI_MODE_AP) {
-		WiFi.mode(WIFI_MODE_APSTA);
-		WiFi.setSleep(WIFI_PS_NONE);
-		esp_wifi_set_ps(WIFI_PS_NONE);
-	}
-
-	int networks = WiFi.scanNetworks(false, false);
-	if (networks < 0) {
-		Serial.printf("scan failed (code %d)\n", networks);
-		return "[]";
-	}
-
+String WifiManagerClass::buildNetworksJson(int networks) {
 	String json = "[";
 	json.reserve((networks * 34) + 2);
 	bool first = true;
@@ -228,9 +248,11 @@ String WifiManagerClass::getAvailableNetworks() {
 	}
 
 	json += "]";
-	Serial.println("scan complete...\n");
-
 	return json;
+}
+
+String WifiManagerClass::getAvailableNetworks() {
+	return _networks;
 }
 
 bool WifiManagerClass::connectToWifi() {

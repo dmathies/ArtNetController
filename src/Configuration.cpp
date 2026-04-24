@@ -2,7 +2,6 @@
 
 #include <LittleFS.h>
 #include <cstdio>
-#include <unistd.h>
 
 Configuration::Configuration() {
 	// File paths to save input values permanently
@@ -27,12 +26,12 @@ void Configuration::initFileSystem() {
 		return;
 	}
 
-	fsInitialized = true;
-
 	if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
 		Serial.println("An error has occurred while mounting LittleFS");
 		return;
 	}
+
+	fsInitialized = true;
 
 	ensureDefaultFile(dhcpPath, "1");
 	ensureDefaultFile(ipPath, "");
@@ -52,54 +51,56 @@ void Configuration::ensureDefaultFile(const char *path, const char *defaultValue
 	writeFile(LittleFS, path, defaultValue ? defaultValue : "");
 }
 
-void Configuration::writeSSID(const char *ssid) {
-	writeFile(LittleFS, ssidPath, ssid);
+bool Configuration::writeSSID(const String& ssid) {
+	return writeFile(LittleFS, ssidPath, ssid.c_str());
 }
 
-void Configuration::writePass(const char *pass) {
-	writeFile(LittleFS, passPath, pass);
+bool Configuration::writePass(const String& pass) {
+	return writeFile(LittleFS, passPath, pass.c_str());
 }
 
-void Configuration::writeHostname(const char *hostname) {
-	writeFile(LittleFS, hostnamePath, hostname);
+bool Configuration::writeHostname(const String& hostname) {
+	return writeFile(LittleFS, hostnamePath, hostname.c_str());
 }
 
-void Configuration::writeDMXAddress(int value) {
-	writeFile(LittleFS, dmx_addrPath, String(value).c_str());
+bool Configuration::writeDMXAddress(int value) {
+	String text = String(value);
+	return writeFile(LittleFS, dmx_addrPath, text.c_str());
 }
 
-void Configuration::writeDMXUniverse(int value) {
-	writeFile(LittleFS, dmx_uniPath, String(value).c_str());
+bool Configuration::writeDMXUniverse(int value) {
+	String text = String(value);
+	return writeFile(LittleFS, dmx_uniPath, text.c_str());
 }
 
-void Configuration::writeDhcpEnabled(bool enabled) {
-	writeFile(LittleFS, dhcpPath, enabled ? "1" : "0");
+bool Configuration::writeDhcpEnabled(bool enabled) {
+	return writeFile(LittleFS, dhcpPath, enabled ? "1" : "0");
 }
 
-void Configuration::writeStaticIP(const char *ip) {
-	writeFile(LittleFS, ipPath, ip ? ip : "");
+bool Configuration::writeStaticIP(const String& ip) {
+	return writeFile(LittleFS, ipPath, ip.c_str());
 }
 
-void Configuration::writeGateway(const char *gateway) {
-	writeFile(LittleFS, gatewayPath, gateway ? gateway : "");
+bool Configuration::writeGateway(const String& gateway) {
+	return writeFile(LittleFS, gatewayPath, gateway.c_str());
 }
 
-void Configuration::writeSubnet(const char *subnet) {
-	writeFile(LittleFS, subnetPath, subnet ? subnet : "");
+bool Configuration::writeSubnet(const String& subnet) {
+	return writeFile(LittleFS, subnetPath, subnet.c_str());
 }
 
-void Configuration::writeDNS1(const char *dns1) {
-	writeFile(LittleFS, dns1Path, dns1 ? dns1 : "");
+bool Configuration::writeDNS1(const String& dns1) {
+	return writeFile(LittleFS, dns1Path, dns1.c_str());
 }
 
-void Configuration::writeDNS2(const char *dns2) {
-	writeFile(LittleFS, dns2Path, dns2 ? dns2 : "");
+bool Configuration::writeDNS2(const String& dns2) {
+	return writeFile(LittleFS, dns2Path, dns2.c_str());
 }
 
-void Configuration::writeStartValue(float value) {
+bool Configuration::writeStartValue(float value) {
 	char buf[24];
 	snprintf(buf, sizeof(buf), "%.6g", (double)value);
-	writeFile(LittleFS, startValuePath, buf);
+	return writeFile(LittleFS, startValuePath, buf);
 }
 
 String Configuration::getSSID() {
@@ -165,70 +166,65 @@ float Configuration::getStartValue() {
 
 // Read file from LittleFS
 String Configuration::readFile(fs::FS &fs, const char *path) {
+	String fileContent = "";
 	initFileSystem();
 
-	if (!fs.exists(path)) {
-		return String();
+	if (fs.exists(path)) {
+		File file = fs.open(path);
+		if (file && !file.isDirectory()) {
+			fileContent = file.readStringUntil('\n');
+			file.close();
+		}
 	}
 
-	File file = fs.open(path);
-	if (!file || file.isDirectory()) {
-		return String();
-	}
-
-	String fileContent = file.readStringUntil('\n');
-	file.close();
 	return fileContent;
 }
 
 // Write file to LittleFS
-void Configuration::writeFile(fs::FS &fs, const char *path, const char *message) {
+bool Configuration::writeFile(fs::FS &fs, const char *path, const char *message) {
 	initFileSystem();
-	(void)fs;
 
 	const char *value = message ? message : "";
 	size_t len = strlen(value);
 
-	char tmpPath[64];
-	snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
-	char fullTmpPath[96];
-	char fullPath[96];
-	snprintf(fullTmpPath, sizeof(fullTmpPath), "/littlefs%s", tmpPath);
-	snprintf(fullPath, sizeof(fullPath), "/littlefs%s", path);
-
-	remove(fullTmpPath);
-
-	FILE *file = fopen(fullTmpPath, "w");
-	if (!file) {
-		Serial.printf("Failed to open temp config file for write: %s\n", fullTmpPath);
-		return;
+	if (fs.exists(path) && !fs.remove(path)) {
+		Serial.printf("Failed to remove config file: %s\n", path);
+		return false;
 	}
 
-	size_t written = 0;
-	if (len > 0) {
-		written = fwrite(value, 1, len, file);
-		if (written != len) {
-			Serial.printf("Failed to write config file: %s (%u/%u bytes)\n",
-			              path,
-			              (unsigned int)written,
-			              (unsigned int)len);
-			fclose(file);
-			remove(fullTmpPath);
-			return;
-		}
-	}
-	fflush(file);
-	fsync(fileno(file));
-	fclose(file);
-
-	if (LittleFS.exists(path) && remove(fullPath) != 0) {
-		Serial.printf("Failed to remove old config file: %s\n", path);
-		remove(fullTmpPath);
-		return;
+	File file = fs.open(path, FILE_WRITE, true);
+	if (!file || file.isDirectory()) {
+		Serial.printf("Failed to open config file for write: %s\n", path);
+		return false;
 	}
 
-	if (rename(fullTmpPath, fullPath) != 0) {
-		Serial.printf("Failed to rename temp config file: %s -> %s\n", fullTmpPath, fullPath);
-		remove(fullTmpPath);
+	size_t written = file.print(value);
+	file.flush();
+	file.close();
+
+	if (written != len) {
+		Serial.printf("Failed to write config file: %s (%u/%u bytes)\n",
+		              path,
+		              (unsigned int)written,
+		              (unsigned int)len);
+		fs.remove(path);
+		return false;
 	}
+
+	File verifyFile = fs.open(path, FILE_READ);
+	if (!verifyFile || verifyFile.isDirectory()) {
+		Serial.printf("Failed to reopen config file for verify: %s\n", path);
+		fs.remove(path);
+		return false;
+	}
+
+	String verifyValue = verifyFile.readString();
+	verifyFile.close();
+	if (verifyValue != value) {
+		Serial.printf("Config verify mismatch for %s\n", path);
+		fs.remove(path);
+		return false;
+	}
+
+	return true;
 }

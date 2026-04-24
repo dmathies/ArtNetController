@@ -480,11 +480,12 @@
             sel.value = initialCreds.ssid;
             toggleCustomSsid(sel.value);
           } else {
-            toggleCustomSsid(sel.value || "");
+            sel.value = "";
+            toggleCustomSsid("", true);
           }
         } catch (e) {
           toggleIpMode(document.getElementById("ip_mode").value);
-          toggleCustomSsid("");
+          toggleCustomSsid("", true);
           credentialsLoaded = false;
           setSaveEnabled(false);
           setTimeout(() => alert("Failed to load current settings. Save is disabled to avoid overwriting them with blanks."), 0);
@@ -521,7 +522,7 @@
           sel.value = initialCreds.ssid;
         }
 
-        toggleCustomSsid(sel.value);
+        toggleCustomSsid(sel.value, true);
         if (refreshBtn) {
           refreshBtn.disabled = false;
           refreshBtn.textContent = "Refresh Networks";
@@ -529,7 +530,7 @@
         networkScanInProgress = false;
 
         if (!networkHandlerAttached) {
-          sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+          sel.addEventListener("change", () => toggleCustomSsid(sel.value, true));
           networkHandlerAttached = true;
         }
       }
@@ -545,19 +546,32 @@
         sel.appendChild(other);
         sel.value = "";
         if (!networkHandlerAttached) {
-          sel.addEventListener("change", () => toggleCustomSsid(sel.value));
+          sel.addEventListener("change", () => toggleCustomSsid(sel.value, true));
           networkHandlerAttached = true;
         }
       }
 
-      async function fetchNetworks() {
+      async function fetchNetworks(refresh = true) {
         const sel = document.getElementById("network");
         const refreshBtn = document.getElementById("refresh-networks");
         try {
-          const res = await fetch(`${apiBase}/networks?details=1&refresh=1`, { method: "GET", cache: "no-store" });
+          const res = await fetch(`${apiBase}/networks?details=1&refresh=${refresh ? "1" : "0"}`, { method: "GET", cache: "no-store" });
           if (!res.ok) throw new Error("HTTP " + res.status);
           const body = await res.json();
+          const scanning = !!body.scanning;
           const list = Array.isArray(body.networks) ? body.networks : [];
+
+          if (scanning) {
+            sel.disabled = true;
+            if (refreshBtn) {
+              refreshBtn.disabled = true;
+              refreshBtn.textContent = "Scanning...";
+            }
+            setTimeout(() => {
+              if (networkScanInProgress) fetchNetworks(false);
+            }, 500);
+            return;
+          }
 
           renderNetworks(list);
         } catch (e) {
@@ -579,20 +593,23 @@
           refreshBtn.disabled = true;
           refreshBtn.textContent = "Scanning...";
         }
-        fetchNetworks();
+        fetchNetworks(true);
       }
 
       function showManualSsid() {
         document.getElementById("custom-ssid").style.display = "grid";
       }
 
-      function toggleCustomSsid(selected) {
+      function toggleCustomSsid(selected, preserveInput = false) {
         const custom = document.getElementById("custom-ssid");
         const ssidInput = document.getElementById("ssid");
         const show = selected.length ? "none" : "grid";
-        const value = selected.length ? selected : (initialCreds?.ssid || "");
         custom.style.display = show;
-        ssidInput.value = value;
+        if (selected.length) {
+          ssidInput.value = selected;
+        } else if (!preserveInput && !ssidInput.value.trim()) {
+          ssidInput.value = initialCreds?.ssid || "";
+        }
       }
 
       async function saveAndReboot() {
@@ -615,7 +632,7 @@
           const dns2 = document.getElementById("dns2").value.trim();
           const selectedNetwork = getSelectedNetworkValue();
           const manualSsid = document.getElementById("ssid").value.trim();
-          const ssid = (selectedNetwork || manualSsid || initialCreds.ssid || "").trim();
+          const ssid = (selectedNetwork || manualSsid).trim();
           const hostname = (document.getElementById("hostname").value.trim() || initialCreds.hostname || "").trim();
 
           if (!dhcp && (!ip || !gateway || !subnet)) {
@@ -630,25 +647,29 @@
             return;
           }
 
-          const payload = {
-            ssid,
-            password: document.getElementById("password").value,
-            hostname,
-            dhcp,
-            ip,
-            gateway,
-            subnet,
-            dns1,
-            dns2,
-            channel: Number(document.getElementById("channel").value || "1"),
-            universe: Number(document.getElementById("universe").value || "0"),
-            start_value: Number(document.getElementById("start_value").value || "0")
-          };
+          const payload = {};
+          payload.ssid = String(ssid);
+          payload.password = String(document.getElementById("password").value || "");
+          payload.hostname = String(hostname);
+          payload.dhcp = !!dhcp;
+          payload.ip = String(ip);
+          payload.gateway = String(gateway);
+          payload.subnet = String(subnet);
+          payload.dns1 = String(dns1);
+          payload.dns2 = String(dns2);
+          payload.channel = Number(document.getElementById("channel").value || "1");
+          payload.dmx_address = payload.channel;
+          payload.universe = Number(document.getElementById("universe").value || "0");
+          payload.dmx_universe = payload.universe;
+          payload.start_value = Number(document.getElementById("start_value").value || "0");
+
+          const payloadJson = JSON.stringify(payload);
+          console.log("[CFG PAYLOAD]", payloadJson);
 
           const res = await fetch(`${apiBase}/credentials`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: payloadJson
           });
 
           if (loaderWrap) loaderWrap.style.display = "none";

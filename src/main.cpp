@@ -15,7 +15,7 @@
 
 #include "main_common.h"
 
-static constexpr uint16_t ARTNET_PORT = 6454;
+
 static constexpr int MAX_WS_CLIENTS = 6;
 static constexpr uint32_t SLOW_HTTP_MS = 100;
 static constexpr uint32_t SLOW_WS_BROADCAST_MS = 50;
@@ -943,6 +943,8 @@ static esp_err_t networksHandler(httpd_req_t* req) {
   uint32_t startMs = millis();
   bool details = false;
   bool refresh = false;
+  bool refreshProvided = false;
+  bool scanProvided = false;
   bool legacyDetailsOnly = false;
   size_t qlen = httpd_req_get_url_query_len(req);
   if (qlen > 0 && qlen < 64) {
@@ -951,12 +953,14 @@ static esp_err_t networksHandler(httpd_req_t* req) {
       char value[8];
       if (httpd_query_key_value(query, "details", value, sizeof(value)) == ESP_OK) details = true;
       if (httpd_query_key_value(query, "refresh", value, sizeof(value)) == ESP_OK) {
+        refreshProvided = true;
         refresh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
       }
       if (httpd_query_key_value(query, "scan", value, sizeof(value)) == ESP_OK) {
+        scanProvided = true;
         refresh = (strcmp(value, "1") == 0 || strcmp(value, "true") == 0);
       }
-      legacyDetailsOnly = details && !refresh;
+      legacyDetailsOnly = details && !refreshProvided && !scanProvided;
     }
   }
   // Backward compatibility: older settings pages request details only on refresh click.
@@ -1044,7 +1048,7 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
   }
   body[offset] = '\0';
 
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     free(body);
@@ -1054,7 +1058,6 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     logHttpRequest(req, startMs, 400, "invalid json");
     return ret;
   }
-
   auto invalidTextField = [](const char* value, bool allowEmpty, size_t maxLen) {
     if (!value) return !allowEmpty;
     size_t len = strlen(value);
@@ -1067,9 +1070,12 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return false;
   };
 
-  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
+  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
+  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
+  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
 #if CONFIG_DEBUG_LOG_ENABLE
@@ -1097,31 +1103,41 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return ret;
   }
 
-  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
-  if (doc.containsKey("password")) g_config.writePass(passwordValue);
-  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
-  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
-  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
-  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
-  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
-  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
-  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
-  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
+  bool writeOk = true;
+  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidText) && writeOk;
+  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordText) && writeOk;
+  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameText) && writeOk;
+  if (doc.containsKey("dhcp")) writeOk = g_config.writeDhcpEnabled(dhcpValue) && writeOk;
+  if (doc.containsKey("ip")) writeOk = g_config.writeStaticIP(doc["ip"].as<String>()) && writeOk;
+  if (doc.containsKey("gateway")) writeOk = g_config.writeGateway(doc["gateway"].as<String>()) && writeOk;
+  if (doc.containsKey("subnet")) writeOk = g_config.writeSubnet(doc["subnet"].as<String>()) && writeOk;
+  if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<String>()) && writeOk;
+  if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<String>()) && writeOk;
+  if (doc.containsKey("start_value")) writeOk = g_config.writeStartValue(startValue) && writeOk;
 
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) writeOk = g_config.writeDMXAddress(channel) && writeOk;
   } else if (doc.containsKey("dmx_address")) {
     int channel = doc["dmx_address"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) writeOk = g_config.writeDMXAddress(channel) && writeOk;
   }
 
   if (doc.containsKey("universe")) {
     int universe = doc["universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) writeOk = g_config.writeDMXUniverse(universe) && writeOk;
   } else if (doc.containsKey("dmx_universe")) {
     int universe = doc["dmx_universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) writeOk = g_config.writeDMXUniverse(universe) && writeOk;
+  }
+
+  if (!writeOk) {
+    free(body);
+    setCorsHeaders(req);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    esp_err_t ret = httpd_resp_send(req, "Failed to persist settings", HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 500, "config write failed");
+    return ret;
   }
 
 #if CONFIG_DEBUG_LOG_ENABLE
@@ -1349,19 +1365,23 @@ static void asyncNetworksHandler(AsyncWebServerRequest* request) {
   uint32_t startMs = millis();
   bool details = false;
   bool refresh = false;
+  bool refreshProvided = false;
+  bool scanProvided = false;
   if (request->hasParam("details")) {
     String value = request->getParam("details")->value();
     details = (value == "1" || value == "true");
   }
   if (request->hasParam("refresh")) {
+    refreshProvided = true;
     String value = request->getParam("refresh")->value();
     refresh = (value == "1" || value == "true");
   }
   if (request->hasParam("scan")) {
+    scanProvided = true;
     String value = request->getParam("scan")->value();
     refresh = (value == "1" || value == "true");
   }
-  if (details && !refresh) refresh = true;
+  if (details && !refreshProvided && !scanProvided) refresh = true;
   String payload = g_wifiManager.getNetworksPayload(details, refresh);
   AsyncWebServerResponse* response = request->beginResponse(200, "application/json", payload);
   asyncAddCommonHeaders(response, true);
@@ -1421,8 +1441,8 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return;
   }
 
-  DynamicJsonDocument doc(1024);
-  DeserializationError err = deserializeJson(doc, body);
+  DynamicJsonDocument doc(2048);
+  DeserializationError err = deserializeJson(doc, static_cast<const char*>(body));
   free(body);
   request->_tempObject = nullptr;
   if (err) {
@@ -1445,12 +1465,14 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return false;
   };
 
-  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
+  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
+  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
+  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
-
   if (ssidValue && invalidTextField(ssidValue, false, 32)) {
     AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "Invalid SSID");
     asyncAddCommonHeaders(response);
@@ -1466,31 +1488,86 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return;
   }
 
-  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
-  if (doc.containsKey("password")) g_config.writePass(passwordValue);
-  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
-  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
-  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
-  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
-  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
-  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
-  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
-  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
+  bool writeOk = true;
+  if (doc.containsKey("ssid")) {
+    bool ok = g_config.writeSSID(ssidText);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("password")) {
+    bool ok = g_config.writePass(passwordText);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("hostname")) {
+    bool ok = g_config.writeHostname(hostnameText);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("dhcp")) {
+    bool ok = g_config.writeDhcpEnabled(dhcpValue);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("ip")) {
+    String value = doc["ip"].as<String>();
+    bool ok = g_config.writeStaticIP(value);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("gateway")) {
+    String value = doc["gateway"].as<String>();
+    bool ok = g_config.writeGateway(value);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("subnet")) {
+    String value = doc["subnet"].as<String>();
+    bool ok = g_config.writeSubnet(value);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("dns1")) {
+    String value = doc["dns1"].as<String>();
+    bool ok = g_config.writeDNS1(value);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("dns2")) {
+    String value = doc["dns2"].as<String>();
+    bool ok = g_config.writeDNS2(value);
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("start_value")) {
+    bool ok = g_config.writeStartValue(startValue);
+    writeOk = ok && writeOk;
+  }
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) {
+      bool ok = g_config.writeDMXAddress(channel);
+      writeOk = ok && writeOk;
+    }
   } else if (doc.containsKey("dmx_address")) {
     int channel = doc["dmx_address"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) {
+      bool ok = g_config.writeDMXAddress(channel);
+      writeOk = ok && writeOk;
+    }
   }
   if (doc.containsKey("universe")) {
     int universe = doc["universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) {
+      bool ok = g_config.writeDMXUniverse(universe);
+      writeOk = ok && writeOk;
+    }
   } else if (doc.containsKey("dmx_universe")) {
     int universe = doc["dmx_universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) {
+      bool ok = g_config.writeDMXUniverse(universe);
+      writeOk = ok && writeOk;
+    }
   }
 
+  if (!writeOk) {
+    AsyncWebServerResponse* response = request->beginResponse(500, "text/plain", "Failed to persist settings");
+    asyncAddCommonHeaders(response);
+    request->send(response);
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
+  }
   g_wifiManager.scheduleRestart(1000);
   AsyncWebServerResponse* response = request->beginResponse(204);
   asyncAddCommonHeaders(response);
@@ -1781,19 +1858,23 @@ static void webNetworksHandler() {
   uint32_t startMs = millis();
   bool details = false;
   bool refresh = false;
+  bool refreshProvided = false;
+  bool scanProvided = false;
   if (g_webServer.hasArg("details")) {
     String value = g_webServer.arg("details");
     details = (value == "1" || value == "true");
   }
   if (g_webServer.hasArg("refresh")) {
+    refreshProvided = true;
     String value = g_webServer.arg("refresh");
     refresh = (value == "1" || value == "true");
   }
   if (g_webServer.hasArg("scan")) {
+    scanProvided = true;
     String value = g_webServer.arg("scan");
     refresh = (value == "1" || value == "true");
   }
-  if (details && !refresh) refresh = true;
+  if (details && !refreshProvided && !scanProvided) refresh = true;
   String payload = g_wifiManager.getNetworksPayload(details, refresh);
   webSetCommonHeaders(true);
   g_webServer.send(200, "application/json", payload);
@@ -1836,7 +1917,7 @@ static void webCredentialsPutHandler() {
     return;
   }
 
-  DynamicJsonDocument doc(1024);
+  DynamicJsonDocument doc(2048);
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     webSetCommonHeaders();
@@ -1844,7 +1925,6 @@ static void webCredentialsPutHandler() {
     noteWebTaskWorkUs((millis() - startMs) * 1000UL);
     return;
   }
-
   auto invalidTextField = [](const char* value, bool allowEmpty, size_t maxLen) {
     if (!value) return !allowEmpty;
     size_t len = strlen(value);
@@ -1857,9 +1937,12 @@ static void webCredentialsPutHandler() {
     return false;
   };
 
-  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
+  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
+  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
+  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
 
@@ -1876,29 +1959,37 @@ static void webCredentialsPutHandler() {
     return;
   }
 
-  if (doc.containsKey("ssid")) g_config.writeSSID(ssidValue);
-  if (doc.containsKey("password")) g_config.writePass(passwordValue);
-  if (doc.containsKey("hostname")) g_config.writeHostname(hostnameValue);
-  if (doc.containsKey("dhcp")) g_config.writeDhcpEnabled(dhcpValue);
-  if (doc.containsKey("ip")) g_config.writeStaticIP(doc["ip"].as<const char*>());
-  if (doc.containsKey("gateway")) g_config.writeGateway(doc["gateway"].as<const char*>());
-  if (doc.containsKey("subnet")) g_config.writeSubnet(doc["subnet"].as<const char*>());
-  if (doc.containsKey("dns1")) g_config.writeDNS1(doc["dns1"].as<const char*>());
-  if (doc.containsKey("dns2")) g_config.writeDNS2(doc["dns2"].as<const char*>());
-  if (doc.containsKey("start_value")) g_config.writeStartValue(startValue);
+  bool writeOk = true;
+  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidText) && writeOk;
+  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordText) && writeOk;
+  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameText) && writeOk;
+  if (doc.containsKey("dhcp")) writeOk = g_config.writeDhcpEnabled(dhcpValue) && writeOk;
+  if (doc.containsKey("ip")) writeOk = g_config.writeStaticIP(doc["ip"].as<String>()) && writeOk;
+  if (doc.containsKey("gateway")) writeOk = g_config.writeGateway(doc["gateway"].as<String>()) && writeOk;
+  if (doc.containsKey("subnet")) writeOk = g_config.writeSubnet(doc["subnet"].as<String>()) && writeOk;
+  if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<String>()) && writeOk;
+  if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<String>()) && writeOk;
+  if (doc.containsKey("start_value")) writeOk = g_config.writeStartValue(startValue) && writeOk;
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) writeOk = g_config.writeDMXAddress(channel) && writeOk;
   } else if (doc.containsKey("dmx_address")) {
     int channel = doc["dmx_address"].as<int>();
-    if (channel >= 1 && channel <= 512) g_config.writeDMXAddress(channel);
+    if (channel >= 1 && channel <= 512) writeOk = g_config.writeDMXAddress(channel) && writeOk;
   }
   if (doc.containsKey("universe")) {
     int universe = doc["universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) writeOk = g_config.writeDMXUniverse(universe) && writeOk;
   } else if (doc.containsKey("dmx_universe")) {
     int universe = doc["dmx_universe"].as<int>();
-    if (universe >= 0 && universe <= 32767) g_config.writeDMXUniverse(universe);
+    if (universe >= 0 && universe <= 32767) writeOk = g_config.writeDMXUniverse(universe) && writeOk;
+  }
+
+  if (!writeOk) {
+    webSetCommonHeaders();
+    g_webServer.send(500, "text/plain", "Failed to persist settings");
+    noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+    return;
   }
 
   g_wifiManager.scheduleRestart(1000);
@@ -2092,6 +2183,24 @@ AppTaskRuntimeStats appGetWebTaskRuntimeStats() {
   stats.utilPermille = g_webTaskUtilPermille;
   portEXIT_CRITICAL(&g_statusMux);
   return stats;
+}
+
+
+void appInitializeBaseRuntime() {
+  Serial.begin(115200);
+
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && (ARDUINO_USB_CDC_ON_BOOT == 1)
+  uint32_t serialWaitStart = millis();
+  while (!Serial && (millis() - serialWaitStart) < 1500) {
+    delay(10);
+  }
+#endif
+
+  Serial.println("Startup...");
+
+  if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
+    Serial.println("LittleFS mount failed");
+  }
 }
 
 void appInitRuntime(const AppRuntimeHooks& hooks) {

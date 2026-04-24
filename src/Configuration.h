@@ -8,7 +8,7 @@ class Configuration {
 		void initFileSystem();
 		void ensureDefaultFile(const char *path, const char *defaultValue);
 
-		void writeFile(fs::FS &fs, const char *path, const char *message);
+		bool writeFile(fs::FS &fs, const char *path, const char *message);
 		String readFile(fs::FS &fs, const char *path);
 
 		const char *ssidPath;
@@ -29,18 +29,18 @@ class Configuration {
 	public:
 		Configuration();
 
-		void writeSSID(const char *ssid);
-		void writePass(const char *pass);
-        void writeDMXAddress(int value);
-        void writeDMXUniverse(int value);
-        void writeHostname(const char *hostname);
-		void writeDhcpEnabled(bool enabled);
-		void writeStaticIP(const char *ip);
-		void writeGateway(const char *gateway);
-		void writeSubnet(const char *subnet);
-		void writeDNS1(const char *dns1);
-		void writeDNS2(const char *dns2);
-		void writeStartValue(float value);
+		bool writeSSID(const String& ssid);
+		bool writePass(const String& pass);
+        bool writeDMXAddress(int value);
+        bool writeDMXUniverse(int value);
+        bool writeHostname(const String& hostname);
+		bool writeDhcpEnabled(bool enabled);
+		bool writeStaticIP(const String& ip);
+		bool writeGateway(const String& gateway);
+		bool writeSubnet(const String& subnet);
+		bool writeDNS1(const String& dns1);
+		bool writeDNS2(const String& dns2);
+		bool writeStartValue(float value);
 
         String getSSID();
 		String getPass();

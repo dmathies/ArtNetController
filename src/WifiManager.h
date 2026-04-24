@@ -57,6 +57,7 @@ class WifiManagerClass {
 		bool _scanRequested;
 		bool _scanHasResult;
 		bool _otaInProgress;
+		unsigned long _scanStartedAtMs;
 		TaskHandle_t _scanTaskHandle;
 		uint32_t _reconnectAttempts;
 		uint32_t _reconnectSuccesses;
@@ -64,6 +65,7 @@ class WifiManagerClass {
 		uint32_t _lastReconnectSuccessMs;
 
 		String getAvailableNetworks();
+		String buildNetworksJson(int networks);
 		void requestRestart(unsigned long delayMs);
 		void cleanupBeforeRestart();
 		void ensureReconnectAttempt();
