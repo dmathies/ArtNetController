@@ -482,7 +482,16 @@
                 window.location.href = '/';
               }, 5000);
             } else {
-              showStatus(statusDiv, 'Update failed: ' + xhr.statusText, 'error');
+              let message = 'Update failed';
+              try {
+                const payload = JSON.parse(xhr.responseText || '{}');
+                if (payload.message && payload.error) message = `${payload.message}: ${payload.error}`;
+                else if (payload.message) message = payload.message;
+                else if (payload.error) message = payload.error;
+              } catch (e) {
+                if (xhr.statusText) message = 'Update failed: ' + xhr.statusText;
+              }
+              showStatus(statusDiv, message, 'error');
               uploadBtn.disabled = false;
               progressContainer.style.display = 'none';
             }
@@ -580,7 +589,16 @@
                 window.location.href = '/';
               }, 5000);
             } else {
-              showStatus(statusDiv, 'Update failed: ' + xhr.statusText, 'error');
+              let message = 'Update failed';
+              try {
+                const payload = JSON.parse(xhr.responseText || '{}');
+                if (payload.message && payload.error) message = `${payload.message}: ${payload.error}`;
+                else if (payload.message) message = payload.message;
+                else if (payload.error) message = payload.error;
+              } catch (e) {
+                if (xhr.statusText) message = 'Update failed: ' + xhr.statusText;
+              }
+              showStatus(statusDiv, message, 'error');
               uploadBtn.disabled = false;
               progressContainer.style.display = 'none';
             }

@@ -1,15 +1,16 @@
 # ArtNetController
 
-An ESP32-based Art-Net lighting controller. The repository contains two firmware variants that share the same Wi-Fi, web UI, OTA update flow, and LittleFS-backed configuration storage.
+An ESP32-based Art-Net lighting controller. The repository contains multiple firmware variants that share the same Wi-Fi, web UI, OTA update flow, and LittleFS-backed configuration storage.
 
 ## What This Project Does
 
 - Receives Art-Net DMX on UDP port `6454`
 - Exposes a built-in web UI on port `80` for status, configuration, and OTA updates
 - Stores Wi-Fi and runtime configuration in LittleFS
-- Supports two application modes:
+- Supports multiple application modes:
   - `BLDC` controller: maps one DMX channel to a motor speed controller over UART
   - `LED` controller: maps four 16-bit Art-Net values to four PWM LED outputs
+  - `Relay` controller: maps one DMX channel to a binary relay output
 
 ## Hardware Targets
 
@@ -17,10 +18,12 @@ The project currently has PlatformIO environments for:
 
 - `seeed_xiao_esp32s3`
 - `seeed_xiao_esp32s3_led`
+- `seeed_xiao_esp32s3_relay`
 - `nodemcu-32s`
 - `nodemcu-32s_led`
+- `nodemcu-32s_relay`
 
-The `_led` environments build the LED receiver firmware. The non-`_led` environments build the BLDC motor controller firmware.
+The `_led` environments build the LED receiver firmware, the `_relay` environments build the relay firmware, and the remaining environments build the BLDC motor controller firmware.
 
 ## Firmware Variants
 
@@ -72,6 +75,22 @@ For `nodemcu-32s_led`, the build overrides the mapping to avoid the serial conso
 - `LED 2 -> GPIO21`
 - `LED 3 -> GPIO2` (onboard LED on many NodeMCU-32S boards)
 
+### Relay Variant
+
+Source entry point: `src/main_relay.cpp`
+
+- Listens for Art-Net DMX
+- Reads one 8-bit DMX value from the configured start address
+- Switches the relay `OFF` for values `< 128`
+- Switches the relay `ON` for values `>= 128`
+
+Default relay pin mapping:
+
+- `seeed_xiao_esp32s3_relay -> GPIO1`
+- `nodemcu-32s_relay -> GPIO16`
+
+The relay logic defaults to active-high output. Set `RELAY_ACTIVE_HIGH=0` in build flags if your relay board is active-low.
+
 
 ## Project Layout
 
@@ -80,6 +99,7 @@ src/
   main.cpp            Shared runtime, HTTP server, OTA, WebSocket status
   main_bldc.cpp       BLDC Art-Net controller
   main_led.cpp        4-channel LED Art-Net receiver
+  main_relay.cpp      Single-channel relay Art-Net receiver
   WifiManager.*       Wi-Fi connection and management AP logic
   Configuration.*     Persistent config stored in LittleFS
   bldc_uart.h         BLDC serial protocol helper
@@ -122,6 +142,12 @@ Build LED firmware for XIAO ESP32S3:
 
 ```powershell
 pio run -e seeed_xiao_esp32s3_led
+```
+
+Build relay firmware for XIAO ESP32S3:
+
+```powershell
+pio run -e seeed_xiao_esp32s3_relay
 ```
 
 Upload firmware:
@@ -226,7 +252,7 @@ The web page currently refers to the filesystem image as `spiffs.bin`, but the p
 ## Notes For Development
 
 - `src/main.cpp` is the shared runtime layer used by both variants
-- `build_src_filter` in `platformio.ini` selects either the BLDC or LED entry point
+- `build_src_filter` in `platformio.ini` selects the BLDC, LED, or relay entry point
 - Wi-Fi scanning is performed on demand from the settings page instead of at boot
 - If Art-Net traffic goes idle for long enough, the UDP listener attempts a rebind
 

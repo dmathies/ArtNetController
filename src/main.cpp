@@ -1177,6 +1177,14 @@ static esp_err_t updateInfoHandler(httpd_req_t* req) {
   return ret;
 }
 
+static void buildUpdateErrorJson(char* out, size_t outSize, const char* message) {
+  StaticJsonDocument<256> doc;
+  doc["success"] = false;
+  doc["message"] = message ? message : "Update failed";
+  doc["error"] = Update.errorString();
+  serializeJson(doc, out, outSize);
+}
+
 static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
   uint32_t startMs = millis();
   g_wifiManager.setOtaInProgress(true);
@@ -1194,8 +1202,11 @@ static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
     g_wifiManager.setOtaInProgress(false);
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Update begin failed\"}", HTTPD_RESP_USE_STRLEN);
-    logHttpRequest(req, startMs, 400, updateCmd == U_SPIFFS ? "update begin failed: fs" : "update begin failed: flash");
+    httpd_resp_set_type(req, "application/json");
+    char out[256];
+    buildUpdateErrorJson(out, sizeof(out), updateCmd == U_SPIFFS ? "Filesystem update begin failed" : "Firmware update begin failed");
+    esp_err_t ret = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 400, Update.errorString());
     return ret;
   }
 
@@ -1232,8 +1243,11 @@ static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
     Update.printError(Serial);
     setCorsHeaders(req);
     httpd_resp_set_status(req, "400 Bad Request");
-    esp_err_t ret = httpd_resp_send(req, "{\"success\":false,\"message\":\"Update finalize failed\"}", HTTPD_RESP_USE_STRLEN);
-    logHttpRequest(req, startMs, 400, "update finalize failed");
+    httpd_resp_set_type(req, "application/json");
+    char out[256];
+    buildUpdateErrorJson(out, sizeof(out), updateCmd == U_SPIFFS ? "Filesystem update finalize failed" : "Firmware update finalize failed");
+    esp_err_t ret = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    logHttpRequest(req, startMs, 400, Update.errorString());
     return ret;
   }
 
@@ -1624,7 +1638,9 @@ static void asyncHandleUpdateRequest(AsyncWebServerRequest* request, int updateC
     response = request->beginResponse(200, "application/json", "{\"success\":true,\"message\":\"Update successful. Restarting...\"}");
     g_wifiManager.scheduleRestart(1000);
   } else {
-    response = request->beginResponse(400, "application/json", "{\"success\":false,\"message\":\"Update failed\"}");
+    char out[256];
+    buildUpdateErrorJson(out, sizeof(out), updateCmd == U_SPIFFS ? "Filesystem update failed" : "Firmware update failed");
+    response = request->beginResponse(400, "application/json", out);
   }
   asyncAddCommonHeaders(response, true);
   request->send(response);
@@ -2113,16 +2129,16 @@ static void startWebServer() {
       "/update",
       HTTP_POST,
       [](AsyncWebServerRequest* request) { asyncHandleUpdateRequest(request, U_FLASH); },
-      [](AsyncWebServerRequest* request, String, size_t index, uint8_t* data, size_t len, bool final) {
-        size_t total = final ? index + len : index + len;
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
         asyncHandleUpdateBody(request, U_FLASH, data, len, index, total);
       });
   g_asyncWebServer.on(
       "/updatefs",
       HTTP_POST,
       [](AsyncWebServerRequest* request) { asyncHandleUpdateRequest(request, U_SPIFFS); },
-      [](AsyncWebServerRequest* request, String, size_t index, uint8_t* data, size_t len, bool final) {
-        size_t total = final ? index + len : index + len;
+      nullptr,
+      [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
         asyncHandleUpdateBody(request, U_SPIFFS, data, len, index, total);
       });
   g_asyncWebServer.on("/status", HTTP_OPTIONS, asyncSendOptions);

@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>Cablecar Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
+<style>
+      :root {
+        --bg0: #120d09;
+        --bg1: #1f1710;
+        --bg2: #2e2217;
+        --bg3: #0d0d0f;
+        --panel: rgba(28, 22, 17, 0.92);
+        --panel-2: rgba(39, 30, 22, 0.97);
+        --soft: rgba(255,255,255,0.045);
+        --soft-2: rgba(255,255,255,0.08);
+        --line: rgba(214,173,98,0.22);
+        --line-strong: rgba(214,173,98,0.42);
+        --text: #f5ecde;
+        --muted: #c6b49d;
+        --accent: #d6ad62;
+        --accent-2: #946325;
+        --accent-3: #f2cf87;
+        --logo-color: var(--accent-3);
+        --accent-rgb: 214,173,98;
+        --ok: #c5a96b;
+        --ok-rgb: 197,169,107;
+        --warn: #f0c670;
+        --danger: #ef9a7d;
+        --shadow: 0 18px 48px rgba(0,0,0,0.34);
+        --radius: 18px;
+        --radius-sm: 14px;
+        --button-text: #24160b;
+        --button-bg: linear-gradient(135deg, var(--accent-3), var(--accent-2));
+        --button-bg-hover: linear-gradient(135deg, #f7ddab, #b37734);
+        --meter-bg: rgba(255,255,255,0.05);
+        --meter-fill: linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96));
+        --header-line: linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent);
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; }
+      html {
+        background:
+          radial-gradient(circle at top left, rgba(var(--accent-rgb), 0.14), transparent 28%),
+          radial-gradient(circle at top right, rgba(var(--accent-rgb), 0.10), transparent 22%),
+          linear-gradient(180deg, var(--bg2), var(--bg0) 44%, var(--bg3));
+      }
+      body {
+        margin: 0;
+        color: var(--text);
+        font-family: "Segoe UI", Verdana, sans-serif;
+        background: transparent;
+      }
+      a { color: inherit; text-decoration: none; }
+      button, select { font: inherit; }
+      .page { min-height: 100%; padding: 18px; }
+      .shell { max-width: 1120px; margin: 0 auto; }
+      .topbar, .card {
+        background: linear-gradient(180deg, var(--panel-2), var(--panel));
+        border: 1px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        position: relative;
+        overflow: hidden;
+      }
+      .topbar::before, .card::before {
+        content: "";
+        position: absolute;
+        inset: 0 0 auto 0;
+        height: 1px;
+        background: var(--header-line);
+      }
+      .topbar {
+        padding: 16px 18px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+      .brand-logo {
+        width: 56px;
+        height: 56px;
+        flex: 0 0 auto;
+        border-radius: 16px;
+        padding: 8px;
+        color: var(--logo-color);
+        background:
+          radial-gradient(circle at 28% 22%, rgba(255,255,255,0.08), transparent 46%),
+          linear-gradient(180deg, rgba(var(--accent-rgb),0.10), rgba(255,255,255,0.02));
+        border: 1px solid var(--line);
+        box-shadow:
+          inset 0 1px 0 rgba(255,255,255,0.05),
+          0 0 22px rgba(var(--accent-rgb),0.08);
+      }
+      .brand-logo svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .eyebrow {
+        margin: 0 0 3px;
+        font-size: 11px;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        color: var(--accent-3);
+        font-weight: 800;
+      }
+      h1 {
+        margin: 0;
+        font-size: clamp(24px, 4vw, 34px);
+        line-height: 1.08;
+      }
+      .subtitle {
+        margin: 4px 0 0;
+        color: var(--muted);
+        font-size: 13px;
+      }
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        justify-content: flex-end;
+      }
+      .btn, .theme-select {
+        border-radius: 999px;
+        min-height: 42px;
+      }
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 16px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid var(--line-strong);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        transition: transform .15s ease, background .15s ease, border-color .15s ease, box-shadow .15s ease;
+      }
+      .btn:hover {
+        transform: translateY(-1px);
+        background: rgba(255,255,255,0.08);
+        border-color: rgba(var(--accent-rgb),0.56);
+      }
+      .btn-primary {
+        border: none;
+        background: var(--button-bg);
+        color: var(--button-text);
+        box-shadow: 0 10px 22px rgba(var(--accent-rgb),0.22);
+      }
+      .btn-primary:hover { background: var(--button-bg-hover); }
+      .theme-wrap {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 8px 0 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line-strong);
+        background: rgba(255,255,255,0.05);
+        min-height: 42px;
+      }
+      .theme-label {
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        font-weight: 800;
+      }
+      .theme-select {
+        border: none;
+        background: transparent;
+        color: var(--text);
+        padding: 0 8px 0 0;
+        outline: none;
+      }
+      .theme-select option { color: #111; }
+      .card-inner { padding: 20px; }
+      .card-title { margin: 0; font-size: 18px; font-weight: 800; }
+      .mono { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
+      .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 11px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.05);
+        border: 1px solid var(--line);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        font-weight: 800;
+        color: var(--muted);
+      }
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+        box-shadow: 0 0 12px rgba(var(--accent-rgb),0.55);
+      }
+      .layout {
+        display: grid;
+        gap: 18px;
+      }
+      .row-split {
+        display: grid;
+        grid-template-columns: minmax(320px, 1.15fr) minmax(280px, 0.85fr);
+        gap: 18px;
+        align-items: start;
+      }
+      .stack { display: grid; gap: 18px; }
+      .hero-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+      }
+      .metric {
+        padding: 14px;
+        border-radius: 16px;
+        background: var(--soft);
+        border: 1px solid var(--line);
+      }
+      .metric-label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+        font-weight: 800;
+      }
+      .metric-value {
+        margin-top: 8px;
+        font-size: clamp(24px, 5vw, 40px);
+        line-height: 1;
+        font-weight: 800;
+      }
+      .status-grid {
+        display: grid;
+        gap: 12px;
+      }
+      .meta-grid {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .meta {
+        padding: 14px;
+        border-radius: 16px;
+        background: var(--soft);
+        border: 1px solid var(--line);
+      }
+      .meta .label {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.11em;
+        font-weight: 800;
+        margin-bottom: 8px;
+      }
+      .meta .value {
+        font-size: 24px;
+        font-weight: 800;
+      }
+      .task-state {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 4px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.05);
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .rssi-wrap {
+        margin-top: 10px;
+      }
+      .rssi-bar {
+        position: relative;
+        height: 12px;
+        border-radius: 999px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: linear-gradient(90deg, #c95a53 0%, #d97f57 22%, #e0bf5a 48%, #9fca6a 74%, #63c07e 100%);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,0.06);
+      }
+      .rssi-marker {
+        position: absolute;
+        top: 50%;
+        width: 12px;
+        height: 12px;
+        border-radius: 999px;
+        background: #fff;
+        border: 2px solid rgba(0,0,0,0.35);
+        box-shadow: 0 0 0 2px rgba(255,255,255,0.18);
+        transform: translate(-50%, -50%);
+        left: 0%;
+      }
+      .rssi-scale {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        margin-top: 6px;
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+      .rssi-note {
+        margin-top: 6px;
+        font-size: 11px;
+        color: var(--muted);
+        text-transform: uppercase;
+      }
+      .kv-pairs {
+        display: grid;
+        gap: 8px;
+      }
+      .kv-row {
+        display: grid;
+        grid-template-columns: var(--kv-label-width, 72px) minmax(0, 1fr);
+        align-items: baseline;
+        gap: 12px;
+      }
+      .kv-key {
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+        font-weight: 800;
+      }
+      .kv-val {
+        font-size: 16px;
+        font-weight: 800;
+        text-align: right;
+        word-break: break-word;
+      }
+      @media (max-width: 920px) {
+        .row-split { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 760px) {
+        .page { padding: 12px; }
+        .topbar { flex-direction: column; align-items: flex-start; }
+        .toolbar { width: 100%; justify-content: stretch; }
+      }
+      @media (max-width: 560px) {
+        .hero-grid, .meta-grid { grid-template-columns: 1fr; }
+      }
+</style>
+<script>
+      const THEMES = {
+        gold: {
+          '--bg0':'#120d09','--bg1':'#1f1710','--bg2':'#2e2217','--bg3':'#0d0d0f',
+          '--panel':'rgba(28,22,17,0.92)','--panel-2':'rgba(39,30,22,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(214,173,98,0.22)','--line-strong':'rgba(214,173,98,0.42)',
+          '--text':'#f5ecde','--muted':'#c6b49d','--accent':'#d6ad62','--accent-2':'#946325','--accent-3':'#f2cf87',
+          '--accent-rgb':'214,173,98','--ok':'#c5a96b','--ok-rgb':'197,169,107','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--button-text':'#24160b',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #f7ddab, #b37734)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.30), rgba(var(--accent-rgb),0.96))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.55), rgba(var(--accent-rgb),0.18), transparent)'
+        },
+        blue: {
+          '--bg0':'#0b1018','--bg1':'#111a27','--bg2':'#18273a','--bg3':'#090d14',
+          '--panel':'rgba(14,22,34,0.92)','--panel-2':'rgba(19,30,45,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(92,166,255,0.20)','--line-strong':'rgba(92,166,255,0.42)',
+          '--text':'#eef6ff','--muted':'#aac0dd','--accent':'#67b5ff','--accent-2':'#2f5e9d','--accent-3':'#b8e3ff',
+          '--accent-rgb':'103,181,255','--ok':'#6fb9ff','--ok-rgb':'111,185,255','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--button-text':'#0b1727',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #d4efff, #4877b3)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.26), rgba(var(--accent-rgb),0.94))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+        },
+        green: {
+          '--bg0':'#0d1511','--bg1':'#15241d','--bg2':'#1d3329','--bg3':'#09100d',
+          '--panel':'rgba(15,25,21,0.92)','--panel-2':'rgba(20,35,28,0.97)',
+          '--soft':'rgba(255,255,255,0.045)','--line':'rgba(111,196,145,0.22)','--line-strong':'rgba(111,196,145,0.42)',
+          '--text':'#edf8f0','--muted':'#b3ceb9','--accent':'#78cb97','--accent-2':'#2d7250','--accent-3':'#bce9ca',
+          '--accent-rgb':'120,203,151','--ok':'#78cb97','--ok-rgb':'120,203,151','--warn':'#f0c670','--danger':'#ef9a7d',
+          '--button-text':'#0d1c14',
+          '--button-bg':'linear-gradient(135deg, var(--accent-3), var(--accent-2))',
+          '--button-bg-hover':'linear-gradient(135deg, #d5f5df, #428565)',
+          '--meter-bg':'rgba(255,255,255,0.05)',
+          '--meter-fill':'linear-gradient(90deg, rgba(var(--accent-rgb),0.28), rgba(var(--accent-rgb),0.96))',
+          '--header-line':'linear-gradient(90deg, rgba(var(--accent-rgb),0.62), rgba(var(--accent-rgb),0.18), transparent)'
+        }
+      };
+
+      function applyTheme(themeName) {
+        const theme = THEMES[themeName] || THEMES.gold;
+        const root = document.documentElement;
+        Object.keys(theme).forEach(k => root.style.setProperty(k, theme[k]));
+        root.style.setProperty('--logo-color', 'var(--accent-3)');
+        document.querySelectorAll('.theme-select').forEach(sel => sel.value = themeName);
+        try { localStorage.setItem('gaos-theme', themeName); } catch (e) {}
+      }
+
+      function initThemePicker() {
+        const saved = (() => { try { return localStorage.getItem('gaos-theme'); } catch(e) { return null; } })() || 'gold';
+        applyTheme(saved);
+        document.querySelectorAll('.theme-select').forEach(sel => {
+          sel.addEventListener('change', () => applyTheme(sel.value));
+        });
+      }
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function getRssiInfo(rssi) {
+        if (!isFinite(rssi)) return { percent: 0, label: 'Unknown' };
+        const percent = clamp(((rssi + 100) / 50) * 100, 0, 100);
+        if (rssi >= -67) return { percent, label: 'Good' };
+        if (rssi >= -75) return { percent, label: 'Fair' };
+        return { percent, label: 'Weak' };
+      }
+
+      function setText(id, value) {
+        const el = document.getElementById(id);
+        if (el) el.innerText = value;
+      }
+
+      function toInitCapHostname(hostname) {
+        if (typeof hostname !== 'string') return '';
+        return hostname
+          .replace(/[^a-zA-Z0-9]+/g, ' ')
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .map(part => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+          .join(' ');
+      }
+
+      function updateDashboardTitle(hostname) {
+        const base = toInitCapHostname(hostname) || 'Cablecar';
+        const title = `${base} Dashboard`;
+        setText('dashboardTitle', title);
+        document.title = title;
+      }
+
+      function formatTaskAge(msAgo) {
+        return isFinite(msAgo) && msAgo >= 0 ? `${Math.round(msAgo)} ms` : '-';
+      }
+
+      function formatTaskState(state) {
+        const s = typeof state === 'string' ? state.toLowerCase() : '';
+        if (s === 'running') return 'Running';
+        if (s === 'ready') return 'Ready';
+        if (s === 'blocked') return 'Waiting';
+        if (s === 'suspended') return 'Paused';
+        if (s === 'deleted') return 'Stopped';
+        return '-';
+      }
+
+      function applyTask(prefix, state, stackHwm, lastMsAgo, utilPct) {
+        setText(`${prefix}State`, formatTaskState(state));
+        setText(`${prefix}Stack`, isFinite(stackHwm) ? `${Math.round(stackHwm)} words` : '-');
+        setText(`${prefix}Last`, formatTaskAge(lastMsAgo));
+        setText(`${prefix}Util`, isFinite(utilPct) ? `${utilPct.toFixed(1)}%` : '-');
+      }
+
+      let statusSocket = null;
+      let wsConnected = false;
+      let wsReconnectTimer = null;
+      let statusPollInFlight = false;
+      let statusPollTimer = null;
+      let lastStatusUpdateMs = 0;
+      const STATUS_POLL_ACTIVE_MS = 500;
+      const STATUS_POLL_HIDDEN_MS = 2000;
+      const STATUS_FETCH_TIMEOUT_MS = 1500;
+      const STATUS_WS_STALE_MS = 4000;
+
+      function applyStatus(s) {
+        lastStatusUpdateMs = Date.now();
+        const relayValue = Number(s.relay_value ?? NaN);
+        const relayOn = Boolean(s.relay_on);
+
+        const art = Number(s.art_age_ms ?? NaN);
+        const wifiRssi = Number(s.wifi_rssi ?? NaN);
+        const wifiIp = typeof s.wifi_ip === 'string' && s.wifi_ip.length ? s.wifi_ip : '-';
+        const wifiMac = typeof s.wifi_mac === 'string' && s.wifi_mac.length ? s.wifi_mac : '-';
+        const freeHeap = Number(s.free_heap ?? NaN);
+        const minFreeHeap = Number(s.min_free_heap ?? NaN);
+        const boardTempC = Number(s.board_temp_c ?? NaN);
+        const rssiInfo = getRssiInfo(wifiRssi);
+        updateDashboardTitle(s.hostname);
+        document.getElementById('artAge').innerText = isFinite(art) ? art : '-';
+        document.getElementById('artBadge').innerText = isFinite(art) && art < 2000 ? 'Live' : 'Idle';
+        document.getElementById('wsBadge').innerText = wsConnected ? 'WebSocket' : 'Polling';
+        document.getElementById('wifiRssi').innerText = isFinite(wifiRssi) ? `${wifiRssi} dBm` : '-';
+        document.getElementById('wifiIp').innerText = wifiIp;
+        document.getElementById('wifiMac').innerText = wifiMac;
+        document.getElementById('wifiRssiMarker').style.left = `${rssiInfo.percent}%`;
+        document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
+        document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
+        document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
+        document.getElementById('boardTemp').innerText = isFinite(boardTempC) ? `${boardTempC.toFixed(1)} deg C` : '-';
+
+        const relayStateText = relayOn ? 'On' : 'Off';
+        const relayStateEl = document.getElementById('relayState');
+        if (relayStateEl) relayStateEl.innerText = relayStateText;
+        const relayValueEl = document.getElementById('relayValue');
+        if (relayValueEl) relayValueEl.innerText = isFinite(relayValue) ? String(Math.round(relayValue)) : '-';
+
+        applyTask(
+          'controlTask',
+          s.task_control_state,
+          Number(s.task_control_stack_hwm ?? NaN),
+          Number(s.task_control_last_ms_ago ?? NaN),
+          Number(s.task_control_util_pct ?? NaN)
+        );
+        applyTask(
+          'webTask',
+          s.task_web_state,
+          Number(s.task_web_stack_hwm ?? NaN),
+          Number(s.task_web_last_ms_ago ?? NaN),
+          Number(s.task_web_util_pct ?? NaN)
+        );
+      }
+
+      function scheduleNextStatusPoll(delayMs) {
+        if (statusPollTimer) clearTimeout(statusPollTimer);
+        statusPollTimer = setTimeout(pollStatus, delayMs);
+      }
+
+      function connectStatusWebSocket() {
+        if (statusSocket) {
+          try { statusSocket.close(); } catch (e) {}
+          statusSocket = null;
+        }
+        wsConnected = false;
+        const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        try {
+          statusSocket = new WebSocket(`${proto}${location.host}/ws`);
+          statusSocket.onopen = () => {
+            wsConnected = true;
+            lastStatusUpdateMs = Date.now();
+            if (statusPollTimer) clearTimeout(statusPollTimer);
+          };
+          statusSocket.onmessage = (event) => {
+            try {
+              applyStatus(JSON.parse(event.data));
+            } catch (e) {
+            }
+          };
+          statusSocket.onclose = () => {
+            wsConnected = false;
+            statusSocket = null;
+            scheduleNextStatusPoll(250);
+          };
+          statusSocket.onerror = () => {
+            wsConnected = false;
+          };
+        } catch (e) {
+          wsConnected = false;
+          statusSocket = null;
+        }
+      }
+
+      async function pollStatus() {
+        if (wsConnected) {
+          if (lastStatusUpdateMs > 0 && (Date.now() - lastStatusUpdateMs) > STATUS_WS_STALE_MS) {
+            if (statusSocket) { statusSocket.close(); }
+          } else {
+            scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
+            return;
+          }
+        }
+        if (statusPollInFlight) {
+          scheduleNextStatusPoll(STATUS_POLL_ACTIVE_MS);
+          return;
+        }
+
+        statusPollInFlight = true;
+        try {
+          const ctrl = new AbortController();
+          const timeoutId = setTimeout(() => ctrl.abort(), STATUS_FETCH_TIMEOUT_MS);
+          const res = await fetch('/status', { cache: 'no-store', signal: ctrl.signal });
+          clearTimeout(timeoutId);
+          if (!res.ok) throw new Error();
+          applyStatus(await res.json());
+        } catch (e) {
+        } finally {
+          statusPollInFlight = false;
+          scheduleNextStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_ACTIVE_MS);
+        }
+      }
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          scheduleNextStatusPoll(STATUS_POLL_HIDDEN_MS);
+        } else {
+          connectStatusWebSocket();
+          scheduleNextStatusPoll(250);
+        }
+      });
+
+      document.addEventListener('DOMContentLoaded', () => {
+        initThemePicker();
+        connectStatusWebSocket();
+        pollStatus();
+      });
+</script>
+</head>
+<body>
+<div class="page">
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-logo" aria-label="GAOS logo"><svg class="gaos-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 955.27 390.39">
+  <g>
+    <path fill="currentColor" d="M396.22,387.4h53.28l-12.2-47.35c-48.46,14.81-116.46.89-147.68-66.77-6.38-13.82-10.95-26.54-12.71-39.18l-32.24,153.3h83.88l5.01-34.75h57.64l5.01,34.75Z"/>
+    <path fill="currentColor" d="M368.02,71.1s-5.81-23-8.98-34.42c-2.84-10.22-5.46-20.53-7.37-31h-26.71l-32.51,154.58c12.58-27.88,48.39-56.03,75.58-89.17"/>
+    <path fill="currentColor" d="M218.58,139.99l-75.99.02v-4.76c0-38.03-7.26-58.65-26.61-58.65-25.71,0-36.22,50.84-36.22,118.66s10.39,121.76,36.22,121.76c35.17,0,34.82-59.71,34.38-73.36l-23.25-18.28v-47.36h91.47v209.3h-29.21l-16.67-21.97c-9.95,16.07-35.66,25.04-69.2,25.04C15.52,390.39,0,271.69,0,195.22S12.87,0,114.17,0c91.18,0,104.41,67.62,104.41,136.3v3.69Z"/>
+    <path fill="currentColor" d="M811.69,246.7v22.19c0,33,13.38,52.3,36.84,52.3,19.56,0,31.46-15.55,31.46-34.87,0-23.23-13.33-37.5-45.86-59.69l-35.18-23.78c-40-26.94-51.78-56.52-51.78-95.61,0-70.79,44.31-107.25,102.96-107.25,55.46,0,101.89,32.76,101.89,116.76v15.32h-70.38v-10.04c0-36.45-12.13-52.82-33.64-52.82-15.84,0-29.86,11.79-29.86,31.17,0,12.67,4.8,25.36,41.59,49.13l35.72,23.25c61.32,40.15,59.82,90.33,59.82,108.29,0,69.73-36.89,109.34-101.94,109.34-59.19,0-115.23-32.74-115.23-116.21v-27.47h73.59Z"/>
+    <path fill="currentColor" d="M604.05,0C496.08,0,493.34,130.75,493.34,195.26s2.19,195.13,110.71,195.13,110.71-130.62,110.71-195.13S712.03,0,604.05,0M604.05,313.79c-29.11,0-34.89-54.17-34.89-118.55s5.26-118.64,34.89-118.64,34.89,54.27,34.89,118.64-5.79,118.55-34.89,118.55"/>
+    <path fill="currentColor" d="M401.17,198.33c-10.23,1.92-21.48,11.43-27.05,20.21-.58.92-.74,1.18-1.26,2.15l7.76,54.7h-9.55c3.21,7.09,7.88,13.09,14,16.99,2.94,1.88,10.22,5.93,19.8,7.3-1.58.74-9.32,1.02-10.9,1.02-2.76.01-5.61-.5-8.26-1.32-13.89-4.3-23.64-12.81-29.6-24.01h-10.39l3.98-27.6c-1.21-9.46.63-23.54,4.64-33.92l7.78-53.38h2.16l4.19,31.1c2.23-2.5,4.7-4.97,7.47-7.36,4.96-4.3,11.41-8.76,18.61-11.89-4.76-18.82-10.72-41.91-15.74-61.76-6.16,7.06-51.52,54.18-62.81,77.29-12.32,25.21-13.3,48.76-5.33,76.47,10.45,36.39,57.7,76.89,123.06,61.75-10.35-40.85-22.2-86.89-32.55-127.74"/>
+    <path fill="currentColor" d="M420.48,167.54c6.88-.08,13.33.42,19.33,1.53l-23.08-109.16c-7.77,14.6-16.01,25.14-26.98,38.29l18.13,70.38c3.66-.54,8.44-.99,12.6-1.04"/>
+    <path fill="currentColor" d="M407.07,14.4l-1.85-8.71h-38.56c-1.12,1.63,13.55,54.64,13.55,54.64,8.81-12.2,18.39-28.42,26.86-45.93"/>
+    <path fill="currentColor" d="M486.03,387.4l-14.11-66.67c-4.73,5.09-11.05,9.77-21.14,14.38l13.47,52.29h21.78Z"/>
+    <path fill="currentColor" d="M468.84,305.53l-21.97-103.12c-11.3-6.11-22.79-7.81-32.1-7.07l32.59,126.51c6.85-3.06,15.97-8.7,21.48-16.32"/>
+  </g>
+</svg></div>
+        <div>
+          <p class="eyebrow">Geneva Musical Theatre</p>
+          <h1 id="dashboardTitle">Cablecar Dashboard</h1>
+          <p class="subtitle">Single-channel Art-Net relay controller</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="theme-wrap">
+          <span class="theme-label">Theme</span>
+          <select class="theme-select" aria-label="Theme">
+            <option value="gold">Gold</option>
+            <option value="blue">Blue</option>
+            <option value="green">Green</option>
+          </select>
+        </div>
+        <a class="btn" href="/settings.html">Settings</a>
+        <a class="btn btn-primary" href="/ota.html">Updates</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="row-split">
+        <article class="card">
+          <div class="card-inner">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+              <div>
+                <h2 class="card-title">Status</h2>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <span class="status-badge"><span class="dot"></span><span id="artBadge">Waiting</span></span>
+                <span class="status-badge"><span class="dot"></span><span id="wsBadge">Connecting</span></span>
+              </div>
+            </div>
+
+            <div class="hero-grid">
+              <div class="metric">
+                <div class="metric-label">Art-Net age</div>
+                <div class="metric-value mono"><span id="artAge">-</span><span style="font-size:.45em;margin-left:8px;color:var(--muted);">ms</span></div>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-inner">
+            <h2 class="card-title">Relay Output</h2>
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:1fr;">
+              <div class="meta">
+                <span class="label">Output State</span>
+                <div id="relayState" class="value mono">Off</div>
+              </div>
+              <div class="meta">
+                <span class="label">DMX Value</span>
+                <div id="relayValue" class="value mono">0</div>
+                <div class="rssi-note">Minimum switch interval 500 ms</div>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="stack">
+        <article class="card">
+          <div class="card-inner">
+            <h2 class="card-title">System</h2>
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
+              <div class="meta"><span class="label">Wi-Fi RSSI</span><div id="wifiRssi" class="value mono">-</div><div class="rssi-wrap"><div class="rssi-bar"><div id="wifiRssiMarker" class="rssi-marker"></div></div><div class="rssi-scale"><span>Weak</span><span>Fair</span><span>Good</span></div><div id="wifiRssiQuality" class="rssi-note">Unknown</div></div></div>
+              <div class="meta" style="--kv-label-width:56px;"><span class="label">Network</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">IP</span><span id="wifiIp" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MAC</span><span id="wifiMac" class="kv-val mono">-</span></div></div></div>
+              <div class="meta" style="--kv-label-width:56px;"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MCU</span><span id="boardTemp" class="kv-val mono">-</span></div></div></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-inner">
+            <h2 class="card-title">Tasks</h2>
+            <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(2, minmax(0, 1fr));">
+              <div class="meta"><span class="label">Art-Net Task</span><div id="controlTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="controlTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="controlTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="controlTaskStack" class="mono">-</span></div></div>
+              <div class="meta"><span class="label">Web Task</span><div id="webTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="webTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="webTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="webTaskStack" class="mono">-</span></div></div>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </div>
+</div>
+</body>
+</html>
