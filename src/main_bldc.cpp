@@ -606,8 +606,8 @@ void setup() {
     nullptr,
   });
 
-  appConnectWifi();
   appStartCommonServices();
+  appConnectWifi();
 
   motorQueue = xQueueCreate(1, sizeof(MotorCmd));
   // Keep application work off core 0 so the ESP32 WiFi/lwIP stack can service

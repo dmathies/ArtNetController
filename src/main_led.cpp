@@ -324,8 +324,8 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["min_free_heap"] = ESP.getMinFreeHeap();
   j["board_temp_c"] = appReadBoardTemperatureC();
   j["reset_reason"] = appResetReasonToString(esp_reset_reason());
-  j["task_control_state"] = taskStateToString(eTaskGetState(controlTaskHandle));
-  j["task_control_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  j["task_control_state"] = controlTaskHandle ? taskStateToString(eTaskGetState(controlTaskHandle)) : "not_created";
+  j["task_control_stack_hwm"] = controlTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle) : -1;
   j["task_control_last_ms_ago"] = (snapshot.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - snapshot.controlTaskLastLoopMs);
   j["task_control_util_pct"] = (float)snapshot.controlTaskUtilPermille / 10.0f;
   j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
@@ -419,8 +419,8 @@ void setup() {
     nullptr,
   });
 
-  appConnectWifi();
   appStartCommonServices();
+  appConnectWifi();
 
   xTaskCreatePinnedToCore(controlTask,
                           "ControlTask",

@@ -29,6 +29,8 @@ struct AppTaskRuntimeStats {
 
 Configuration& appConfig();
 WifiManagerClass& appWifiManager();
+size_t appBuildStatusJson(char* out, size_t outSize, bool details);
+const char* appGetDeviceName();
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len);
 void appMarkArtnetActivity();
@@ -43,4 +45,5 @@ void appInitializeBaseRuntime();
 void appInitRuntime(const AppRuntimeHooks& hooks);
 void appStartCommonServices();
 void appConnectWifi();
+void appStartWebServices();
 void appCommonLoop(uint32_t wsStatusPushMs);

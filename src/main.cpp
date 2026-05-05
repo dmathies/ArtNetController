@@ -13,7 +13,9 @@
 #include <cctype>
 #include <cstring>
 
+#include "BleManager.h"
 #include "main_common.h"
+#include "RemoteLogBuffer.h"
 
 
 static constexpr int MAX_WS_CLIENTS = 6;
@@ -151,6 +153,11 @@ static void logFileReadPerf(const char* path) {
 
 Configuration& appConfig() { return g_config; }
 WifiManagerClass& appWifiManager() { return g_wifiManager; }
+size_t appBuildStatusJson(char* out, size_t outSize, bool details) {
+  if (!g_hooks.buildStatusJson || !out || outSize == 0) return 0;
+  return g_hooks.buildStatusJson(out, outSize, details);
+}
+const char* appGetDeviceName() { return g_hooks.deviceName ? g_hooks.deviceName : "CableCar"; }
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
   ArtDmxPacket r;
@@ -2213,9 +2220,11 @@ void appInitializeBaseRuntime() {
 #endif
 
   Serial.println("Startup...");
+  appLogLine("Startup...");
 
   if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
     Serial.println("LittleFS mount failed");
+    appLogLine("LittleFS mount failed");
   }
 }
 
@@ -2224,8 +2233,12 @@ void appInitRuntime(const AppRuntimeHooks& hooks) {
 }
 
 void appStartCommonServices() {
+  appStartBleServices();
+}
+
+void appStartWebServices() {
   startWebServer();
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
 
 #if FS_BENCHMARK_LOG_ENABLE
   logFileReadPerf("/wifi-manager/index.html");
@@ -2240,11 +2253,15 @@ void appConnectWifi() {
   bool connected = g_wifiManager.connectToWifi();
   if (!connected) {
     Serial.println("No WiFi... Starting AP");
+    appLogLine("No WiFi... Starting AP");
     g_wifiManager.startManagementAP();
   }
 
+  appStartWebServices();
+
   IPAddress ip = g_wifiManager.getIP();
   Serial.printf("IP Address: %s\n", ip.toString().c_str());
+  appLogPrintf("IP Address: %s\n", ip.toString().c_str());
 }
 
 void appCommonLoop(uint32_t wsStatusPushMs) {
@@ -2253,6 +2270,7 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
   }
 
   g_wifiManager.check();
+  appBleLoop();
 
   uint32_t now = millis();
   refreshStatusCacheIfDue(now);
