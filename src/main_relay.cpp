@@ -21,10 +21,10 @@ static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
 static constexpr uint32_t CONTROL_TASK_IDLE_WAIT_MS = 20;
 static constexpr uint32_t RELAY_SWITCH_MIN_INTERVAL_MS = 500;
 static constexpr uint32_t SOURCE_HOLD_MS = 1000;
-static constexpr uint32_t SERIAL_NET_LOG_INTERVAL_MS = 1000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
 static constexpr UBaseType_t CONTROL_TASK_PRIORITY = 2;
 static constexpr BaseType_t CONTROL_TASK_CORE = 1;
+static constexpr uint32_t STATUS_DIAGNOSTICS_REFRESH_MS = 5000;
 
 #ifndef ARTNET_TIMING_LOG_ENABLE
 #define ARTNET_TIMING_LOG_ENABLE 0
@@ -53,11 +53,17 @@ struct StatusSnapshot {
   uint16_t controlTaskUtilPermille = 0;
 };
 
+struct CachedDiagnostics {
+  int32_t controlTaskStackHwm = -1;
+  int32_t webTaskStackHwm = -1;
+  const char* controlTaskState = "unknown";
+  const char* webTaskState = "unknown";
+};
+
 static TaskHandle_t controlTaskHandle = nullptr;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 static AsyncUDP g_artudp;
 static bool g_artudpListening = false;
-static uint32_t g_lastSerialNetLogMs = 0;
 static bool g_havePendingRelayValue = false;
 static uint8_t g_pendingRelayValue = 0;
 
@@ -80,6 +86,8 @@ static IPAddress artUdpLastRemoteIp(0, 0, 0, 0);
 static AppConfigCache g_cfg;
 static TaskMetrics g_controlTaskMetrics;
 static ArtnetTimingWindow g_artnetTiming;
+static CachedDiagnostics g_cachedDiagnostics;
+static uint32_t g_statusDiagnosticsBuiltMs = 0;
 
 static inline bool relayRawToState(uint8_t raw) {
   return raw >= RELAY_ON_THRESHOLD;
@@ -308,13 +316,48 @@ static StatusSnapshot readStatusSnapshot() {
   return snapshot;
 }
 
+static CachedDiagnostics readCachedDiagnostics() {
+  CachedDiagnostics diagnostics;
+  portENTER_CRITICAL(&statusMux);
+  diagnostics = g_cachedDiagnostics;
+  portEXIT_CRITICAL(&statusMux);
+  return diagnostics;
+}
+
+static void refreshStatusDiagnosticsIfDue(uint32_t nowMs) {
+  uint32_t lastBuiltMs;
+  portENTER_CRITICAL(&statusMux);
+  lastBuiltMs = g_statusDiagnosticsBuiltMs;
+  portEXIT_CRITICAL(&statusMux);
+
+  if (lastBuiltMs != 0 && (nowMs - lastBuiltMs) < STATUS_DIAGNOSTICS_REFRESH_MS) {
+    return;
+  }
+
+  CachedDiagnostics diagnostics;
+  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
+  if (controlTaskHandle) {
+    diagnostics.controlTaskState = taskStateToString(eTaskGetState(controlTaskHandle));
+    diagnostics.controlTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  }
+  diagnostics.webTaskState = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
+  diagnostics.webTaskStackHwm = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+
+  portENTER_CRITICAL(&statusMux);
+  g_cachedDiagnostics = diagnostics;
+  g_statusDiagnosticsBuiltMs = nowMs;
+  portEXIT_CRITICAL(&statusMux);
+}
+
 static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   StaticJsonDocument<1024> j;
+  refreshStatusDiagnosticsIfDue(millis());
   StatusSnapshot snapshot = readStatusSnapshot();
   uint32_t now = millis();
   uint32_t artAge = (snapshot.lastArtMs == 0) ? 0xFFFFFFFFu : (now - snapshot.lastArtMs);
-  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
   AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
+  AppSlowStatusMetrics slowMetrics = appGetSlowStatusMetrics();
+  CachedDiagnostics diagnostics = readCachedDiagnostics();
   WifiManagerClass& wifiManager = appWifiManager();
   IPAddress ip = wifiManager.getIP();
   char ipBuf[16];
@@ -332,16 +375,16 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["hostname"] = wifiManager.getHostnameCStr();
   j["wifi_ip"] = ipBuf;
   j["wifi_mac"] = macBuf;
-  j["free_heap"] = ESP.getFreeHeap();
-  j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["board_temp_c"] = appReadBoardTemperatureC();
-  j["reset_reason"] = appResetReasonToString(esp_reset_reason());
-  j["task_control_state"] = controlTaskHandle ? taskStateToString(eTaskGetState(controlTaskHandle)) : "not_created";
-  j["task_control_stack_hwm"] = controlTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle) : -1;
+  j["free_heap"] = slowMetrics.freeHeap;
+  j["min_free_heap"] = slowMetrics.minFreeHeap;
+  j["board_temp_c"] = slowMetrics.boardTempC;
+  j["reset_reason"] = slowMetrics.resetReason;
+  j["task_control_state"] = diagnostics.controlTaskState;
+  j["task_control_stack_hwm"] = diagnostics.controlTaskStackHwm;
   j["task_control_last_ms_ago"] = (snapshot.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - snapshot.controlTaskLastLoopMs);
   j["task_control_util_pct"] = (float)snapshot.controlTaskUtilPermille / 10.0f;
-  j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
-  j["task_web_stack_hwm"] = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+  j["task_web_state"] = diagnostics.webTaskState;
+  j["task_web_stack_hwm"] = diagnostics.webTaskStackHwm;
   j["task_web_last_ms_ago"] = (webTaskStats.lastActiveMs == 0) ? -1 : (int32_t)(now - webTaskStats.lastActiveMs);
   j["task_web_util_pct"] = (float)webTaskStats.utilPermille / 10.0f;
 
@@ -357,6 +400,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
 }
 
 static size_t buildHealthSummary(char* out, size_t outSize) {
+  refreshStatusDiagnosticsIfDue(millis());
   StatusSnapshot snapshot = readStatusSnapshot();
   uint32_t now = millis();
   int32_t lastMsAgo = (snapshot.artDmxLastArrivalMs == 0) ? -1 : (int32_t)(now - snapshot.artDmxLastArrivalMs);
@@ -402,26 +446,6 @@ static size_t buildHealthSummary(char* out, size_t outSize) {
                   (unsigned int)snapshot.dmxValue);
 }
 
-static void logNetworkInfoIfDue() {
-  uint32_t now = millis();
-  if ((now - g_lastSerialNetLogMs) < SERIAL_NET_LOG_INTERVAL_MS) {
-    return;
-  }
-  g_lastSerialNetLogMs = now;
-
-  WifiManagerClass& wifiManager = appWifiManager();
-  IPAddress ip = wifiManager.getIP();
-  char macBuf[18];
-  wifiManager.getMacAddress(macBuf, sizeof(macBuf));
-
-  Serial.printf("[NET] ip=%u.%u.%u.%u mac=%s\n",
-                ip[0],
-                ip[1],
-                ip[2],
-                ip[3],
-                macBuf);
-}
-
 void setup() {
   appInitializeBaseRuntime();
 
@@ -454,7 +478,6 @@ void setup() {
 }
 
 void loop() {
-  logNetworkInfoIfDue();
   appCommonLoop(WS_STATUS_PUSH_MS);
   delay(1);
 }

@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <BLE2902.h>
+#include <BLEAdvertising.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -13,6 +14,7 @@ namespace {
 constexpr char BLE_SERVICE_UUID[] = "8f2a2000-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_WIFI_RSSI_UUID[] = "8f2a2002-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_WIFI_IP_UUID[] = "8f2a2003-1e8e-4f4c-a8c0-6c5b7d019000";
+constexpr char BLE_CHAR_WIFI_MAC_UUID[] = "8f2a2008-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_LAST_LOG_UUID[] = "8f2a2004-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_LOG_TAIL_UUID[] = "8f2a2005-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_REBOOT_UUID[] = "8f2a2006-1e8e-4f4c-a8c0-6c5b7d019000";
@@ -32,7 +34,13 @@ constexpr char BLE_CHAR_DMX_UNIVERSE_UUID[] = "8f2a201b-1e8e-4f4c-a8c0-6c5b7d019
 
 constexpr uint32_t BLE_STATUS_REFRESH_MS = 1000;
 constexpr size_t BLE_LOG_TAIL_BYTES = 512;
+constexpr uint16_t BLE_ADV_INTERVAL_MIN = 0xA0;  // 100 ms
+constexpr uint16_t BLE_ADV_INTERVAL_MAX = 0xC0;  // 120 ms
 constexpr uint16_t BLE_SERVICE_HANDLE_COUNT = 64;
+constexpr size_t BLE_PENDING_VALUE_MAX = 96;
+constexpr uint16_t BLE_MANUFACTURER_ID = 0xFFFF;
+constexpr uint8_t BLE_ADV_METADATA_VERSION = 1;
+constexpr uint8_t BLE_ADV_FLAG_IP_PRESENT = 0x01;
 
 enum class ConfigField {
   Ssid,
@@ -49,9 +57,51 @@ enum class ConfigField {
   DmxUniverse,
 };
 
+const char* configFieldName(ConfigField field) {
+  switch (field) {
+    case ConfigField::Ssid:
+      return "ssid";
+    case ConfigField::Password:
+      return "password";
+    case ConfigField::Hostname:
+      return "hostname";
+    case ConfigField::Dhcp:
+      return "dhcp";
+    case ConfigField::Ip:
+      return "ip";
+    case ConfigField::Gateway:
+      return "gateway";
+    case ConfigField::Subnet:
+      return "subnet";
+    case ConfigField::Dns1:
+      return "dns1";
+    case ConfigField::Dns2:
+      return "dns2";
+    case ConfigField::StartValue:
+      return "start_value";
+    case ConfigField::DmxAddress:
+      return "dmx_address";
+    case ConfigField::DmxUniverse:
+      return "dmx_universe";
+  }
+
+  return "unknown";
+}
+
+String configValuePreview(ConfigField field, const String& value) {
+  if (field == ConfigField::Password) {
+    return String("<len=") + value.length() + ">";
+  }
+
+  if (value.length() == 0) return "<empty>";
+  if (value.length() <= 48) return value;
+  return value.substring(0, 48) + "...";
+}
+
 BLEServer* g_server = nullptr;
 BLECharacteristic* g_wifiRssiChar = nullptr;
 BLECharacteristic* g_wifiIpChar = nullptr;
+BLECharacteristic* g_wifiMacChar = nullptr;
 BLECharacteristic* g_lastLogChar = nullptr;
 BLECharacteristic* g_logTailChar = nullptr;
 BLECharacteristic* g_rebootChar = nullptr;
@@ -72,11 +122,53 @@ bool g_bleStarted = false;
 bool g_bleClientConnected = false;
 uint32_t g_lastStatusRefreshMs = 0;
 bool g_statusRefreshPending = false;
+String g_lastNotifiedLogLine;
+String g_lastNotifiedRssi;
+portMUX_TYPE g_bleMux = portMUX_INITIALIZER_UNLOCKED;
+
+struct PendingBleWrite {
+  bool pending = false;
+  bool isReboot = false;
+  ConfigField field = ConfigField::Ssid;
+  char value[BLE_PENDING_VALUE_MAX] = {0};
+};
+
+PendingBleWrite g_pendingBleWrite;
 
 String trimAscii(const std::string& raw) {
   String value(raw.c_str());
   value.trim();
   return value;
+}
+
+void queueBleWrite(ConfigField field, const String& value) {
+  portENTER_CRITICAL(&g_bleMux);
+  g_pendingBleWrite.pending = true;
+  g_pendingBleWrite.isReboot = false;
+  g_pendingBleWrite.field = field;
+  value.toCharArray(g_pendingBleWrite.value, BLE_PENDING_VALUE_MAX);
+  portEXIT_CRITICAL(&g_bleMux);
+}
+
+void queueBleReboot(const String& value) {
+  portENTER_CRITICAL(&g_bleMux);
+  g_pendingBleWrite.pending = true;
+  g_pendingBleWrite.isReboot = true;
+  value.toCharArray(g_pendingBleWrite.value, BLE_PENDING_VALUE_MAX);
+  portEXIT_CRITICAL(&g_bleMux);
+}
+
+bool takePendingBleWrite(PendingBleWrite& out) {
+  bool hasPending = false;
+  portENTER_CRITICAL(&g_bleMux);
+  if (g_pendingBleWrite.pending) {
+    out = g_pendingBleWrite;
+    g_pendingBleWrite.pending = false;
+    g_pendingBleWrite.value[0] = '\0';
+    hasPending = true;
+  }
+  portEXIT_CRITICAL(&g_bleMux);
+  return hasPending;
 }
 
 bool containsInvalidText(const String& value, bool allowEmpty, size_t maxLen) {
@@ -124,6 +216,64 @@ String buildAdvertisedName() {
   return String(appGetDeviceName()) + "-" + suffix;
 }
 
+bool parseMacAddressBytes(const char* macText, uint8_t out[6]) {
+  if (!macText || !out) return false;
+  unsigned int parts[6];
+  int matched = sscanf(macText, "%2x:%2x:%2x:%2x:%2x:%2x",
+                       &parts[0],
+                       &parts[1],
+                       &parts[2],
+                       &parts[3],
+                       &parts[4],
+                       &parts[5]);
+  if (matched != 6) return false;
+  for (int i = 0; i < 6; ++i) out[i] = (uint8_t)parts[i];
+  return true;
+}
+
+std::string buildAdvertisingMetadata() {
+  WifiManagerClass& wifi = appWifiManager();
+  char macBuf[18];
+  wifi.getMacAddress(macBuf, sizeof(macBuf));
+
+  uint8_t macBytes[6] = {0};
+  parseMacAddressBytes(macBuf, macBytes);
+
+  IPAddress ip = wifi.getIP();
+  bool hasIp = ip != IPAddress((uint32_t)0);
+
+  std::string data;
+  data.reserve(14);
+  data.push_back((char)(BLE_MANUFACTURER_ID & 0xFF));
+  data.push_back((char)((BLE_MANUFACTURER_ID >> 8) & 0xFF));
+  data.push_back((char)BLE_ADV_METADATA_VERSION);
+  data.push_back((char)(hasIp ? BLE_ADV_FLAG_IP_PRESENT : 0));
+  data.append((const char*)macBytes, sizeof(macBytes));
+  if (hasIp) {
+    uint8_t ipBytes[4] = {ip[0], ip[1], ip[2], ip[3]};
+    data.append((const char*)ipBytes, sizeof(ipBytes));
+  }
+
+  return data;
+}
+
+void configureAdvertisingPayload(BLEAdvertising* advertising, const String& deviceName) {
+  if (!advertising) return;
+
+  advertising->setMinInterval(BLE_ADV_INTERVAL_MIN);
+  advertising->setMaxInterval(BLE_ADV_INTERVAL_MAX);
+
+  BLEAdvertisementData advData;
+  advData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+  advData.setManufacturerData(buildAdvertisingMetadata());
+  advertising->setAdvertisementData(advData);
+
+  BLEAdvertisementData scanResponseData;
+  scanResponseData.setName(deviceName.c_str());
+  advertising->setScanResponseData(scanResponseData);
+  advertising->setScanResponse(true);
+}
+
 void setResult(const String& message) {
   if (!g_resultChar) return;
   g_resultChar->setValue(message.c_str());
@@ -135,7 +285,7 @@ void setResult(const String& message) {
 void refreshConfigCharacteristics() {
   Configuration& config = appConfig();
   if (g_ssidChar) g_ssidChar->setValue(config.getSSID().c_str());
-  if (g_passwordChar) g_passwordChar->setValue(config.getPass().c_str());
+  if (g_passwordChar) g_passwordChar->setValue("");
   if (g_hostnameChar) g_hostnameChar->setValue(config.getHostname().c_str());
   if (g_dhcpChar) g_dhcpChar->setValue(config.getDhcpEnabled() ? "1" : "0");
   if (g_ipChar) g_ipChar->setValue(config.getStaticIP().c_str());
@@ -156,24 +306,34 @@ void refreshConfigCharacteristics() {
 void refreshStatusCharacteristics(bool notify) {
   WifiManagerClass& wifi = appWifiManager();
   char ipBuf[16];
+  char macBuf[18];
   IPAddress ip = wifi.getIP();
   snprintf(ipBuf, sizeof(ipBuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  wifi.getMacAddress(macBuf, sizeof(macBuf));
 
   char rssiBuf[16];
   snprintf(rssiBuf, sizeof(rssiBuf), "%d", (int)wifi.getRSSI());
 
   String lastLog = appLogGetLastLine();
   String logTail = appLogGetTail(BLE_LOG_TAIL_BYTES);
+  bool lastLogChanged = lastLog != g_lastNotifiedLogLine;
+  bool rssiChanged = String(rssiBuf) != g_lastNotifiedRssi;
 
   if (g_wifiIpChar) g_wifiIpChar->setValue(ipBuf);
+  if (g_wifiMacChar) g_wifiMacChar->setValue(macBuf);
   if (g_wifiRssiChar) g_wifiRssiChar->setValue(rssiBuf);
   if (g_lastLogChar) g_lastLogChar->setValue(lastLog.c_str());
   if (g_logTailChar) g_logTailChar->setValue(logTail.c_str());
 
   if (notify && g_bleClientConnected) {
-    if (g_wifiIpChar) g_wifiIpChar->notify();
-    if (g_wifiRssiChar) g_wifiRssiChar->notify();
-    if (g_lastLogChar) g_lastLogChar->notify();
+    if (g_wifiRssiChar && rssiChanged) {
+      g_wifiRssiChar->notify();
+      g_lastNotifiedRssi = rssiBuf;
+    }
+    if (g_lastLogChar && lastLogChanged) {
+      g_lastLogChar->notify();
+      g_lastNotifiedLogLine = lastLog;
+    }
   }
 }
 
@@ -189,7 +349,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write SSID";
         return false;
       }
-      message = "SSID updated; reboot scheduled";
+      message = "SSID updated";
       return true;
     case ConfigField::Password:
       if (value.length() > 63) {
@@ -200,7 +360,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write password";
         return false;
       }
-      message = "Password updated; reboot scheduled";
+      message = "Password updated";
       return true;
     case ConfigField::Hostname:
       if (containsInvalidText(value, true, 63)) {
@@ -211,7 +371,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write hostname";
         return false;
       }
-      message = "Hostname updated; reboot scheduled";
+      message = "Hostname updated";
       return true;
     case ConfigField::Dhcp: {
       bool enabled = true;
@@ -223,7 +383,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write DHCP";
         return false;
       }
-      message = enabled ? "DHCP enabled; reboot scheduled" : "Static IP mode; reboot scheduled";
+      message = enabled ? "DHCP enabled" : "Static IP mode enabled";
       return true;
     }
     case ConfigField::Ip:
@@ -231,35 +391,35 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write IP";
         return false;
       }
-      message = "Static IP updated; reboot scheduled";
+      message = "Static IP updated";
       return true;
     case ConfigField::Gateway:
       if (!config.writeGateway(value)) {
         message = "Failed to write gateway";
         return false;
       }
-      message = "Gateway updated; reboot scheduled";
+      message = "Gateway updated";
       return true;
     case ConfigField::Subnet:
       if (!config.writeSubnet(value)) {
         message = "Failed to write subnet";
         return false;
       }
-      message = "Subnet updated; reboot scheduled";
+      message = "Subnet updated";
       return true;
     case ConfigField::Dns1:
       if (!config.writeDNS1(value)) {
         message = "Failed to write DNS1";
         return false;
       }
-      message = "DNS1 updated; reboot scheduled";
+      message = "DNS1 updated";
       return true;
     case ConfigField::Dns2:
       if (!config.writeDNS2(value)) {
         message = "Failed to write DNS2";
         return false;
       }
-      message = "DNS2 updated; reboot scheduled";
+      message = "DNS2 updated";
       return true;
     case ConfigField::StartValue: {
       char* end = nullptr;
@@ -272,7 +432,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write start value";
         return false;
       }
-      message = "Start value updated; reboot scheduled";
+      message = "Start value updated";
       return true;
     }
     case ConfigField::DmxAddress: {
@@ -286,7 +446,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write DMX address";
         return false;
       }
-      message = "DMX address updated; reboot scheduled";
+      message = "DMX address updated";
       return true;
     }
     case ConfigField::DmxUniverse: {
@@ -300,7 +460,7 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         message = "Failed to write universe";
         return false;
       }
-      message = "Universe updated; reboot scheduled";
+      message = "Universe updated";
       return true;
     }
   }
@@ -332,18 +492,9 @@ class ConfigCallbacks : public BLECharacteristicCallbacks {
   explicit ConfigCallbacks(ConfigField field) : field_(field) {}
 
   void onWrite(BLECharacteristic* characteristic) override {
+    (void)characteristic;
     String value = trimAscii(characteristic->getValue());
-    String message;
-    if (!applyConfigField(field_, value, message)) {
-      setResult(message);
-      refreshConfigCharacteristics();
-      return;
-    }
-
-    refreshConfigCharacteristics();
-    appLogLine(message.c_str());
-    setResult(message);
-    appWifiManager().scheduleRestart(1000);
+    queueBleWrite(field_, value);
   }
 
  private:
@@ -354,15 +505,7 @@ class RebootCallbacks : public BLECharacteristicCallbacks {
  public:
   void onWrite(BLECharacteristic* characteristic) override {
     String value = trimAscii(characteristic->getValue());
-    value.toLowerCase();
-    if (value != "1" && value != "reboot" && value != "restart") {
-      setResult("Write '1' or 'reboot' to restart");
-      return;
-    }
-
-    appLogLine("BLE reboot requested");
-    setResult("Reboot scheduled");
-    appWifiManager().scheduleRestart(500);
+    queueBleReboot(value);
   }
 };
 
@@ -398,9 +541,12 @@ void appStartBleServices() {
   g_wifiRssiChar->addDescriptor(new BLE2902());
   g_wifiIpChar = createCharacteristic(service,
                                       BLE_CHAR_WIFI_IP_UUID,
-                                      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
+                                      BLECharacteristic::PROPERTY_READ,
                                       "wifi_ip");
-  g_wifiIpChar->addDescriptor(new BLE2902());
+  g_wifiMacChar = createCharacteristic(service,
+                                       BLE_CHAR_WIFI_MAC_UUID,
+                                       BLECharacteristic::PROPERTY_READ,
+                                       "wifi_mac");
   g_lastLogChar = createCharacteristic(service,
                                        BLE_CHAR_LAST_LOG_UUID,
                                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
@@ -427,8 +573,7 @@ void appStartBleServices() {
                                     "ssid");
   g_passwordChar = createCharacteristic(service,
                                         BLE_CHAR_PASSWORD_UUID,
-                                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                            BLECharacteristic::PROPERTY_WRITE_NR,
+                                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
                                         "password");
   g_hostnameChar = createCharacteristic(service,
                                         BLE_CHAR_HOSTNAME_UUID,
@@ -502,16 +647,64 @@ void appStartBleServices() {
   service->start();
 
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  advertising->addServiceUUID(BLE_SERVICE_UUID);
-  advertising->setScanResponse(true);
+  configureAdvertisingPayload(advertising, deviceName);
   advertising->start();
 
   appLogPrintf("BLE service started as %s\n", deviceName.c_str());
   g_bleStarted = true;
 }
 
+void appRefreshBleAdvertising() {
+  if (!g_bleStarted) return;
+
+  String deviceName = buildAdvertisedName();
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  if (!advertising) return;
+
+  advertising->stop();
+  configureAdvertisingPayload(advertising, deviceName);
+  advertising->start();
+  appLogPrintf("BLE advertising refreshed as %s\n", deviceName.c_str());
+}
+
 void appBleLoop() {
   if (!g_bleStarted) return;
+
+  PendingBleWrite pendingWrite;
+  if (takePendingBleWrite(pendingWrite)) {
+    String value(pendingWrite.value);
+    if (pendingWrite.isReboot) {
+      appLogPrintf("BLE reboot write: value=%s\n", value.c_str());
+      value.toLowerCase();
+      if (value != "1" && value != "reboot" && value != "restart") {
+        appLogLine("BLE reboot rejected");
+        setResult("Write '1' or 'reboot' to restart");
+      } else {
+        appLogLine("BLE reboot requested");
+        setResult("Reboot scheduled");
+        appWifiManager().scheduleRestart(500);
+      }
+    } else {
+      String message;
+      appLogPrintf("BLE config write: field=%s value=%s\n",
+                   configFieldName(pendingWrite.field),
+                   configValuePreview(pendingWrite.field, value).c_str());
+      if (!applyConfigField(pendingWrite.field, value, message)) {
+        appLogPrintf("BLE config rejected: field=%s reason=%s\n",
+                     configFieldName(pendingWrite.field),
+                     message.c_str());
+        setResult(message);
+        refreshConfigCharacteristics();
+      } else {
+        refreshConfigCharacteristics();
+        appLogPrintf("BLE config accepted: field=%s result=%s\n",
+                     configFieldName(pendingWrite.field),
+                     message.c_str());
+        appLogLine(message.c_str());
+        setResult(message);
+      }
+    }
+  }
 
   uint32_t now = millis();
   if (!g_statusRefreshPending && (now - g_lastStatusRefreshMs) < BLE_STATUS_REFRESH_MS) return;

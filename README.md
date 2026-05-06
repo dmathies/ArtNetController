@@ -162,6 +162,12 @@ Build filesystem image:
 pio run -e seeed_xiao_esp32s3 --target buildfs
 ```
 
+Build a combined OTA bundle:
+
+```powershell
+pio run -e seeed_xiao_esp32s3 --target buildota
+```
+
 Upload filesystem image:
 
 ```powershell
@@ -195,6 +201,7 @@ API endpoints:
 - `GET /update`
 - `POST /update`
 - `POST /updatefs`
+- `POST /updatebundle`
 - `GET /ws` - WebSocket status stream
 
 If stored Wi-Fi credentials are missing or connection fails, the device starts a management access point:
@@ -228,7 +235,7 @@ Shared runtime services in `src/main.cpp` provide:
 - Wi-Fi reconnect handling
 - HTTP file serving from LittleFS
 - WebSocket status broadcasting
-- OTA firmware and filesystem upload handlers
+- OTA firmware, filesystem, and combined bundle upload handlers
 - health and task runtime reporting
 
 The dashboard displays items such as:
@@ -244,10 +251,13 @@ The dashboard displays items such as:
 
 The built-in OTA page accepts:
 
+- combined firmware + filesystem bundle upload via `POST /updatebundle`
 - firmware image upload to the active OTA slot via `POST /update`
 - filesystem image upload to the LittleFS partition via `POST /updatefs`
 
-The web page currently refers to the filesystem image as `spiffs.bin`, but the project is configured to use `LittleFS`. Build and upload the filesystem image using the PlatformIO filesystem targets for the selected environment.
+The recommended one-file OTA artifact is `.pio/build/<env>/ota_bundle.ota`. It is generated from the firmware image plus the LittleFS image and can be uploaded from the Combined tab on `/ota.html`.
+
+`pio run -e <env> --target buildota` builds the firmware, builds the filesystem image, and writes the combined bundle. The same bundle is also refreshed automatically whenever both `firmware.bin` and `littlefs.bin` exist in the build directory.
 
 ## Notes For Development
 

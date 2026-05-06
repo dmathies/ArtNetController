@@ -76,7 +76,6 @@ struct StatusSnapshot {
 };
 
 struct CachedDiagnostics {
-  float boardTempC = NAN;
   int32_t controlTaskStackHwm = -1;
   int32_t motorTaskStackHwm = -1;
   int32_t webTaskStackHwm = -1;
@@ -435,7 +434,6 @@ static void refreshStatusDiagnosticsIfDue(uint32_t nowMs) {
 
   CachedDiagnostics diagnostics;
   TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
-  diagnostics.boardTempC = appReadBoardTemperatureC();
   if (controlTaskHandle) {
     diagnostics.controlTaskState = taskStateToString(eTaskGetState(controlTaskHandle));
     diagnostics.controlTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
@@ -494,6 +492,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
   WifiManagerClass& wifiManager = appWifiManager();
   CachedDiagnostics diagnostics = readCachedDiagnostics();
+  AppSlowStatusMetrics slowMetrics = appGetSlowStatusMetrics();
   IPAddress ip = wifiManager.getIP();
   char ipBuf[16];
   char macBuf[18];
@@ -508,10 +507,10 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["hostname"] = wifiManager.getHostnameCStr();
   j["wifi_ip"] = ipBuf;
   j["wifi_mac"] = macBuf;
-  j["free_heap"] = ESP.getFreeHeap();
-  j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["board_temp_c"] = diagnostics.boardTempC;
-  j["reset_reason"] = appResetReasonToString(esp_reset_reason());
+  j["free_heap"] = slowMetrics.freeHeap;
+  j["min_free_heap"] = slowMetrics.minFreeHeap;
+  j["board_temp_c"] = slowMetrics.boardTempC;
+  j["reset_reason"] = slowMetrics.resetReason;
   j["task_control_state"] = diagnostics.controlTaskState;
   j["task_control_stack_hwm"] = diagnostics.controlTaskStackHwm;
   j["task_control_last_ms_ago"] = (s.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.controlTaskLastLoopMs);

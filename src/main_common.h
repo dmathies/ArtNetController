@@ -27,6 +27,13 @@ struct AppTaskRuntimeStats {
   uint16_t utilPermille = 0;
 };
 
+struct AppSlowStatusMetrics {
+  float boardTempC = NAN;
+  uint32_t freeHeap = 0;
+  uint32_t minFreeHeap = 0;
+  const char* resetReason = "unknown";
+};
+
 Configuration& appConfig();
 WifiManagerClass& appWifiManager();
 size_t appBuildStatusJson(char* out, size_t outSize, bool details);
@@ -37,6 +44,7 @@ void appMarkArtnetActivity();
 uint32_t appGetLastArtnetMs();
 TaskHandle_t appGetWebServerTaskHandle();
 AppTaskRuntimeStats appGetWebTaskRuntimeStats();
+AppSlowStatusMetrics appGetSlowStatusMetrics();
 
 const char* appResetReasonToString(esp_reset_reason_t reason);
 float appReadBoardTemperatureC();
