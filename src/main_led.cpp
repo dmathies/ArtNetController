@@ -360,6 +360,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   wifiManager.getMacAddress(macBuf, sizeof(macBuf));
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
+  j["variant"] = "led";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
   j["wifi_rssi"] = wifiManager.getRSSI();
   j["hostname"] = wifiManager.getHostnameCStr();
@@ -458,7 +459,7 @@ void setup() {
   applyStartValue(g_cfg.startValue);
 
   appInitRuntime({
-    "/wifi-manager/index_led.html",
+    "/wifi-manager/index.html",
     "CableCar LED",
     buildStatusJson,
     buildHealthSummary,

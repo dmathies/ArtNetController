@@ -756,11 +756,28 @@
         statusDiv.style.display = 'block';
       }
 
+      function formatVariantLabel(variant, device) {
+        const key = typeof variant === 'string' ? variant.toLowerCase() : '';
+        if (key === 'bldc') return 'BLDC';
+        if (key === 'relay') return 'Relay';
+        if (key === 'led') return 'LED';
+        return device || 'Unknown';
+      }
+
       // Get OTA info on page load
       window.addEventListener('load', async () => {
         try {
           const response = await fetch('/update');
           const data = await response.json();
+          const variantLabel = formatVariantLabel(data.variant, data.device);
+          const variantEl = document.getElementById('deviceVariant');
+          const variantHintEl = document.getElementById('variantPathHint');
+          if (variantEl) variantEl.textContent = variantLabel;
+          if (variantHintEl) {
+            variantHintEl.textContent = data.variant
+              ? `.pio/build/<env-for-${data.variant}>/`
+              : '.pio/build/<your-environment>/';
+          }
           console.log('Device Info:', data);
         } catch (error) {
           console.log('Could not fetch device info');
@@ -812,6 +829,7 @@
       <section class="card">
         <div class="card-inner">
           <h2 class="card-title">Update Packages</h2>
+          <p class="subtitle" style="margin-top:8px;">Current device variant: <strong id="deviceVariant">Detecting...</strong></p>
 
           <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('bundle', this)">Combined</button>
@@ -827,7 +845,7 @@
             <div class="form-group">
               <label class="form-label" for="bundle-file">Select combined OTA bundle</label>
               <input type="file" id="bundle-file" accept=".ota,.bin" />
-              <small class="muted" style="display:block;margin-top:8px;">Recommended: <code>.pio/build/seeed_xiao_esp32s3/ota_bundle.ota</code></small>
+              <small class="muted" style="display:block;margin-top:8px;">Recommended: <code id="variantPathHint">.pio/build/&lt;your-environment&gt;/</code><code>ota_bundle.ota</code></small>
             </div>
 
             <button class="btn btn-primary upload-btn" onclick="uploadBundle()">Upload Firmware + Filesystem</button>
@@ -848,7 +866,7 @@
             <div class="form-group">
               <label class="form-label" for="firmware-file">Select firmware file</label>
               <input type="file" id="firmware-file" accept=".bin" />
-              <small class="muted" style="display:block;margin-top:8px;">Expected: <code>.pio/build/seeed_xiao_esp32s3/firmware.bin</code></small>
+              <small class="muted" style="display:block;margin-top:8px;">Expected: <code>.pio/build/&lt;your-environment&gt;/firmware.bin</code></small>
             </div>
 
             <button class="btn btn-primary upload-btn" onclick="uploadFirmware()">Upload Firmware</button>
@@ -869,7 +887,7 @@
             <div class="form-group">
               <label class="form-label" for="spiffs-file">Select filesystem image</label>
               <input type="file" id="spiffs-file" accept=".bin" />
-              <small class="muted" style="display:block;margin-top:8px;">Build with <code>pio run --target buildfs</code> then use <code>.pio/build/seeed_xiao_esp32s3/littlefs.bin</code></small>
+              <small class="muted" style="display:block;margin-top:8px;">Build with <code>pio run -e &lt;your-environment&gt; --target buildfs</code> then use <code>.pio/build/&lt;your-environment&gt;/littlefs.bin</code></small>
             </div>
 
             <button class="btn btn-primary upload-btn" onclick="uploadSPIFFS()">Upload Filesystem</button>

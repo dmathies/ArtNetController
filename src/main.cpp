@@ -233,6 +233,13 @@ static void refreshSlowStatusMetricsIfDue(uint32_t nowMs) {
 }
 const char* appGetDeviceName() { return g_hooks.deviceName ? g_hooks.deviceName : "CableCar"; }
 
+static const char* appGetVariantName() {
+  const char* deviceName = appGetDeviceName();
+  if (strstr(deviceName, "Relay") != nullptr) return "relay";
+  if (strstr(deviceName, "LED") != nullptr) return "led";
+  return "bldc";
+}
+
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
   ArtDmxPacket r;
   if (len < 18) return r;
@@ -1246,6 +1253,7 @@ static esp_err_t updateInfoHandler(httpd_req_t* req) {
   StaticJsonDocument<128> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
   doc["ota_ready"] = true;
 
   char out[128];
@@ -1603,6 +1611,7 @@ static void asyncSendFsFile(AsyncWebServerRequest* request, const char* path, co
 
   AsyncWebServerResponse* response = request->beginResponse(LittleFS, resolvedPath, contentType);
   asyncAddCommonHeaders(response);
+  response->addHeader("Cache-Control", "no-store");
   if (servingGzip) {
     response->addHeader("Content-Encoding", "gzip");
     response->addHeader("Vary", "Accept-Encoding");
@@ -1880,6 +1889,8 @@ static void asyncUpdateInfoHandler(AsyncWebServerRequest* request) {
   StaticJsonDocument<128> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
+  doc["index_page"] = g_hooks.indexPagePath;
   doc["ota_ready"] = true;
   doc["bundle_ready"] = true;
   String out;
@@ -2306,6 +2317,7 @@ static void webUpdateInfoHandler() {
   StaticJsonDocument<128> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
   doc["ota_ready"] = true;
   String out;
   serializeJson(doc, out);
@@ -2540,7 +2552,6 @@ void appStartWebServices() {
 
 #if FS_BENCHMARK_LOG_ENABLE
   logFileReadPerf("/wifi-manager/index.html");
-  logFileReadPerf("/wifi-manager/index_led.html");
   logFileReadPerf("/wifi-manager/settings.html");
   logFileReadPerf("/wifi-manager/ota.html");
 #endif

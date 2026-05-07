@@ -366,6 +366,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   wifiManager.getMacAddress(macBuf, sizeof(macBuf));
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
+  j["variant"] = "relay";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
   j["relay_value"] = snapshot.dmxValue;
   j["relay_on"] = snapshot.relayOn;
@@ -458,7 +459,7 @@ void setup() {
   applyStartValue(g_cfg.startValue);
 
   appInitRuntime({
-    "/wifi-manager/index_relay.html",
+    "/wifi-manager/index.html",
     "CableCar Relay",
     buildStatusJson,
     buildHealthSummary,

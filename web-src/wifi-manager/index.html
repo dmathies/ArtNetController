@@ -387,6 +387,9 @@
         font-weight: 700;
         color: var(--text);
       }
+      .hidden {
+        display: none !important;
+      }
       @media (max-width: 920px) {
         .row-split { grid-template-columns: 1fr; }
       }
@@ -495,8 +498,19 @@
         document.title = title;
       }
 
+      function formatVariantLabel(variant) {
+        if (variant === 'bldc') return 'BLDC';
+        if (variant === 'relay') return 'Relay';
+        if (variant === 'led') return 'LED';
+        return 'Unknown';
+      }
+
       function formatTaskAge(msAgo) {
         return isFinite(msAgo) && msAgo >= 0 ? `${Math.round(msAgo)} ms` : '-';
+      }
+
+      function formatPresenceAge(msAgo) {
+        return isFinite(msAgo) && msAgo >= 0 ? `${Math.round(msAgo)} ms ago` : 'No status frames yet';
       }
 
       function formatTaskState(state) {
@@ -509,30 +523,120 @@
         return '-';
       }
 
+      function applyTask(prefix, state, stackHwm, lastMsAgo, utilPct) {
+        setText(`${prefix}State`, formatTaskState(state));
+        setText(`${prefix}Stack`, isFinite(stackHwm) ? `${Math.round(stackHwm)} words` : '-');
+        setText(`${prefix}Last`, formatTaskAge(lastMsAgo));
+        setText(`${prefix}Util`, isFinite(utilPct) ? `${utilPct.toFixed(1)}%` : '-');
+      }
+
+      const VARIANT_META = {
+        bldc: {
+          subtitle: 'Single-channel Art-Net motor controller',
+          outputTitle: 'Motor Output',
+          tasksColumns: 'repeat(3, minmax(0, 1fr))'
+        },
+        relay: {
+          subtitle: 'Single-channel Art-Net relay controller',
+          outputTitle: 'Relay Output',
+          tasksColumns: 'repeat(2, minmax(0, 1fr))'
+        },
+        led: {
+          subtitle: 'Embedded lighting controller',
+          outputTitle: 'LED Output',
+          tasksColumns: 'repeat(2, minmax(0, 1fr))'
+        }
+      };
+
+      let activeVariant = null;
+
+      function detectVariant(s) {
+        if (typeof s.variant === 'string' && s.variant.length) {
+          return s.variant.toLowerCase();
+        }
+        if (typeof s.motor_value !== 'undefined' || typeof s.motor_step !== 'undefined' || typeof s.task_motor_state !== 'undefined') {
+          return 'bldc';
+        }
+        if (typeof s.relay_value !== 'undefined' || typeof s.relay_on !== 'undefined') {
+          return 'relay';
+        }
+        if (typeof s.led_value0 !== 'undefined' || typeof s.led_value1 !== 'undefined' || typeof s.led_value2 !== 'undefined' || typeof s.led_value3 !== 'undefined') {
+          return 'led';
+        }
+        return 'bldc';
+      }
+
+      function setVisible(id, visible) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.classList.toggle('hidden', !visible);
+      }
+
+      function applyVariantLayout(variant) {
+        if (activeVariant === variant) return;
+        activeVariant = variant;
+        const meta = VARIANT_META[variant] || VARIANT_META.bldc;
+        setText('dashboardSubtitle', meta.subtitle);
+        setText('outputTitle', meta.outputTitle);
+        setText('variantBadge', `Variant ${formatVariantLabel(variant)}`);
+        setVisible('motorOutputPanel', variant === 'bldc');
+        setVisible('relayOutputPanel', variant === 'relay');
+        setVisible('ledOutputPanel', variant === 'led');
+        setVisible('motorTaskMeta', variant === 'bldc');
+        const tasksGrid = document.getElementById('tasksGrid');
+        if (tasksGrid) tasksGrid.style.gridTemplateColumns = meta.tasksColumns;
+      }
+
+      async function seedVariantFromUpdateInfo() {
+        try {
+          const res = await fetch('/update', { cache: 'no-store' });
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data && typeof data.variant === 'string' && data.variant.length) {
+            applyVariantLayout(data.variant.toLowerCase());
+          }
+          if (data && typeof data.device === 'string' && data.device.length) {
+            updateDashboardTitle(data.device);
+          }
+        } catch (e) {
+        }
+      }
+
       let statusSocket = null;
       let wsConnected = false;
       let wsReconnectTimer = null;
       let statusPollInFlight = false;
       let statusPollTimer = null;
       let lastStatusUpdateMs = 0;
-      const STATUS_POLL_ACTIVE_MS = 200;
+      const STATUS_POLL_ACTIVE_MS = 500;
       const STATUS_POLL_HIDDEN_MS = 2000;
       const STATUS_FETCH_TIMEOUT_MS = 1500;
       const STATUS_WS_STALE_MS = 4000;
 
       function applyStatus(s) {
         lastStatusUpdateMs = Date.now();
+        const variant = detectVariant(s);
+        applyVariantLayout(variant);
+
+        const motorValue = Number(s.motor_value ?? NaN);
+        const controllerPowerOn = Boolean(s.controller_power_on);
+        const controllerLastStatusMsAgo = Number(s.controller_last_status_ms_ago ?? NaN);
+        setText('motorValue', isFinite(motorValue) ? String(Math.round(motorValue) / 10.0) : '-');
+        setText('controllerPowerState', controllerPowerOn ? 'On' : 'Off');
+        setText('controllerLastStatus', formatPresenceAge(controllerLastStatusMsAgo));
+        setText('relayState', Boolean(s.relay_on) ? 'On' : 'Off');
+        setText('relayValue', isFinite(Number(s.relay_value ?? NaN)) ? String(Math.round(Number(s.relay_value))) : '-');
         for (let i = 0; i < 4; i++) {
           const raw = s['led_value' + i];
           const valueEl = document.getElementById('led-val-' + i);
           const fillEl = document.getElementById('led-fill-' + i);
-          if (typeof raw !== 'undefined') {
-            const num = Number(raw);
-            const clamped = isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;
-            if (valueEl) valueEl.innerText = isFinite(num) ? num.toFixed(3) : String(raw);
-            if (fillEl) fillEl.style.width = (clamped * 100).toFixed(1) + '%';
-          }
+          if (!valueEl || !fillEl) continue;
+          const num = Number(raw);
+          const clamped = isFinite(num) ? Math.max(0, Math.min(1, num)) : 0;
+          valueEl.innerText = isFinite(num) ? num.toFixed(3) : '-';
+          fillEl.style.width = (clamped * 100).toFixed(1) + '%';
         }
+
         const art = Number(s.art_age_ms ?? NaN);
         const wifiRssi = Number(s.wifi_rssi ?? NaN);
         const wifiIp = typeof s.wifi_ip === 'string' && s.wifi_ip.length ? s.wifi_ip : '-';
@@ -552,15 +656,28 @@
         document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
         document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
         document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
-        document.getElementById('boardTemp').innerText = isFinite(boardTempC) ? `${boardTempC.toFixed(1)} °C` : '-';
-        setText('controlTaskState', formatTaskState(s.task_control_state));
-        setText('controlTaskStack', isFinite(Number(s.task_control_stack_hwm ?? NaN)) ? `${Math.round(Number(s.task_control_stack_hwm))} words` : '-');
-        setText('controlTaskLast', formatTaskAge(Number(s.task_control_last_ms_ago ?? NaN)));
-        setText('controlTaskUtil', isFinite(Number(s.task_control_util_pct ?? NaN)) ? `${Number(s.task_control_util_pct).toFixed(1)}%` : '-');
-        setText('webTaskState', formatTaskState(s.task_web_state));
-        setText('webTaskStack', isFinite(Number(s.task_web_stack_hwm ?? NaN)) ? `${Math.round(Number(s.task_web_stack_hwm))} words` : '-');
-        setText('webTaskLast', formatTaskAge(Number(s.task_web_last_ms_ago ?? NaN)));
-        setText('webTaskUtil', isFinite(Number(s.task_web_util_pct ?? NaN)) ? `${Number(s.task_web_util_pct).toFixed(1)}%` : '-');
+        document.getElementById('boardTemp').innerText = isFinite(boardTempC) ? `${boardTempC.toFixed(1)} deg C` : '-';
+        applyTask(
+          'controlTask',
+          s.task_control_state,
+          Number(s.task_control_stack_hwm ?? NaN),
+          Number(s.task_control_last_ms_ago ?? NaN),
+          Number(s.task_control_util_pct ?? NaN)
+        );
+        applyTask(
+          'motorTask',
+          s.task_motor_state,
+          Number(s.task_motor_stack_hwm ?? NaN),
+          Number(s.task_motor_last_ms_ago ?? NaN),
+          Number(s.task_motor_util_pct ?? NaN)
+        );
+        applyTask(
+          'webTask',
+          s.task_web_state,
+          Number(s.task_web_stack_hwm ?? NaN),
+          Number(s.task_web_last_ms_ago ?? NaN),
+          Number(s.task_web_util_pct ?? NaN)
+        );
       }
 
       function scheduleNextStatusPoll(delayMs) {
@@ -643,6 +760,7 @@
 
       document.addEventListener('DOMContentLoaded', () => {
         initThemePicker();
+        seedVariantFromUpdateInfo();
         connectStatusWebSocket();
         pollStatus();
       });
@@ -670,7 +788,7 @@
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
           <h1 id="dashboardTitle">Cablecar Dashboard</h1>
-          <p class="subtitle">Embedded lighting controller</p>
+          <p id="dashboardSubtitle" class="subtitle">Waiting for device status...</p>
         </div>
       </div>
       <div class="toolbar">
@@ -696,6 +814,7 @@
                 <h2 class="card-title">Status</h2>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <span class="status-badge"><span class="dot"></span><span id="variantBadge">Variant Detecting...</span></span>
                 <span class="status-badge"><span class="dot"></span><span id="artBadge">Waiting</span></span>
                 <span class="status-badge"><span class="dot"></span><span id="wsBadge">Connecting</span></span>
               </div>
@@ -712,8 +831,30 @@
 
         <article class="card">
           <div class="card-inner">
-            <h2 class="card-title">LED Output</h2>
-            <div class="status-grid" style="margin-top:16px;">
+            <h2 id="outputTitle" class="card-title">Variant Output</h2>
+            <div id="motorOutputPanel" class="meta-grid hidden" style="margin-top:16px;grid-template-columns:1fr;">
+              <div class="meta">
+                <span class="label">Output Value</span>
+                <div id="motorValue" class="value mono">0</div>
+              </div>
+              <div class="meta">
+                <span class="label">Controller Power</span>
+                <div id="controllerPowerState" class="value mono">Off</div>
+                <div id="controllerLastStatus" class="rssi-note">No status frames yet</div>
+              </div>
+            </div>
+            <div id="relayOutputPanel" class="meta-grid hidden" style="margin-top:16px;grid-template-columns:1fr;">
+              <div class="meta">
+                <span class="label">Output State</span>
+                <div id="relayState" class="value mono">Off</div>
+              </div>
+              <div class="meta">
+                <span class="label">DMX Value</span>
+                <div id="relayValue" class="value mono">0</div>
+                <div class="rssi-note">Minimum switch interval 500 ms</div>
+              </div>
+            </div>
+            <div id="ledOutputPanel" class="status-grid hidden" style="margin-top:16px;">
               <div class="status-row"><div class="label">LED 0</div><div class="meter"><div id="led-fill-0" class="meter-fill"></div></div><div id="led-val-0" class="meter-value mono">0.000</div></div>
               <div class="status-row"><div class="label">LED 1</div><div class="meter"><div id="led-fill-1" class="meter-fill"></div></div><div id="led-val-1" class="meter-value mono">0.000</div></div>
               <div class="status-row"><div class="label">LED 2</div><div class="meter"><div id="led-fill-2" class="meter-fill"></div></div><div id="led-val-2" class="meter-value mono">0.000</div></div>
@@ -738,8 +879,9 @@
         <article class="card">
           <div class="card-inner">
             <h2 class="card-title">Tasks</h2>
-            <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(2, minmax(0, 1fr));">
+            <div id="tasksGrid" class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
               <div class="meta"><span class="label">Art-Net Task</span><div id="controlTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="controlTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="controlTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="controlTaskStack" class="mono">-</span></div></div>
+              <div id="motorTaskMeta" class="meta"><span class="label">BLDC UART Task</span><div id="motorTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="motorTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="motorTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="motorTaskStack" class="mono">-</span></div></div>
               <div class="meta"><span class="label">Web Task</span><div id="webTaskState" class="task-state">-</div><div class="rssi-note">Load <span id="webTaskUtil" class="mono">-</span></div><div class="rssi-note">Last loop <span id="webTaskLast" class="mono">-</span></div><div class="rssi-note">Stack HWM <span id="webTaskStack" class="mono">-</span></div></div>
             </div>
           </div>

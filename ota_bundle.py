@@ -1,7 +1,8 @@
 from pathlib import Path
 import struct
+import subprocess
 
-from SCons.Script import DefaultEnvironment
+from SCons.Script import AlwaysBuild, DefaultEnvironment
 
 
 env = DefaultEnvironment()
@@ -63,19 +64,61 @@ def build_ota_bundle(*_args, **_kwargs):
     )
 
 
+def build_ota_target(*_args, **_kwargs):
+    # Force both artifacts to be rebuilt when users invoke `-t buildota`,
+    # so filesystem-only UI changes are always included in the final bundle.
+    python_exe = env.subst("$PYTHONEXE")
+    project_dir = env.subst("$PROJECT_DIR")
+    pio_env = env.subst("$PIOENV")
+
+    subprocess.check_call(
+        [python_exe, "-m", "platformio", "run", "-d", project_dir, "-e", pio_env],
+        cwd=project_dir,
+    )
+    subprocess.check_call(
+        [python_exe, "-m", "platformio", "run", "-d", project_dir, "-e", pio_env, "-t", "buildfs"],
+        cwd=project_dir,
+    )
+    build_ota_bundle()
+
+
 firmware_target = env.subst("$BUILD_DIR/${PROGNAME}.bin")
 fs_image_target = env.DataToBin(
     env.subst("$BUILD_DIR/${ESP32_FS_IMAGE_NAME}"),
     env.subst("$PROJECT_DATA_DIR"),
 )
 env.NoCache(fs_image_target)
+AlwaysBuild(fs_image_target)
 
 env.AddPostAction(firmware_target, build_ota_bundle)
 env.AddPostAction(fs_image_target, build_ota_bundle)
 env.AddCustomTarget(
     name="buildota",
-    dependencies=[firmware_target, fs_image_target],
-    actions=[build_ota_bundle],
+    dependencies=None,
+    actions=[build_ota_target],
     title="Build OTA bundle",
     description="Create a combined firmware + LittleFS OTA bundle",
 )
+
+
+def build_all_ota_bundles(*_args, **_kwargs):
+    python_exe = env.subst("$PYTHONEXE")
+    project_dir = env.subst("$PROJECT_DIR")
+    command = (
+        f'"{python_exe}" -m platformio run '
+        f'-e seeed_xiao_esp32s3 '
+        f'-e seeed_xiao_esp32s3_led '
+        f'-e seeed_xiao_esp32s3_relay '
+        f'-t buildota'
+    )
+    env.Execute(command)
+
+
+if env.subst("$PIOENV") == "seeed_xiao_esp32s3":
+    env.AddCustomTarget(
+        name="buildota-all",
+        dependencies=None,
+        actions=[build_all_ota_bundles],
+        title="Build all OTA bundles",
+        description="Create combined OTA bundles for BLDC, LED, and relay variants",
+    )
