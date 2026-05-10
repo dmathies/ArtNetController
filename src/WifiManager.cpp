@@ -2,6 +2,10 @@
 
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+
+#ifndef APP_MDNS_ENABLE
+#define APP_MDNS_ENABLE 1
+#endif
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_wifi.h>
@@ -335,6 +339,7 @@ bool WifiManagerClass::connectToWifi() {
 		Serial.println("Setting hostname " + _hostname);
 		appLogPrintf("Setting hostname %s\n", _hostname.c_str());
 
+#if APP_MDNS_ENABLE
 		if (MDNS.begin(_hostname.c_str())) {
 			Serial.println("mDNS responder started");
 			appLogLine("mDNS responder started");
@@ -342,6 +347,10 @@ bool WifiManagerClass::connectToWifi() {
 			Serial.println("Unable to start mDNS responder");
 			appLogLine("Unable to start mDNS responder");
 		}
+#else
+		Serial.println("mDNS responder disabled");
+		appLogLine("mDNS responder disabled");
+#endif
 	} else {
 		Serial.println("No hostname configured");
 		appLogLine("No hostname configured");

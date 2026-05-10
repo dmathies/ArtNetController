@@ -94,3 +94,40 @@ String appLogGetTail(size_t maxBytes) {
   portEXIT_CRITICAL(&g_logMux);
   return out;
 }
+
+size_t appLogCopyLastLine(char* out, size_t outSize, size_t maxBytes) {
+  if (!out || outSize == 0) return 0;
+  out[0] = '\0';
+
+  portENTER_CRITICAL(&g_logMux);
+  const char* src = g_lastLine.c_str();
+  size_t srcLen = src ? strlen(src) : 0;
+  if (maxBytes > 0 && srcLen > maxBytes) srcLen = maxBytes;
+  size_t copyLen = (srcLen < (outSize - 1)) ? srcLen : (outSize - 1);
+  if (copyLen > 0 && src) {
+    memcpy(out, src + (srcLen - copyLen), copyLen);
+  }
+  out[copyLen] = '\0';
+  portEXIT_CRITICAL(&g_logMux);
+  return copyLen;
+}
+
+size_t appLogCopyTail(char* out, size_t outSize, size_t maxBytes) {
+  if (!out || outSize == 0) return 0;
+  if (maxBytes == 0) {
+    out[0] = '\0';
+    return 0;
+  }
+
+  portENTER_CRITICAL(&g_logMux);
+  size_t count = g_logSize;
+  if (count > maxBytes) count = maxBytes;
+  if (count > (outSize - 1)) count = outSize - 1;
+  size_t start = (g_logHead + LOG_BUFFER_SIZE - count) % LOG_BUFFER_SIZE;
+  for (size_t i = 0; i < count; ++i) {
+    out[i] = g_logBuffer[(start + i) % LOG_BUFFER_SIZE];
+  }
+  out[count] = '\0';
+  portEXIT_CRITICAL(&g_logMux);
+  return count;
+}

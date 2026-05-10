@@ -598,12 +598,24 @@
           if (data && typeof data.device === 'string' && data.device.length) {
             updateDashboardTitle(data.device);
           }
+          if (data && typeof data.ws_ready !== 'undefined') {
+            wsSupported = Boolean(data.ws_ready);
+            if (!wsSupported) {
+              wsConnected = false;
+              if (statusSocket) {
+                try { statusSocket.close(); } catch (e) {}
+                statusSocket = null;
+              }
+              setText('wsBadge', 'Polling');
+            }
+          }
         } catch (e) {
         }
       }
 
       let statusSocket = null;
       let wsConnected = false;
+      let wsSupported = true;
       let wsReconnectTimer = null;
       let statusPollInFlight = false;
       let statusPollTimer = null;
@@ -643,6 +655,7 @@
         const wifiMac = typeof s.wifi_mac === 'string' && s.wifi_mac.length ? s.wifi_mac : '-';
         const freeHeap = Number(s.free_heap ?? NaN);
         const minFreeHeap = Number(s.min_free_heap ?? NaN);
+        const largestFreeBlock = Number(s.largest_free_block ?? NaN);
         const boardTempC = Number(s.board_temp_c ?? NaN);
         const rssiInfo = getRssiInfo(wifiRssi);
         updateDashboardTitle(s.hostname);
@@ -656,6 +669,7 @@
         document.getElementById('wifiRssiQuality').innerText = rssiInfo.label;
         document.getElementById('freeHeap').innerText = isFinite(freeHeap) ? `${Math.round(freeHeap / 1024)} KB` : '-';
         document.getElementById('minFreeHeap').innerText = isFinite(minFreeHeap) ? `${Math.round(minFreeHeap / 1024)} KB` : '-';
+        document.getElementById('largestFreeBlock').innerText = isFinite(largestFreeBlock) ? `${Math.round(largestFreeBlock / 1024)} KB` : '-';
         document.getElementById('boardTemp').innerText = isFinite(boardTempC) ? `${boardTempC.toFixed(1)} deg C` : '-';
         applyTask(
           'controlTask',
@@ -686,6 +700,15 @@
       }
 
       function connectStatusWebSocket() {
+        if (!wsSupported) {
+          wsConnected = false;
+          if (statusSocket) {
+            try { statusSocket.close(); } catch (e) {}
+            statusSocket = null;
+          }
+          setText('wsBadge', 'Polling');
+          return;
+        }
         if (statusSocket) {
           try { statusSocket.close(); } catch (e) {}
           statusSocket = null;
@@ -871,7 +894,7 @@
             <div class="meta-grid" style="margin-top:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
               <div class="meta"><span class="label">Wi-Fi RSSI</span><div id="wifiRssi" class="value mono">-</div><div class="rssi-wrap"><div class="rssi-bar"><div id="wifiRssiMarker" class="rssi-marker"></div></div><div class="rssi-scale"><span>Weak</span><span>Fair</span><span>Good</span></div><div id="wifiRssiQuality" class="rssi-note">Unknown</div></div></div>
               <div class="meta" style="--kv-label-width:56px;"><span class="label">Network</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">IP</span><span id="wifiIp" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MAC</span><span id="wifiMac" class="kv-val mono">-</span></div></div></div>
-              <div class="meta" style="--kv-label-width:56px;"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MCU</span><span id="boardTemp" class="kv-val mono">-</span></div></div></div>
+              <div class="meta" style="--kv-label-width:56px;"><span class="label">Memory</span><div class="kv-pairs"><div class="kv-row"><span class="kv-key">Free</span><span id="freeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Min</span><span id="minFreeHeap" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">Block</span><span id="largestFreeBlock" class="kv-val mono">-</span></div><div class="kv-row"><span class="kv-key">MCU</span><span id="boardTemp" class="kv-val mono">-</span></div></div></div>
             </div>
           </div>
         </article>

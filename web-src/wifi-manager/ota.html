@@ -419,6 +419,7 @@
       }
 
       document.addEventListener('DOMContentLoaded', initThemePicker);
+      let otaTransport = 'raw';
 
 
       function switchTab(tab, btn) {
@@ -469,6 +470,7 @@
 
           xhr.upload.addEventListener('load', () => {
             uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
             showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
           });
 
@@ -497,10 +499,9 @@
           });
 
           xhr.addEventListener('error', () => {
-            if (uploadComplete && progressFill.style.width === '100%') {
+            if (uploadComplete) {
               showStatus(statusDiv, 'Success! Combined update uploaded. Device is restarting...', 'success');
-              progressText.textContent = '100%';
-              progressFill.style.width = '100%';
+              markUploadComplete(progressFill, progressText);
               setTimeout(() => {
                 window.location.href = '/';
               }, 5000);
@@ -525,9 +526,7 @@
 
           xhr.timeout = 180000;
 
-          xhr.open('POST', '/updatebundle');
-          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-          xhr.send(file);
+          sendUploadRequest(xhr, '/updatebundle', file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -573,6 +572,7 @@
 
           xhr.upload.addEventListener('load', () => {
             uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
             // Upload finished, now waiting for server response
             // Device will restart, so connection may drop
             showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
@@ -604,10 +604,9 @@
 
           xhr.addEventListener('error', () => {
             // If upload was complete and then connection lost, that's expected (device restarting)
-            if (uploadComplete && progressFill.style.width === '100%') {
+            if (uploadComplete) {
               showStatus(statusDiv, 'Success! Firmware updated. Device is restarting...', 'success');
-              progressText.textContent = '100%';
-              progressFill.style.width = '100%';
+              markUploadComplete(progressFill, progressText);
               setTimeout(() => {
                 window.location.href = '/';
               }, 5000);
@@ -632,9 +631,7 @@
 
           xhr.timeout = 180000;  // 3 minute timeout
           
-          xhr.open('POST', '/update');
-          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-          xhr.send(file);
+          sendUploadRequest(xhr, '/update', file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -680,6 +677,7 @@
 
           xhr.upload.addEventListener('load', () => {
             uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
             // Upload finished, now waiting for server response
             // Device will restart, so connection may drop
             showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
@@ -711,10 +709,9 @@
 
           xhr.addEventListener('error', () => {
             // If upload was complete and then connection lost, that's expected (device restarting)
-            if (uploadComplete && progressFill.style.width === '100%') {
+            if (uploadComplete) {
               showStatus(statusDiv, 'Success! Filesystem updated. Device is restarting...', 'success');
-              progressText.textContent = '100%';
-              progressFill.style.width = '100%';
+              markUploadComplete(progressFill, progressText);
               setTimeout(() => {
                 window.location.href = '/';
               }, 5000);
@@ -739,9 +736,7 @@
 
           xhr.timeout = 180000;  // 3 minute timeout
           
-          xhr.open('POST', '/updatefs');
-          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-          xhr.send(file);
+          sendUploadRequest(xhr, '/updatefs', file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -754,6 +749,23 @@
         statusDiv.textContent = message;
         statusDiv.className = 'status ' + type;
         statusDiv.style.display = 'block';
+      }
+
+      function markUploadComplete(progressFill, progressText) {
+        progressFill.style.width = '100%';
+        progressText.textContent = '100%';
+      }
+
+      function sendUploadRequest(xhr, url, file) {
+        xhr.open('POST', url);
+        if (otaTransport === 'multipart') {
+          const formData = new FormData();
+          formData.append('file', file, file.name);
+          xhr.send(formData);
+        } else {
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.send(file);
+        }
       }
 
       function formatVariantLabel(variant, device) {
@@ -777,6 +789,21 @@
             variantHintEl.textContent = data.variant
               ? `.pio/build/<env-for-${data.variant}>/`
               : '.pio/build/<your-environment>/';
+          }
+          if (data && typeof data.ota_transport === 'string' && data.ota_transport.length) {
+            otaTransport = data.ota_transport;
+          }
+          if (data && data.bundle_ready === false) {
+            const bundleTab = document.querySelector('.tab-btn[onclick*="bundle"]');
+            const bundlePanel = document.getElementById('bundle');
+            if (bundleTab) bundleTab.style.display = 'none';
+            if (bundlePanel && bundlePanel.classList.contains('active')) {
+              bundlePanel.classList.remove('active');
+              const firmwareTab = document.querySelector('.tab-btn[onclick*="firmware"]');
+              const firmwarePanel = document.getElementById('firmware');
+              if (firmwareTab) firmwareTab.classList.add('active');
+              if (firmwarePanel) firmwarePanel.classList.add('active');
+            }
           }
           console.log('Device Info:', data);
         } catch (error) {

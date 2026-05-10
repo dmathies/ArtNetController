@@ -1,5 +1,27 @@
 #include "BleManager.h"
 
+#ifndef APP_BLE_ENABLE
+#define APP_BLE_ENABLE 1
+#endif
+
+#ifndef APP_BLE_LOG_TAIL_BYTES
+#define APP_BLE_LOG_TAIL_BYTES 512
+#endif
+
+#ifndef APP_BLE_LAST_LOG_BYTES
+#define APP_BLE_LAST_LOG_BYTES 160
+#endif
+
+#ifndef APP_BLE_MTU
+#define APP_BLE_MTU 247
+#endif
+
+#ifndef APP_BLE_GATT_ENABLE
+#define APP_BLE_GATT_ENABLE 1
+#endif
+
+#if APP_BLE_ENABLE
+
 #include <ArduinoJson.h>
 #include <BLE2902.h>
 #include <BLEAdvertising.h>
@@ -33,7 +55,8 @@ constexpr char BLE_CHAR_DMX_ADDRESS_UUID[] = "8f2a201a-1e8e-4f4c-a8c0-6c5b7d0190
 constexpr char BLE_CHAR_DMX_UNIVERSE_UUID[] = "8f2a201b-1e8e-4f4c-a8c0-6c5b7d019000";
 
 constexpr uint32_t BLE_STATUS_REFRESH_MS = 1000;
-constexpr size_t BLE_LOG_TAIL_BYTES = 512;
+constexpr size_t BLE_LOG_TAIL_BYTES = APP_BLE_LOG_TAIL_BYTES;
+constexpr size_t BLE_LAST_LOG_BYTES = APP_BLE_LAST_LOG_BYTES;
 constexpr uint16_t BLE_ADV_INTERVAL_MIN = 0xA0;  // 100 ms
 constexpr uint16_t BLE_ADV_INTERVAL_MAX = 0xC0;  // 120 ms
 constexpr uint16_t BLE_SERVICE_HANDLE_COUNT = 64;
@@ -41,6 +64,7 @@ constexpr size_t BLE_PENDING_VALUE_MAX = 96;
 constexpr uint16_t BLE_MANUFACTURER_ID = 0xFFFF;
 constexpr uint8_t BLE_ADV_METADATA_VERSION = 1;
 constexpr uint8_t BLE_ADV_FLAG_IP_PRESENT = 0x01;
+constexpr size_t BLE_RSSI_TEXT_BYTES = 16;
 
 enum class ConfigField {
   Ssid,
@@ -122,8 +146,8 @@ bool g_bleStarted = false;
 bool g_bleClientConnected = false;
 uint32_t g_lastStatusRefreshMs = 0;
 bool g_statusRefreshPending = false;
-String g_lastNotifiedLogLine;
-String g_lastNotifiedRssi;
+char g_lastNotifiedLogLine[BLE_LAST_LOG_BYTES + 1] = {0};
+char g_lastNotifiedRssi[BLE_RSSI_TEXT_BYTES] = {0};
 portMUX_TYPE g_bleMux = portMUX_INITIALIZER_UNLOCKED;
 
 struct PendingBleWrite {
@@ -266,12 +290,20 @@ void configureAdvertisingPayload(BLEAdvertising* advertising, const String& devi
   BLEAdvertisementData advData;
   advData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
   advData.setManufacturerData(buildAdvertisingMetadata());
+#if APP_BLE_GATT_ENABLE
+  advertising->setAdvertisementType(ADV_TYPE_IND);
   advertising->setAdvertisementData(advData);
 
   BLEAdvertisementData scanResponseData;
   scanResponseData.setName(deviceName.c_str());
   advertising->setScanResponseData(scanResponseData);
   advertising->setScanResponse(true);
+#else
+  advertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+  advData.setName(deviceName.c_str());
+  advertising->setAdvertisementData(advData);
+  advertising->setScanResponse(false);
+#endif
 }
 
 void setResult(const String& message) {
@@ -314,25 +346,29 @@ void refreshStatusCharacteristics(bool notify) {
   char rssiBuf[16];
   snprintf(rssiBuf, sizeof(rssiBuf), "%d", (int)wifi.getRSSI());
 
-  String lastLog = appLogGetLastLine();
-  String logTail = appLogGetTail(BLE_LOG_TAIL_BYTES);
-  bool lastLogChanged = lastLog != g_lastNotifiedLogLine;
-  bool rssiChanged = String(rssiBuf) != g_lastNotifiedRssi;
+  char lastLogBuf[BLE_LAST_LOG_BYTES + 1];
+  char logTailBuf[BLE_LOG_TAIL_BYTES + 1];
+  appLogCopyLastLine(lastLogBuf, sizeof(lastLogBuf), BLE_LAST_LOG_BYTES);
+  appLogCopyTail(logTailBuf, sizeof(logTailBuf), BLE_LOG_TAIL_BYTES);
+  bool lastLogChanged = strcmp(lastLogBuf, g_lastNotifiedLogLine) != 0;
+  bool rssiChanged = strcmp(rssiBuf, g_lastNotifiedRssi) != 0;
 
   if (g_wifiIpChar) g_wifiIpChar->setValue(ipBuf);
   if (g_wifiMacChar) g_wifiMacChar->setValue(macBuf);
   if (g_wifiRssiChar) g_wifiRssiChar->setValue(rssiBuf);
-  if (g_lastLogChar) g_lastLogChar->setValue(lastLog.c_str());
-  if (g_logTailChar) g_logTailChar->setValue(logTail.c_str());
+  if (g_lastLogChar) g_lastLogChar->setValue(lastLogBuf);
+  if (g_logTailChar) g_logTailChar->setValue(logTailBuf);
 
   if (notify && g_bleClientConnected) {
     if (g_wifiRssiChar && rssiChanged) {
       g_wifiRssiChar->notify();
-      g_lastNotifiedRssi = rssiBuf;
+      strncpy(g_lastNotifiedRssi, rssiBuf, sizeof(g_lastNotifiedRssi) - 1);
+      g_lastNotifiedRssi[sizeof(g_lastNotifiedRssi) - 1] = '\0';
     }
     if (g_lastLogChar && lastLogChanged) {
       g_lastLogChar->notify();
-      g_lastNotifiedLogLine = lastLog;
+      strncpy(g_lastNotifiedLogLine, lastLogBuf, sizeof(g_lastNotifiedLogLine) - 1);
+      g_lastNotifiedLogLine[sizeof(g_lastNotifiedLogLine) - 1] = '\0';
     }
   }
 }
@@ -525,7 +561,16 @@ void appStartBleServices() {
 
   String deviceName = buildAdvertisedName();
   BLEDevice::init(deviceName.c_str());
-  BLEDevice::setMTU(247);
+  BLEDevice::setMTU(APP_BLE_MTU);
+
+#if !APP_BLE_GATT_ENABLE
+  BLEAdvertising* advertisingOnly = BLEDevice::getAdvertising();
+  configureAdvertisingPayload(advertisingOnly, deviceName);
+  advertisingOnly->start();
+  appLogPrintf("BLE advertising-only started as %s\n", deviceName.c_str());
+  g_bleStarted = true;
+  return;
+#endif
 
   g_server = BLEDevice::createServer();
   g_server->setCallbacks(new ServerCallbacks());
@@ -670,6 +715,10 @@ void appRefreshBleAdvertising() {
 void appBleLoop() {
   if (!g_bleStarted) return;
 
+#if !APP_BLE_GATT_ENABLE
+  return;
+#endif
+
   PendingBleWrite pendingWrite;
   if (takePendingBleWrite(pendingWrite)) {
     String value(pendingWrite.value);
@@ -707,9 +756,20 @@ void appBleLoop() {
   }
 
   uint32_t now = millis();
+  if (!g_bleClientConnected && !g_statusRefreshPending) return;
   if (!g_statusRefreshPending && (now - g_lastStatusRefreshMs) < BLE_STATUS_REFRESH_MS) return;
   g_lastStatusRefreshMs = now;
   bool notify = !g_statusRefreshPending;
   g_statusRefreshPending = false;
   refreshStatusCharacteristics(notify);
 }
+
+#else
+
+void appStartBleServices() {}
+
+void appRefreshBleAdvertising() {}
+
+void appBleLoop() {}
+
+#endif

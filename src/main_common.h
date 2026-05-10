@@ -31,6 +31,7 @@ struct AppSlowStatusMetrics {
   float boardTempC = NAN;
   uint32_t freeHeap = 0;
   uint32_t minFreeHeap = 0;
+  uint32_t largestFreeBlock = 0;
   const char* resetReason = "unknown";
 };
 

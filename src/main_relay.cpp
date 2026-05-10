@@ -378,6 +378,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["wifi_mac"] = macBuf;
   j["free_heap"] = slowMetrics.freeHeap;
   j["min_free_heap"] = slowMetrics.minFreeHeap;
+  j["largest_free_block"] = slowMetrics.largestFreeBlock;
   j["board_temp_c"] = slowMetrics.boardTempC;
   j["reset_reason"] = slowMetrics.resetReason;
   j["task_control_state"] = diagnostics.controlTaskState;
