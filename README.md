@@ -123,12 +123,48 @@ Important PlatformIO settings:
 - Build type: `debug`
 - Dependency:
   - `bblanchon/ArduinoJson@^6.21.3`
+  - `h2zero/NimBLE-Arduino`
 
 Partition layout:
 
 - `app0` OTA slot
 - `app1` OTA slot
 - `littlefs` data partition at `0x310000`, size `0x40000`
+
+### Important Build Flags
+
+The project uses a few non-default build flags in `platformio.ini` to tune behavior per board family:
+
+- `APP_ASYNC_WEB_ENABLE`
+  - `1` uses `ESPAsyncWebServer`
+  - `0` uses the lighter synchronous `WebServer`
+  - XIAO builds use async web; NodeMCU builds use sync web to reduce heap pressure
+
+- `WEB_SOCKET_ENABLE`
+  - enables the `/ws` status stream for the dashboard
+  - enabled on XIAO builds, disabled on NodeMCU builds
+
+- `APP_MDNS_ENABLE`
+  - controls `.local` mDNS advertising
+  - usually safe on XIAO
+  - NodeMCU can run it, but `0` is the preferred low-memory setting if heap margin gets tight
+
+- `APP_BLE_ENABLE`
+  - master BLE enable switch
+
+- `APP_BLE_GATT_ENABLE`
+  - `1` enables the full NimBLE GATT service
+  - `0` leaves BLE in advertising-only mode
+
+- `APP_BLE_LOG_TAIL_BYTES`
+- `APP_BLE_LAST_LOG_BYTES`
+- `APP_BLE_MTU`
+  - trim the BLE logging payload sizes and negotiated MTU
+
+- `CONFIG_ASYNC_TCP_RUNNING_CORE`
+- `CONFIG_ASYNC_TCP_STACK_SIZE`
+  - tune the async networking task used by the async web backend
+  - mainly relevant to the XIAO async-web builds
 
 ## Common Commands
 

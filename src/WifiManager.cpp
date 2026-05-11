@@ -4,6 +4,9 @@
 #include <ESPmDNS.h>
 
 #ifndef APP_MDNS_ENABLE
+// XIAO-class builds have plenty of room for mDNS. NodeMCU can also run it,
+// but disabling it is the preferred low-memory configuration when heap margin
+// matters more than .local discovery convenience.
 #define APP_MDNS_ENABLE 1
 #endif
 #include <WiFi.h>

@@ -23,11 +23,7 @@
 #if APP_BLE_ENABLE
 
 #include <ArduinoJson.h>
-#include <BLE2902.h>
-#include <BLEAdvertising.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
+#include <NimBLEDevice.h>
 
 #include "RemoteLogBuffer.h"
 #include "main_common.h"
@@ -59,7 +55,6 @@ constexpr size_t BLE_LOG_TAIL_BYTES = APP_BLE_LOG_TAIL_BYTES;
 constexpr size_t BLE_LAST_LOG_BYTES = APP_BLE_LAST_LOG_BYTES;
 constexpr uint16_t BLE_ADV_INTERVAL_MIN = 0xA0;  // 100 ms
 constexpr uint16_t BLE_ADV_INTERVAL_MAX = 0xC0;  // 120 ms
-constexpr uint16_t BLE_SERVICE_HANDLE_COUNT = 64;
 constexpr size_t BLE_PENDING_VALUE_MAX = 96;
 constexpr uint16_t BLE_MANUFACTURER_ID = 0xFFFF;
 constexpr uint8_t BLE_ADV_METADATA_VERSION = 1;
@@ -222,9 +217,10 @@ bool parseBoolText(const String& value, bool& out) {
 
 void setUserDescription(BLECharacteristic* characteristic, const char* label) {
   if (!characteristic || !label) return;
-  BLEDescriptor* descriptor = new BLEDescriptor(BLEUUID((uint16_t)0x2901));
-  descriptor->setValue((uint8_t*)label, strlen(label));
-  characteristic->addDescriptor(descriptor);
+  BLEDescriptor* descriptor = characteristic->createDescriptor("2901", NIMBLE_PROPERTY::READ, strlen(label) + 1);
+  if (descriptor) {
+    descriptor->setValue(label);
+  }
 }
 
 String buildAdvertisedName() {
@@ -288,21 +284,23 @@ void configureAdvertisingPayload(BLEAdvertising* advertising, const String& devi
   advertising->setMaxInterval(BLE_ADV_INTERVAL_MAX);
 
   BLEAdvertisementData advData;
-  advData.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
   advData.setManufacturerData(buildAdvertisingMetadata());
 #if APP_BLE_GATT_ENABLE
-  advertising->setAdvertisementType(ADV_TYPE_IND);
+  advertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
+  advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
+  advData.addServiceUUID(BLE_SERVICE_UUID);
   advertising->setAdvertisementData(advData);
 
   BLEAdvertisementData scanResponseData;
   scanResponseData.setName(deviceName.c_str());
   advertising->setScanResponseData(scanResponseData);
-  advertising->setScanResponse(true);
+  advertising->enableScanResponse(true);
 #else
-  advertising->setAdvertisementType(ADV_TYPE_NONCONN_IND);
+  advertising->setConnectableMode(BLE_GAP_CONN_MODE_NON);
+  advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
   advData.setName(deviceName.c_str());
   advertising->setAdvertisementData(advData);
-  advertising->setScanResponse(false);
+  advertising->enableScanResponse(false);
 #endif
 }
 
@@ -507,16 +505,19 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
 
 class ServerCallbacks : public BLEServerCallbacks {
  public:
-  void onConnect(BLEServer* server) override {
+  void onConnect(BLEServer* server, NimBLEConnInfo& connInfo) override {
     (void)server;
+    (void)connInfo;
     g_bleClientConnected = true;
     g_statusRefreshPending = true;
     g_lastStatusRefreshMs = 0;
     setResult("BLE client connected");
   }
 
-  void onDisconnect(BLEServer* server) override {
+  void onDisconnect(BLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
     (void)server;
+    (void)connInfo;
+    (void)reason;
     g_bleClientConnected = false;
     g_statusRefreshPending = false;
     BLEDevice::startAdvertising();
@@ -527,8 +528,9 @@ class ConfigCallbacks : public BLECharacteristicCallbacks {
  public:
   explicit ConfigCallbacks(ConfigField field) : field_(field) {}
 
-  void onWrite(BLECharacteristic* characteristic) override {
+  void onWrite(BLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
     (void)characteristic;
+    (void)connInfo;
     String value = trimAscii(characteristic->getValue());
     queueBleWrite(field_, value);
   }
@@ -539,7 +541,8 @@ class ConfigCallbacks : public BLECharacteristicCallbacks {
 
 class RebootCallbacks : public BLECharacteristicCallbacks {
  public:
-  void onWrite(BLECharacteristic* characteristic) override {
+  void onWrite(BLECharacteristic* characteristic, NimBLEConnInfo& connInfo) override {
+    (void)connInfo;
     String value = trimAscii(characteristic->getValue());
     queueBleReboot(value);
   }
@@ -577,98 +580,95 @@ void appStartBleServices() {
 
   // The Arduino BLE wrapper defaults services to 15 handles, which is too small
   // once we account for our characteristics plus descriptors.
-  BLEService* service = g_server->createService(BLEUUID(BLE_SERVICE_UUID), BLE_SERVICE_HANDLE_COUNT);
+  BLEService* service = g_server->createService(BLEUUID(BLE_SERVICE_UUID));
 
   g_wifiRssiChar = createCharacteristic(service,
                                         BLE_CHAR_WIFI_RSSI_UUID,
-                                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
+                                        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
                                         "wifi_rssi");
-  g_wifiRssiChar->addDescriptor(new BLE2902());
   g_wifiIpChar = createCharacteristic(service,
                                       BLE_CHAR_WIFI_IP_UUID,
-                                      BLECharacteristic::PROPERTY_READ,
+                                      NIMBLE_PROPERTY::READ,
                                       "wifi_ip");
   g_wifiMacChar = createCharacteristic(service,
                                        BLE_CHAR_WIFI_MAC_UUID,
-                                       BLECharacteristic::PROPERTY_READ,
+                                       NIMBLE_PROPERTY::READ,
                                        "wifi_mac");
   g_lastLogChar = createCharacteristic(service,
                                        BLE_CHAR_LAST_LOG_UUID,
-                                       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
+                                       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
                                        "last_log_line");
-  g_lastLogChar->addDescriptor(new BLE2902());
   g_logTailChar = createCharacteristic(service,
                                        BLE_CHAR_LOG_TAIL_UUID,
-                                       BLECharacteristic::PROPERTY_READ,
+                                       NIMBLE_PROPERTY::READ,
                                        "log_tail");
   g_rebootChar = createCharacteristic(service,
                                       BLE_CHAR_REBOOT_UUID,
-                                      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+                                      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR,
                                       "reboot");
   g_resultChar = createCharacteristic(service,
                                       BLE_CHAR_RESULT_UUID,
-                                      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY,
+                                      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
                                       "result");
-  g_resultChar->addDescriptor(new BLE2902());
 
   g_ssidChar = createCharacteristic(service,
                                     BLE_CHAR_SSID_UUID,
-                                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                        BLECharacteristic::PROPERTY_WRITE_NR,
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                        NIMBLE_PROPERTY::WRITE_NR,
                                     "ssid");
   g_passwordChar = createCharacteristic(service,
                                         BLE_CHAR_PASSWORD_UUID,
-                                        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR,
+                                        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR,
                                         "password");
   g_hostnameChar = createCharacteristic(service,
                                         BLE_CHAR_HOSTNAME_UUID,
-                                        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                            BLECharacteristic::PROPERTY_WRITE_NR,
+                                        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                            NIMBLE_PROPERTY::WRITE_NR,
                                         "hostname");
   g_dhcpChar = createCharacteristic(service,
                                     BLE_CHAR_DHCP_UUID,
-                                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                        BLECharacteristic::PROPERTY_WRITE_NR,
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                        NIMBLE_PROPERTY::WRITE_NR,
                                     "dhcp");
   g_ipChar = createCharacteristic(service,
                                   BLE_CHAR_IP_UUID,
-                                  BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                      BLECharacteristic::PROPERTY_WRITE_NR,
+                                  NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                      NIMBLE_PROPERTY::WRITE_NR,
                                   "ip");
   g_gatewayChar = createCharacteristic(service,
                                        BLE_CHAR_GATEWAY_UUID,
-                                       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                           BLECharacteristic::PROPERTY_WRITE_NR,
+                                       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                           NIMBLE_PROPERTY::WRITE_NR,
                                        "gateway");
   g_subnetChar = createCharacteristic(service,
                                       BLE_CHAR_SUBNET_UUID,
-                                      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                          BLECharacteristic::PROPERTY_WRITE_NR,
+                                      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                          NIMBLE_PROPERTY::WRITE_NR,
                                       "subnet");
   g_dns1Char = createCharacteristic(service,
                                     BLE_CHAR_DNS1_UUID,
-                                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                        BLECharacteristic::PROPERTY_WRITE_NR,
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                        NIMBLE_PROPERTY::WRITE_NR,
                                     "dns1");
   g_dns2Char = createCharacteristic(service,
                                     BLE_CHAR_DNS2_UUID,
-                                    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                        BLECharacteristic::PROPERTY_WRITE_NR,
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                        NIMBLE_PROPERTY::WRITE_NR,
                                     "dns2");
   g_startValueChar = createCharacteristic(service,
                                           BLE_CHAR_START_VALUE_UUID,
-                                          BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                              BLECharacteristic::PROPERTY_WRITE_NR,
+                                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                              NIMBLE_PROPERTY::WRITE_NR,
                                           "start_value");
   g_dmxAddressChar = createCharacteristic(service,
                                           BLE_CHAR_DMX_ADDRESS_UUID,
-                                          BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                              BLECharacteristic::PROPERTY_WRITE_NR,
+                                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                              NIMBLE_PROPERTY::WRITE_NR,
                                           "dmx_address");
   g_dmxUniverseChar = createCharacteristic(service,
                                            BLE_CHAR_DMX_UNIVERSE_UUID,
-                                           BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE |
-                                               BLECharacteristic::PROPERTY_WRITE_NR,
+                                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                                               NIMBLE_PROPERTY::WRITE_NR,
                                            "dmx_universe");
 
   g_ssidChar->setCallbacks(new ConfigCallbacks(ConfigField::Ssid));
@@ -689,7 +689,7 @@ void appStartBleServices() {
   refreshStatusCharacteristics(false);
   setResult("ready");
 
-  service->start();
+  g_server->start();
 
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
   configureAdvertisingPayload(advertising, deviceName);
