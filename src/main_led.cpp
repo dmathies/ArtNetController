@@ -6,6 +6,7 @@
 
 #include "main_common.h"
 #include "runtime_metrics.h"
+#include "RemoteLogBuffer.h"
 
 #ifndef LED_PWM_PIN_1
 #define LED_PWM_PIN_1 1
@@ -38,6 +39,7 @@ static constexpr uint32_t SOURCE_HOLD_MS = 1000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
 static constexpr UBaseType_t CONTROL_TASK_PRIORITY = 2;
 static constexpr BaseType_t CONTROL_TASK_CORE = 1;
+static constexpr uint32_t STATUS_DIAGNOSTICS_REFRESH_MS = 5000;
 
 #ifndef ARTNET_TIMING_LOG_ENABLE
 #define ARTNET_TIMING_LOG_ENABLE 0
@@ -74,6 +76,13 @@ struct StatusSnapshot {
   uint16_t controlTaskUtilPermille;
 };
 
+struct CachedDiagnostics {
+  int32_t controlTaskStackHwm = -1;
+  int32_t webTaskStackHwm = -1;
+  const char* controlTaskState = "unknown";
+  const char* webTaskState = "unknown";
+};
+
 static uint32_t artDmxRxTotal = 0;
 static uint32_t artDmxUniverseMatchTotal = 0;
 static uint32_t artDmxUniverseMismatchTotal = 0;
@@ -90,6 +99,8 @@ static IPAddress artUdpLastRemoteIp(0, 0, 0, 0);
 static AppConfigCache g_cfg;
 static TaskMetrics g_controlTaskMetrics;
 static ArtnetTimingWindow g_artnetTiming;
+static CachedDiagnostics g_cachedDiagnostics;
+static uint32_t g_statusDiagnosticsBuiltMs = 0;
 
 static void logArtnetTimingWindowIfDue(uint32_t nowMs) {
 #if ARTNET_TIMING_LOG_ENABLE
@@ -237,9 +248,9 @@ static void startArtnetListener() {
 
   g_artudpListening = g_artudp.listen(APP_ARTNET_PORT);
   if (g_artudpListening) {
-    Serial.printf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
+    appLogPrintf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
   } else {
-    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+    appLogPrintf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
   }
 }
 
@@ -300,13 +311,48 @@ static StatusSnapshot readStatusSnapshot() {
   return snapshot;
 }
 
+static CachedDiagnostics readCachedDiagnostics() {
+  CachedDiagnostics diagnostics;
+  portENTER_CRITICAL(&statusMux);
+  diagnostics = g_cachedDiagnostics;
+  portEXIT_CRITICAL(&statusMux);
+  return diagnostics;
+}
+
+static void refreshStatusDiagnosticsIfDue(uint32_t nowMs) {
+  uint32_t lastBuiltMs;
+  portENTER_CRITICAL(&statusMux);
+  lastBuiltMs = g_statusDiagnosticsBuiltMs;
+  portEXIT_CRITICAL(&statusMux);
+
+  if (lastBuiltMs != 0 && (nowMs - lastBuiltMs) < STATUS_DIAGNOSTICS_REFRESH_MS) {
+    return;
+  }
+
+  CachedDiagnostics diagnostics;
+  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
+  if (controlTaskHandle) {
+    diagnostics.controlTaskState = taskStateToString(eTaskGetState(controlTaskHandle));
+    diagnostics.controlTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  }
+  diagnostics.webTaskState = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
+  diagnostics.webTaskStackHwm = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+
+  portENTER_CRITICAL(&statusMux);
+  g_cachedDiagnostics = diagnostics;
+  g_statusDiagnosticsBuiltMs = nowMs;
+  portEXIT_CRITICAL(&statusMux);
+}
+
 static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   StaticJsonDocument<1024> j;
+  refreshStatusDiagnosticsIfDue(millis());
   StatusSnapshot snapshot = readStatusSnapshot();
   uint32_t now = millis();
   uint32_t artAge = (snapshot.lastArtMs == 0) ? 0xFFFFFFFFu : (now - snapshot.lastArtMs);
-  TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
   AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
+  AppSlowStatusMetrics slowMetrics = appGetSlowStatusMetrics();
+  CachedDiagnostics diagnostics = readCachedDiagnostics();
   WifiManagerClass& wifiManager = appWifiManager();
   IPAddress ip = wifiManager.getIP();
   char ipBuf[16];
@@ -315,21 +361,23 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   wifiManager.getMacAddress(macBuf, sizeof(macBuf));
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
+  j["variant"] = "led";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
   j["wifi_rssi"] = wifiManager.getRSSI();
   j["hostname"] = wifiManager.getHostnameCStr();
   j["wifi_ip"] = ipBuf;
   j["wifi_mac"] = macBuf;
-  j["free_heap"] = ESP.getFreeHeap();
-  j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["board_temp_c"] = appReadBoardTemperatureC();
-  j["reset_reason"] = appResetReasonToString(esp_reset_reason());
-  j["task_control_state"] = taskStateToString(eTaskGetState(controlTaskHandle));
-  j["task_control_stack_hwm"] = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
+  j["free_heap"] = slowMetrics.freeHeap;
+  j["min_free_heap"] = slowMetrics.minFreeHeap;
+  j["largest_free_block"] = slowMetrics.largestFreeBlock;
+  j["board_temp_c"] = slowMetrics.boardTempC;
+  j["reset_reason"] = slowMetrics.resetReason;
+  j["task_control_state"] = diagnostics.controlTaskState;
+  j["task_control_stack_hwm"] = diagnostics.controlTaskStackHwm;
   j["task_control_last_ms_ago"] = (snapshot.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - snapshot.controlTaskLastLoopMs);
   j["task_control_util_pct"] = (float)snapshot.controlTaskUtilPermille / 10.0f;
-  j["task_web_state"] = webTaskHandle ? taskStateToString(eTaskGetState(webTaskHandle)) : "unknown";
-  j["task_web_stack_hwm"] = webTaskHandle ? (int32_t)uxTaskGetStackHighWaterMark(webTaskHandle) : -1;
+  j["task_web_state"] = diagnostics.webTaskState;
+  j["task_web_stack_hwm"] = diagnostics.webTaskStackHwm;
   j["task_web_last_ms_ago"] = (webTaskStats.lastActiveMs == 0) ? -1 : (int32_t)(now - webTaskStats.lastActiveMs);
   j["task_web_util_pct"] = (float)webTaskStats.utilPermille / 10.0f;
 
@@ -350,6 +398,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
 }
 
 static size_t buildHealthSummary(char* out, size_t outSize) {
+  refreshStatusDiagnosticsIfDue(millis());
   StatusSnapshot snapshot = readStatusSnapshot();
   uint32_t now = millis();
   int32_t lastMsAgo = (snapshot.artDmxLastArrivalMs == 0) ? -1 : (int32_t)(now - snapshot.artDmxLastArrivalMs);
@@ -412,15 +461,15 @@ void setup() {
   applyStartValue(g_cfg.startValue);
 
   appInitRuntime({
-    "/wifi-manager/index_led.html",
+    "/wifi-manager/index.html",
     "CableCar LED",
     buildStatusJson,
     buildHealthSummary,
     nullptr,
   });
 
-  appConnectWifi();
   appStartCommonServices();
+  appConnectWifi();
 
   xTaskCreatePinnedToCore(controlTask,
                           "ControlTask",

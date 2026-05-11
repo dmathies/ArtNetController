@@ -123,12 +123,48 @@ Important PlatformIO settings:
 - Build type: `debug`
 - Dependency:
   - `bblanchon/ArduinoJson@^6.21.3`
+  - `h2zero/NimBLE-Arduino`
 
 Partition layout:
 
 - `app0` OTA slot
 - `app1` OTA slot
 - `littlefs` data partition at `0x310000`, size `0x40000`
+
+### Important Build Flags
+
+The project uses a few non-default build flags in `platformio.ini` to tune behavior per board family:
+
+- `APP_ASYNC_WEB_ENABLE`
+  - `1` uses `ESPAsyncWebServer`
+  - `0` uses the lighter synchronous `WebServer`
+  - XIAO builds use async web; NodeMCU builds use sync web to reduce heap pressure
+
+- `WEB_SOCKET_ENABLE`
+  - enables the `/ws` status stream for the dashboard
+  - enabled on XIAO builds, disabled on NodeMCU builds
+
+- `APP_MDNS_ENABLE`
+  - controls `.local` mDNS advertising
+  - usually safe on XIAO
+  - NodeMCU can run it, but `0` is the preferred low-memory setting if heap margin gets tight
+
+- `APP_BLE_ENABLE`
+  - master BLE enable switch
+
+- `APP_BLE_GATT_ENABLE`
+  - `1` enables the full NimBLE GATT service
+  - `0` leaves BLE in advertising-only mode
+
+- `APP_BLE_LOG_TAIL_BYTES`
+- `APP_BLE_LAST_LOG_BYTES`
+- `APP_BLE_MTU`
+  - trim the BLE logging payload sizes and negotiated MTU
+
+- `CONFIG_ASYNC_TCP_RUNNING_CORE`
+- `CONFIG_ASYNC_TCP_STACK_SIZE`
+  - tune the async networking task used by the async web backend
+  - mainly relevant to the XIAO async-web builds
 
 ## Common Commands
 
@@ -160,6 +196,12 @@ Build filesystem image:
 
 ```powershell
 pio run -e seeed_xiao_esp32s3 --target buildfs
+```
+
+Build a combined OTA bundle:
+
+```powershell
+pio run -e seeed_xiao_esp32s3 --target buildota
 ```
 
 Upload filesystem image:
@@ -195,6 +237,7 @@ API endpoints:
 - `GET /update`
 - `POST /update`
 - `POST /updatefs`
+- `POST /updatebundle`
 - `GET /ws` - WebSocket status stream
 
 If stored Wi-Fi credentials are missing or connection fails, the device starts a management access point:
@@ -228,7 +271,7 @@ Shared runtime services in `src/main.cpp` provide:
 - Wi-Fi reconnect handling
 - HTTP file serving from LittleFS
 - WebSocket status broadcasting
-- OTA firmware and filesystem upload handlers
+- OTA firmware, filesystem, and combined bundle upload handlers
 - health and task runtime reporting
 
 The dashboard displays items such as:
@@ -244,10 +287,13 @@ The dashboard displays items such as:
 
 The built-in OTA page accepts:
 
+- combined firmware + filesystem bundle upload via `POST /updatebundle`
 - firmware image upload to the active OTA slot via `POST /update`
 - filesystem image upload to the LittleFS partition via `POST /updatefs`
 
-The web page currently refers to the filesystem image as `spiffs.bin`, but the project is configured to use `LittleFS`. Build and upload the filesystem image using the PlatformIO filesystem targets for the selected environment.
+The recommended one-file OTA artifact is `.pio/build/<env>/ota_bundle.ota`. It is generated from the firmware image plus the LittleFS image and can be uploaded from the Combined tab on `/ota.html`.
+
+`pio run -e <env> --target buildota` builds the firmware, builds the filesystem image, and writes the combined bundle. The same bundle is also refreshed automatically whenever both `firmware.bin` and `littlefs.bin` exist in the build directory.
 
 ## Notes For Development
 

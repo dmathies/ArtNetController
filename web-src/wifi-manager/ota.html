@@ -419,9 +419,11 @@
       }
 
       document.addEventListener('DOMContentLoaded', initThemePicker);
+      let otaTransport = 'raw';
 
 
       function switchTab(tab, btn) {
+        document.getElementById('bundle').classList.remove('active');
         document.getElementById('firmware').classList.remove('active');
         document.getElementById('spiffs').classList.remove('active');
         document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -431,6 +433,108 @@
 
 
       
+      async function uploadBundle() {
+        const fileInput = document.getElementById('bundle-file');
+        const statusDiv = document.getElementById('status-bundle');
+        const progressContainer = document.getElementById('progress-bundle');
+        const progressFill = document.querySelector('.bundle-fill');
+        const progressText = document.querySelector('.bundle-text');
+        const uploadBtn = event.target;
+
+        if (!fileInput.files || fileInput.files.length === 0) {
+          showStatus(statusDiv, 'Please select a combined OTA bundle', 'error');
+          return;
+        }
+
+        const file = fileInput.files[0];
+        if (!file.name.endsWith('.ota') && !file.name.endsWith('.bin')) {
+          showStatus(statusDiv, 'Please select a .ota or .bin bundle file', 'error');
+          return;
+        }
+
+        uploadBtn.disabled = true;
+        progressContainer.style.display = 'block';
+        showStatus(statusDiv, 'Uploading combined firmware and filesystem bundle...', 'info');
+
+        try {
+          const xhr = new XMLHttpRequest();
+          let uploadComplete = false;
+
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+              const percentComplete = (e.loaded / e.total) * 100;
+              progressFill.style.width = percentComplete + '%';
+              progressText.textContent = Math.round(percentComplete) + '%';
+            }
+          });
+
+          xhr.upload.addEventListener('load', () => {
+            uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
+            showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
+          });
+
+          xhr.addEventListener('load', () => {
+            if (xhr.status === 200) {
+              showStatus(statusDiv, 'Success! Firmware and filesystem updated. Device restarting...', 'success');
+              progressText.textContent = '100%';
+              progressFill.style.width = '100%';
+              setTimeout(() => {
+                window.location.href = '/';
+              }, 5000);
+            } else {
+              let message = 'Update failed';
+              try {
+                const payload = JSON.parse(xhr.responseText || '{}');
+                if (payload.message && payload.error) message = `${payload.message}: ${payload.error}`;
+                else if (payload.message) message = payload.message;
+                else if (payload.error) message = payload.error;
+              } catch (e) {
+                if (xhr.statusText) message = 'Update failed: ' + xhr.statusText;
+              }
+              showStatus(statusDiv, message, 'error');
+              uploadBtn.disabled = false;
+              progressContainer.style.display = 'none';
+            }
+          });
+
+          xhr.addEventListener('error', () => {
+            if (uploadComplete) {
+              showStatus(statusDiv, 'Success! Combined update uploaded. Device is restarting...', 'success');
+              markUploadComplete(progressFill, progressText);
+              setTimeout(() => {
+                window.location.href = '/';
+              }, 5000);
+            } else {
+              showStatus(statusDiv, 'Upload failed: Network error', 'error');
+              uploadBtn.disabled = false;
+              progressContainer.style.display = 'none';
+            }
+          });
+
+          xhr.addEventListener('abort', () => {
+            showStatus(statusDiv, 'Upload cancelled', 'error');
+            uploadBtn.disabled = false;
+            progressContainer.style.display = 'none';
+          });
+
+          xhr.addEventListener('timeout', () => {
+            showStatus(statusDiv, 'Upload timed out. Keep this page open and try again.', 'error');
+            uploadBtn.disabled = false;
+            progressContainer.style.display = 'none';
+          });
+
+          xhr.timeout = 180000;
+
+          sendUploadRequest(xhr, '/updatebundle', file);
+
+        } catch (error) {
+          showStatus(statusDiv, 'Error: ' + error.message, 'error');
+          uploadBtn.disabled = false;
+          progressContainer.style.display = 'none';
+        }
+      }
+
       async function uploadFirmware() {
         const fileInput = document.getElementById('firmware-file');
         const statusDiv = document.getElementById('status-firmware');
@@ -468,6 +572,7 @@
 
           xhr.upload.addEventListener('load', () => {
             uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
             // Upload finished, now waiting for server response
             // Device will restart, so connection may drop
             showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
@@ -499,10 +604,9 @@
 
           xhr.addEventListener('error', () => {
             // If upload was complete and then connection lost, that's expected (device restarting)
-            if (uploadComplete && progressFill.style.width === '100%') {
+            if (uploadComplete) {
               showStatus(statusDiv, 'Success! Firmware updated. Device is restarting...', 'success');
-              progressText.textContent = '100%';
-              progressFill.style.width = '100%';
+              markUploadComplete(progressFill, progressText);
               setTimeout(() => {
                 window.location.href = '/';
               }, 5000);
@@ -527,9 +631,7 @@
 
           xhr.timeout = 180000;  // 3 minute timeout
           
-          xhr.open('POST', '/update');
-          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-          xhr.send(file);
+          sendUploadRequest(xhr, '/update', file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -547,7 +649,7 @@
         const uploadBtn = event.target;
 
         if (!fileInput.files || fileInput.files.length === 0) {
-          showStatus(statusDiv, 'Please select a SPIFFS file', 'error');
+          showStatus(statusDiv, 'Please select a filesystem image', 'error');
           return;
         }
 
@@ -575,6 +677,7 @@
 
           xhr.upload.addEventListener('load', () => {
             uploadComplete = true;
+            markUploadComplete(progressFill, progressText);
             // Upload finished, now waiting for server response
             // Device will restart, so connection may drop
             showStatus(statusDiv, 'Upload complete, device restarting...', 'info');
@@ -606,10 +709,9 @@
 
           xhr.addEventListener('error', () => {
             // If upload was complete and then connection lost, that's expected (device restarting)
-            if (uploadComplete && progressFill.style.width === '100%') {
+            if (uploadComplete) {
               showStatus(statusDiv, 'Success! Filesystem updated. Device is restarting...', 'success');
-              progressText.textContent = '100%';
-              progressFill.style.width = '100%';
+              markUploadComplete(progressFill, progressText);
               setTimeout(() => {
                 window.location.href = '/';
               }, 5000);
@@ -634,9 +736,7 @@
 
           xhr.timeout = 180000;  // 3 minute timeout
           
-          xhr.open('POST', '/updatefs');
-          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-          xhr.send(file);
+          sendUploadRequest(xhr, '/updatefs', file);
 
         } catch (error) {
           showStatus(statusDiv, 'Error: ' + error.message, 'error');
@@ -651,11 +751,60 @@
         statusDiv.style.display = 'block';
       }
 
+      function markUploadComplete(progressFill, progressText) {
+        progressFill.style.width = '100%';
+        progressText.textContent = '100%';
+      }
+
+      function sendUploadRequest(xhr, url, file) {
+        xhr.open('POST', url);
+        if (otaTransport === 'multipart') {
+          const formData = new FormData();
+          formData.append('file', file, file.name);
+          xhr.send(formData);
+        } else {
+          xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+          xhr.send(file);
+        }
+      }
+
+      function formatVariantLabel(variant, device) {
+        const key = typeof variant === 'string' ? variant.toLowerCase() : '';
+        if (key === 'bldc') return 'BLDC';
+        if (key === 'relay') return 'Relay';
+        if (key === 'led') return 'LED';
+        return device || 'Unknown';
+      }
+
       // Get OTA info on page load
       window.addEventListener('load', async () => {
         try {
           const response = await fetch('/update');
           const data = await response.json();
+          const variantLabel = formatVariantLabel(data.variant, data.device);
+          const variantEl = document.getElementById('deviceVariant');
+          const variantHintEl = document.getElementById('variantPathHint');
+          if (variantEl) variantEl.textContent = variantLabel;
+          if (variantHintEl) {
+            variantHintEl.textContent = data.variant
+              ? `.pio/build/<env-for-${data.variant}>/`
+              : '.pio/build/<your-environment>/';
+          }
+          if (data && typeof data.ota_transport === 'string' && data.ota_transport.length) {
+            otaTransport = data.ota_transport;
+          }
+          if (data && data.bundle_ready === false) {
+            const bundleTab = document.querySelector('.tab-btn[onclick*="bundle"]');
+            const bundlePanel = document.getElementById('bundle');
+            if (bundleTab) bundleTab.style.display = 'none';
+            if (bundlePanel && bundlePanel.classList.contains('active')) {
+              bundlePanel.classList.remove('active');
+              const firmwareTab = document.querySelector('.tab-btn[onclick*="firmware"]');
+              const firmwarePanel = document.getElementById('firmware');
+              if (firmwareTab) firmwareTab.classList.add('active');
+              if (firmwarePanel) firmwarePanel.classList.add('active');
+            }
+          }
           console.log('Device Info:', data);
         } catch (error) {
           console.log('Could not fetch device info');
@@ -707,13 +856,36 @@
       <section class="card">
         <div class="card-inner">
           <h2 class="card-title">Update Packages</h2>
+          <p class="subtitle" style="margin-top:8px;">Current device variant: <strong id="deviceVariant">Detecting...</strong></p>
 
           <div class="tabs">
-            <button class="tab-btn active" onclick="switchTab('firmware', this)">Firmware</button>
+            <button class="tab-btn active" onclick="switchTab('bundle', this)">Combined</button>
+            <button class="tab-btn" onclick="switchTab('firmware', this)">Firmware</button>
             <button class="tab-btn" onclick="switchTab('spiffs', this)">Filesystem</button>
           </div>
 
-          <div id="firmware" class="tab-content active">
+          <div id="bundle" class="tab-content active">
+            <div class="info-box">
+              <strong>Combined OTA Bundle:</strong> <code>ota_bundle.ota</code>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label" for="bundle-file">Select combined OTA bundle</label>
+              <input type="file" id="bundle-file" accept=".ota,.bin" />
+              <small class="muted" style="display:block;margin-top:8px;">Recommended: <code id="variantPathHint">.pio/build/&lt;your-environment&gt;/</code><code>ota_bundle.ota</code></small>
+            </div>
+
+            <button class="btn btn-primary upload-btn" onclick="uploadBundle()">Upload Firmware + Filesystem</button>
+
+            <div id="progress-bundle" class="progress-container">
+              <div class="progressBar"><div class="progressFill bundle-fill"></div></div>
+              <div class="progressText bundle-text">0%</div>
+            </div>
+
+            <div id="status-bundle" class="status"></div>
+          </div>
+
+          <div id="firmware" class="tab-content">
             <div class="info-box">
               <strong>Firmware:</strong> <code>firmware.bin</code>
             </div>
@@ -721,7 +893,7 @@
             <div class="form-group">
               <label class="form-label" for="firmware-file">Select firmware file</label>
               <input type="file" id="firmware-file" accept=".bin" />
-              <small class="muted" style="display:block;margin-top:8px;">Expected: <code>.pio/build/seeed_xiao_esp32s3/firmware.bin</code></small>
+              <small class="muted" style="display:block;margin-top:8px;">Expected: <code>.pio/build/&lt;your-environment&gt;/firmware.bin</code></small>
             </div>
 
             <button class="btn btn-primary upload-btn" onclick="uploadFirmware()">Upload Firmware</button>
@@ -736,13 +908,13 @@
 
           <div id="spiffs" class="tab-content">
             <div class="info-box">
-              <strong>Filesystem:</strong> <code>spiffs.bin</code>
+              <strong>Filesystem:</strong> <code>littlefs.bin</code>
             </div>
 
             <div class="form-group">
               <label class="form-label" for="spiffs-file">Select filesystem image</label>
               <input type="file" id="spiffs-file" accept=".bin" />
-              <small class="muted" style="display:block;margin-top:8px;">Build with <code>pio run --target buildfs</code> then use <code>.pio/build/seeed_xiao_esp32s3/spiffs.bin</code></small>
+              <small class="muted" style="display:block;margin-top:8px;">Build with <code>pio run -e &lt;your-environment&gt; --target buildfs</code> then use <code>.pio/build/&lt;your-environment&gt;/littlefs.bin</code></small>
             </div>
 
             <button class="btn btn-primary upload-btn" onclick="uploadSPIFFS()">Upload Filesystem</button>

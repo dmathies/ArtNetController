@@ -7,6 +7,7 @@
 #include "main_common.h"
 #include "runtime_metrics.h"
 #include "bldc_uart.h"
+#include "RemoteLogBuffer.h"
 
 #ifndef BLDC_UART_TX_PIN
 #define BLDC_UART_TX_PIN 27
@@ -27,6 +28,7 @@ static constexpr int UART_OE = BLDC_UART_OE_PIN;
 static constexpr uint32_t CONTROL_TASK_DELAY_MS = 2;
 static constexpr uint32_t MOTOR_TASK_DELAY_MS = 10;
 static constexpr uint32_t SOURCE_HOLD_MS = 1000;
+static constexpr uint32_t BLDC_POWER_PRESENT_TIMEOUT_MS = 2000;
 static constexpr uint32_t WS_STATUS_PUSH_MS = 1000;
 static constexpr uint32_t ARTNET_HEALTH_LOG_INTERVAL_MS = 5000;
 static constexpr uint32_t STATUS_DIAGNOSTICS_REFRESH_MS = 2000;
@@ -63,6 +65,8 @@ struct AppConfigCache {
 struct StatusSnapshot {
   uint8_t motorRaw = 0;
   uint8_t motorStep = 0;
+  uint32_t bldcLastStatusFrameMs = 0;
+  uint32_t bldcStatusFrameRxTotal = 0;
   uint32_t lastArtMs = 0;
   uint32_t artDmxRxTotal = 0;
   uint32_t artDmxUniverseMatchTotal = 0;
@@ -76,7 +80,6 @@ struct StatusSnapshot {
 };
 
 struct CachedDiagnostics {
-  float boardTempC = NAN;
   int32_t controlTaskStackHwm = -1;
   int32_t motorTaskStackHwm = -1;
   int32_t webTaskStackHwm = -1;
@@ -97,6 +100,8 @@ static uint8_t g_pendingMotorRaw = 0;
 static portMUX_TYPE statusMux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t g_motorRaw = 0;
 static uint8_t g_motorStep = 0;
+static uint32_t g_bldcLastStatusFrameMs = 0;
+static uint32_t g_bldcStatusFrameRxTotal = 0;
 static uint32_t artDmxRxTotal = 0;
 static uint32_t artDmxUniverseMatchTotal = 0;
 static uint32_t artDmxUniverseMismatchTotal = 0;
@@ -250,9 +255,9 @@ static void startArtnetListener() {
 
   g_artudpListening = g_artudp.listen(APP_ARTNET_PORT);
   if (g_artudpListening) {
-    Serial.printf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
+    appLogPrintf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
   } else {
-    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+    appLogPrintf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
   }
 }
 
@@ -362,12 +367,17 @@ static void enqueueMotor(uint8_t raw) {
 static void motorTask(void* parameter) {
   uint8_t currentRaw = 0;
 
-#if BLDC_RX_LOG_ENABLE
   bldc.onFrame = [](const uint8_t* f) {
+    const uint32_t nowMs = millis();
+    portENTER_CRITICAL(&statusMux);
+    g_bldcLastStatusFrameMs = nowMs;
+    g_bldcStatusFrameRxTotal++;
+    portEXIT_CRITICAL(&statusMux);
+#if BLDC_RX_LOG_ENABLE
     Serial.printf("[BLDC RX] %02X %02X %02X %02X %02X %02X %02X\n",
                   f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
-  };
 #endif
+  };
 
   for (;;) {
     uint32_t workUs = 0;
@@ -435,7 +445,6 @@ static void refreshStatusDiagnosticsIfDue(uint32_t nowMs) {
 
   CachedDiagnostics diagnostics;
   TaskHandle_t webTaskHandle = appGetWebServerTaskHandle();
-  diagnostics.boardTempC = appReadBoardTemperatureC();
   if (controlTaskHandle) {
     diagnostics.controlTaskState = taskStateToString(eTaskGetState(controlTaskHandle));
     diagnostics.controlTaskStackHwm = (int32_t)uxTaskGetStackHighWaterMark(controlTaskHandle);
@@ -472,6 +481,8 @@ static StatusSnapshot readStatusSnapshot() {
   portENTER_CRITICAL(&statusMux);
   snapshot.motorRaw = g_motorRaw;
   snapshot.motorStep = g_motorStep;
+  snapshot.bldcLastStatusFrameMs = g_bldcLastStatusFrameMs;
+  snapshot.bldcStatusFrameRxTotal = g_bldcStatusFrameRxTotal;
   snapshot.lastArtMs = appGetLastArtnetMs();
   snapshot.artDmxRxTotal = artDmxRxTotal;
   snapshot.artDmxUniverseMatchTotal = artDmxUniverseMatchTotal;
@@ -494,6 +505,11 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   AppTaskRuntimeStats webTaskStats = appGetWebTaskRuntimeStats();
   WifiManagerClass& wifiManager = appWifiManager();
   CachedDiagnostics diagnostics = readCachedDiagnostics();
+  AppSlowStatusMetrics slowMetrics = appGetSlowStatusMetrics();
+  const bool controllerPowerOn =
+      (s.bldcLastStatusFrameMs != 0) && ((now - s.bldcLastStatusFrameMs) <= BLDC_POWER_PRESENT_TIMEOUT_MS);
+  const int32_t controllerLastStatusMsAgo =
+      (s.bldcLastStatusFrameMs == 0) ? -1 : (int32_t)(now - s.bldcLastStatusFrameMs);
   IPAddress ip = wifiManager.getIP();
   char ipBuf[16];
   char macBuf[18];
@@ -501,17 +517,22 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   wifiManager.getMacAddress(macBuf, sizeof(macBuf));
 
   j["source"] = (artAge <= SOURCE_HOLD_MS) ? "Art-Net" : "none";
+  j["variant"] = "bldc";
   j["art_age_ms"] = (artAge == 0xFFFFFFFFu) ? -1 : (int32_t)artAge;
   j["motor_value"] = s.motorRaw;
   j["motor_step"] = s.motorStep;
+  j["controller_power_on"] = controllerPowerOn;
+  j["controller_last_status_ms_ago"] = controllerLastStatusMsAgo;
+  j["controller_status_timeout_ms"] = BLDC_POWER_PRESENT_TIMEOUT_MS;
   j["wifi_rssi"] = wifiManager.getRSSI();
   j["hostname"] = wifiManager.getHostnameCStr();
   j["wifi_ip"] = ipBuf;
   j["wifi_mac"] = macBuf;
-  j["free_heap"] = ESP.getFreeHeap();
-  j["min_free_heap"] = ESP.getMinFreeHeap();
-  j["board_temp_c"] = diagnostics.boardTempC;
-  j["reset_reason"] = appResetReasonToString(esp_reset_reason());
+  j["free_heap"] = slowMetrics.freeHeap;
+  j["min_free_heap"] = slowMetrics.minFreeHeap;
+  j["largest_free_block"] = slowMetrics.largestFreeBlock;
+  j["board_temp_c"] = slowMetrics.boardTempC;
+  j["reset_reason"] = slowMetrics.resetReason;
   j["task_control_state"] = diagnostics.controlTaskState;
   j["task_control_stack_hwm"] = diagnostics.controlTaskStackHwm;
   j["task_control_last_ms_ago"] = (s.controlTaskLastLoopMs == 0) ? -1 : (int32_t)(now - s.controlTaskLastLoopMs);
@@ -526,6 +547,7 @@ static size_t buildStatusJson(char* out, size_t outSize, bool details) {
   j["task_web_util_pct"] = (float)webTaskStats.utilPermille / 10.0f;
 
   if (details) {
+    j["controller_status_rx_total"] = s.bldcStatusFrameRxTotal;
     j["art_rx_total"] = s.artDmxRxTotal;
     j["art_rx_universe_total"] = s.artDmxUniverseMatchTotal;
     j["art_rx_universe_mismatch_total"] = s.artDmxUniverseMismatchTotal;
@@ -542,6 +564,10 @@ static size_t buildHealthSummary(char* out, size_t outSize) {
   uint32_t now = millis();
   int32_t lastMsAgo = (s.artDmxLastArrivalMs == 0) ? -1 : (int32_t)(now - s.artDmxLastArrivalMs);
   uint32_t artAge = (s.lastArtMs == 0) ? 0xFFFFFFFFu : (now - s.lastArtMs);
+  const bool controllerPowerOn =
+      (s.bldcLastStatusFrameMs != 0) && ((now - s.bldcLastStatusFrameMs) <= BLDC_POWER_PRESENT_TIMEOUT_MS);
+  const int32_t controllerLastStatusMsAgo =
+      (s.bldcLastStatusFrameMs == 0) ? -1 : (int32_t)(now - s.bldcLastStatusFrameMs);
   int32_t udpLastMsAgo;
   uint32_t udpRx;
   uint32_t udpBytes;
@@ -564,7 +590,7 @@ static size_t buildHealthSummary(char* out, size_t outSize) {
 
   return snprintf(out,
                   outSize,
-                  "art_src=%s art_rx=%lu match=%lu mismatch=%lu invalid=%lu last=%ldms udp_rx=%lu udp_b=%lu udp_last=%ldms from=%s:%u pkt=%u uni=%u rebind=%lu motor=%u",
+                  "art_src=%s art_rx=%lu match=%lu mismatch=%lu invalid=%lu last=%ldms udp_rx=%lu udp_b=%lu udp_last=%ldms from=%s:%u pkt=%u uni=%u rebind=%lu motor=%u ctrl_pwr=%s ctrl_rx_last=%ldms ctrl_rx_total=%lu",
                   (artAge <= SOURCE_HOLD_MS) ? "live" : "idle",
                   (unsigned long)s.artDmxRxTotal,
                   (unsigned long)s.artDmxUniverseMatchTotal,
@@ -579,7 +605,10 @@ static size_t buildHealthSummary(char* out, size_t outSize) {
                   (unsigned int)lastSize,
                   (unsigned int)lastUni,
                   (unsigned long)udpRebinds,
-                  (unsigned int)s.motorRaw);
+                  (unsigned int)s.motorRaw,
+                  controllerPowerOn ? "on" : "off",
+                  (long)controllerLastStatusMsAgo,
+                  (unsigned long)s.bldcStatusFrameRxTotal);
 }
 
 void setup() {
@@ -606,8 +635,8 @@ void setup() {
     nullptr,
   });
 
-  appConnectWifi();
   appStartCommonServices();
+  appConnectWifi();
 
   motorQueue = xQueueCreate(1, sizeof(MotorCmd));
   // Keep application work off core 0 so the ESP32 WiFi/lwIP stack can service

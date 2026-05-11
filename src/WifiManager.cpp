@@ -2,11 +2,26 @@
 
 #include <ArduinoJson.h>
 #include <ESPmDNS.h>
+
+#ifndef APP_MDNS_ENABLE
+// XIAO-class builds have plenty of room for mDNS. NodeMCU can also run it,
+// but disabling it is the preferred low-memory configuration when heap margin
+// matters more than .local discovery convenience.
+#define APP_MDNS_ENABLE 1
+#endif
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_wifi.h>
 
 #include "Configuration.h"
+#include "RemoteLogBuffer.h"
+
+namespace {
+void applyWifiPowerSaveForCoexistence() {
+	WiFi.setSleep(true);
+	esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+}
+}
 
 WifiManagerClass::WifiManagerClass(Configuration& config)
 	: _config(config) {
@@ -47,11 +62,11 @@ void WifiManagerClass::check() {
 		_connected = true;
 		_reconnectSuccesses++;
 		_lastReconnectSuccessMs = millis();
-		Serial.println("WiFi reconnected");
+		appLogLine("WiFi reconnected");
 	}
 
 	if (_restartPending && millis() >= _restartAtMs) {
-		Serial.println("Restarting device...");
+		appLogLine("Restarting device...");
 		cleanupBeforeRestart();
 		delay(100);  // Give cleanup time to complete
 		ESP.restart();
@@ -102,7 +117,7 @@ void WifiManagerClass::requestRestart(unsigned long delayMs) {
 }
 
 void WifiManagerClass::cleanupBeforeRestart() {
-	Serial.println("Cleaning up WiFi and mDNS before restart...");
+	appLogLine("Cleaning up WiFi and mDNS before restart...");
 	
 	// Stop mDNS responder
 	MDNS.end();
@@ -116,7 +131,7 @@ void WifiManagerClass::cleanupBeforeRestart() {
 	// Ensure filesystem metadata is committed before the software reset.
 	LittleFS.end();
 	
-	Serial.println("Cleanup complete");
+	appLogLine("Cleanup complete");
 }
 
 void WifiManagerClass::ensureReconnectAttempt() {
@@ -135,10 +150,9 @@ void WifiManagerClass::ensureReconnectAttempt() {
 		WiFi.mode(WIFI_MODE_STA);
 	}
 
-	WiFi.setSleep(WIFI_PS_NONE);
-	esp_wifi_set_ps(WIFI_PS_NONE);
+	applyWifiPowerSaveForCoexistence();
 
-	Serial.println("WiFi not connected. Attempting to reconnect.");
+	appLogLine("WiFi not connected. Attempting to reconnect.");
 	String currentTarget = WiFi.SSID();
 	if (currentTarget == _stationSsid && WiFi.reconnect()) {
 		return;
@@ -161,27 +175,25 @@ void WifiManagerClass::networkScanTaskEntry(void* parameter) {
 }
 
 void WifiManagerClass::runNetworkScanTask() {
-	Serial.println("Scanning networks...");
+	appLogLine("Scanning networks...");
 
 	wifi_mode_t mode = WiFi.getMode();
 	if (mode == WIFI_MODE_AP) {
 		WiFi.mode(WIFI_MODE_APSTA);
-		WiFi.setSleep(WIFI_PS_NONE);
-		esp_wifi_set_ps(WIFI_PS_NONE);
+		applyWifiPowerSaveForCoexistence();
 	} else if (mode == WIFI_MODE_NULL) {
 		WiFi.mode(WIFI_MODE_STA);
-		WiFi.setSleep(WIFI_PS_NONE);
-		esp_wifi_set_ps(WIFI_PS_NONE);
+		applyWifiPowerSaveForCoexistence();
 	}
 
 	int scanResult = WiFi.scanNetworks(false, false);
 	if (scanResult < 0) {
-		Serial.printf("WiFi scan failed (%d)\n", scanResult);
+		appLogPrintf("WiFi scan failed (%d)\n", scanResult);
 		_networks = "[]";
 	} else {
 		_networks = buildNetworksJson(scanResult);
 		WiFi.scanDelete();
-		Serial.println("scan complete...");
+		appLogLine("WiFi scan complete");
 	}
 
 	_scanInProgress = false;
@@ -202,7 +214,7 @@ void WifiManagerClass::pollNetworkScan() {
 		_scanRequested = false;
 		_scanInProgress = false;
 		_scanStartedAtMs = millis();
-		Serial.println("Starting WiFi scan...");
+		appLogLine("Starting WiFi scan...");
 
 		BaseType_t taskOk = xTaskCreatePinnedToCore(
 			networkScanTaskEntry,
@@ -214,7 +226,7 @@ void WifiManagerClass::pollNetworkScan() {
 			1);
 
 		if (taskOk != pdPASS) {
-			Serial.println("Failed to start WiFi scan task");
+			appLogLine("Failed to start WiFi scan task");
 			_networks = "[]";
 			_scanInProgress = false;
 			_scanHasResult = true;
@@ -263,14 +275,13 @@ bool WifiManagerClass::connectToWifi() {
 	_apSsid = "";
 
 	if (_stationSsid == "") {
-		Serial.println("No connection information specified");
+		appLogLine("No connection information specified");
 
 		return false;
 	}
 
 	WiFi.mode(WIFI_MODE_STA);
-	WiFi.setSleep(WIFI_PS_NONE);
-	esp_wifi_set_ps(WIFI_PS_NONE);
+	applyWifiPowerSaveForCoexistence();
 
 	// Don't scan networks at startup - it blocks for several seconds
 	// Networks will be scanned on-demand when /networks endpoint is called
@@ -301,37 +312,40 @@ bool WifiManagerClass::connectToWifi() {
 
 		if (validRequired) {
 			if (!WiFi.config(ip, gateway, subnet, dns1, dns2)) {
-				Serial.println("Static IP config failed, falling back to DHCP");
+				appLogLine("Static IP config failed, falling back to DHCP");
 				WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
 			} else {
-				Serial.println("Using static IPv4 configuration");
+				appLogLine("Using static IPv4 configuration");
 			}
 		} else {
-			Serial.println("Invalid static IPv4 settings, falling back to DHCP");
+			appLogLine("Invalid static IPv4 settings, falling back to DHCP");
 			WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
 		}
 	}
 
 	if (_hostname != "") {
 		WiFi.setHostname(_hostname.c_str());
-		Serial.println("Setting hostname " + _hostname);
+		appLogPrintf("Setting hostname %s\n", _hostname.c_str());
 
+#if APP_MDNS_ENABLE
 		if (MDNS.begin(_hostname.c_str())) {
-			Serial.println("mDNS responder started");
+			appLogLine("mDNS responder started");
 		} else {
-			Serial.println("Unable to start mDNS responder");
+			appLogLine("Unable to start mDNS responder");
 		}
+#else
+		appLogLine("mDNS responder disabled");
+#endif
 	} else {
-		Serial.println("No hostname configured");
+		appLogLine("No hostname configured");
 	}
 
-	Serial.println("Connecting to WiFi...");
+	appLogLine("Connecting to WiFi...");
 
 	WiFi.begin(_stationSsid.c_str(), pass.c_str());
 
 	_connected = waitForConnection();
-	WiFi.setSleep(WIFI_PS_NONE);
-	esp_wifi_set_ps(WIFI_PS_NONE);
+	applyWifiPowerSaveForCoexistence();
 
 	return _connected;
 }
@@ -341,7 +355,7 @@ bool WifiManagerClass::waitForConnection() {
 
 	while (WiFi.status() != WL_CONNECTED) {
 		if (millis() > timeout) {
-			Serial.println("Unable to connect to WIFI");
+			appLogLine("Unable to connect to WIFI");
 
 			return false;
 		}
@@ -351,8 +365,7 @@ bool WifiManagerClass::waitForConnection() {
 
 	_ip = WiFi.localIP();
 
-	Serial.println("Assigned IP Address:");
-	Serial.println(_ip);
+	appLogPrintf("Assigned IP Address: %s\n", _ip.toString().c_str());
 
 
 	return true;
@@ -370,23 +383,21 @@ void WifiManagerClass::startManagementAP() {
 		_managementApActive = false;
 	}
 
-	Serial.println("Starting Management AP");
+	appLogLine("Starting Management AP");
 	WiFi.softAPdisconnect(true);
 	if (WiFi.getMode() != WIFI_MODE_APSTA) {
 		WiFi.mode(WIFI_MODE_APSTA);
 	}
-	WiFi.setSleep(WIFI_PS_NONE);
-	esp_wifi_set_ps(WIFI_PS_NONE);
+	applyWifiPowerSaveForCoexistence();
 	delay(100);
 
 	bool apOk = WiFi.softAP(ssid);
 	if (!apOk || WiFi.softAPIP() == IPAddress((uint32_t)0)) {
-		Serial.println("Initial AP start failed, retrying WiFi AP setup");
+		appLogLine("Initial AP start failed, retrying WiFi AP setup");
 		WiFi.mode(WIFI_MODE_NULL);
 		delay(100);
 		WiFi.mode(WIFI_MODE_APSTA);
-		WiFi.setSleep(WIFI_PS_NONE);
-		esp_wifi_set_ps(WIFI_PS_NONE);
+		applyWifiPowerSaveForCoexistence();
 		delay(100);
 		apOk = WiFi.softAP(ssid);
 	}
@@ -396,12 +407,11 @@ void WifiManagerClass::startManagementAP() {
 	_ip = WiFi.softAPIP();
 
 	if (!_managementApActive) {
-		Serial.println("Management AP failed to start");
+		appLogLine("Management AP failed to start");
 		return;
 	}
 
-	Serial.println("Server IP Address:");
-	Serial.println(_ip);
+	appLogPrintf("Server IP Address: %s\n", _ip.toString().c_str());
 }
 
 String WifiManagerClass::getHostname() {

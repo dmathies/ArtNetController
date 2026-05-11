@@ -2,6 +2,7 @@
 
 #include <LittleFS.h>
 #include <cstdio>
+#include <RemoteLogBuffer.h>
 
 Configuration::Configuration() {
 	// File paths to save input values permanently
@@ -27,7 +28,7 @@ void Configuration::initFileSystem() {
 	}
 
 	if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
-		Serial.println("An error has occurred while mounting LittleFS");
+		appLogLine("An error has occurred while mounting LittleFS");
 		return;
 	}
 
@@ -188,13 +189,13 @@ bool Configuration::writeFile(fs::FS &fs, const char *path, const char *message)
 	size_t len = strlen(value);
 
 	if (fs.exists(path) && !fs.remove(path)) {
-		Serial.printf("Failed to remove config file: %s\n", path);
+		appLogPrintf("Failed to remove config file: %s\n", path);
 		return false;
 	}
 
 	File file = fs.open(path, FILE_WRITE, true);
 	if (!file || file.isDirectory()) {
-		Serial.printf("Failed to open config file for write: %s\n", path);
+		appLogPrintf("Failed to open config file for write: %s\n", path);
 		return false;
 	}
 
@@ -203,7 +204,7 @@ bool Configuration::writeFile(fs::FS &fs, const char *path, const char *message)
 	file.close();
 
 	if (written != len) {
-		Serial.printf("Failed to write config file: %s (%u/%u bytes)\n",
+		appLogPrintf("Failed to write config file: %s (%u/%u bytes)\n",
 		              path,
 		              (unsigned int)written,
 		              (unsigned int)len);
@@ -213,7 +214,7 @@ bool Configuration::writeFile(fs::FS &fs, const char *path, const char *message)
 
 	File verifyFile = fs.open(path, FILE_READ);
 	if (!verifyFile || verifyFile.isDirectory()) {
-		Serial.printf("Failed to reopen config file for verify: %s\n", path);
+		appLogPrintf("Failed to reopen config file for verify: %s\n", path);
 		fs.remove(path);
 		return false;
 	}
@@ -221,7 +222,7 @@ bool Configuration::writeFile(fs::FS &fs, const char *path, const char *message)
 	String verifyValue = verifyFile.readString();
 	verifyFile.close();
 	if (verifyValue != value) {
-		Serial.printf("Config verify mismatch for %s\n", path);
+		appLogPrintf("Config verify mismatch for %s\n", path);
 		fs.remove(path);
 		return false;
 	}

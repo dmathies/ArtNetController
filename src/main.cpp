@@ -7,13 +7,16 @@
 #include <Update.h>
 #include <esp_partition.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #include <ArduinoJson.h>
 #include <lwip/sockets.h>
 #include <lwip/tcp.h>
 #include <cctype>
 #include <cstring>
 
+#include "BleManager.h"
 #include "main_common.h"
+#include "RemoteLogBuffer.h"
 
 
 static constexpr int MAX_WS_CLIENTS = 6;
@@ -24,8 +27,12 @@ static constexpr uint32_t SLOW_FS_TOTAL_MS = 1000;
 static constexpr size_t HTTP_FILE_CHUNK_SIZE = 1024;
 static constexpr size_t HTTP_FILE_DIRECT_SEND_LIMIT = 32768;
 static constexpr size_t STATUS_JSON_BUFFER_SIZE = 2048;
+static constexpr size_t OTA_BUNDLE_HEADER_SIZE = 20;
 static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
 static constexpr uint32_t STATUS_CACHE_REFRESH_MS = 100;
+static constexpr uint32_t SLOW_STATUS_REFRESH_MS = 5000;
+static constexpr uint8_t OTA_BUNDLE_MAGIC[8] = {'C', 'C', 'A', 'R', 'O', 'T', 'A', '1'};
+static constexpr uint32_t OTA_BUNDLE_VERSION = 1;
 
 #ifndef WEB_DEBUG_LOG
 #define WEB_DEBUG_LOG 0
@@ -33,6 +40,10 @@ static constexpr uint32_t STATUS_CACHE_REFRESH_MS = 100;
 
 #ifndef WEB_SOCKET_ENABLE
 #define WEB_SOCKET_ENABLE 1
+#endif
+
+#ifndef APP_ASYNC_WEB_ENABLE
+#define APP_ASYNC_WEB_ENABLE 1
 #endif
 
 #ifndef HTTP_TIMING_LOG_ENABLE
@@ -50,6 +61,8 @@ static constexpr uint32_t STATUS_CACHE_REFRESH_MS = 100;
 #ifndef CONFIG_DEBUG_LOG_ENABLE
 #define CONFIG_DEBUG_LOG_ENABLE 0
 #endif
+
+static constexpr bool WS_BACKEND_READY = APP_ASYNC_WEB_ENABLE && WEB_SOCKET_ENABLE;
 
 Configuration g_config;
 WifiManagerClass g_wifiManager(g_config);
@@ -90,6 +103,47 @@ static char g_statusJsonCache[STATUS_JSON_BUFFER_SIZE];
 static size_t g_statusJsonCacheLen = 0;
 static uint32_t g_statusJsonCacheBuiltMs = 0;
 static bool g_asyncUpdateOk = false;
+static AppSlowStatusMetrics g_slowStatusMetrics = {};
+static uint32_t g_slowStatusMetricsBuiltMs = 0;
+static bool g_slowStatusMetricsRefreshInProgress = false;
+
+enum class AsyncBundleStage : uint8_t {
+  Header,
+  Firmware,
+  Filesystem,
+  Complete,
+  Failed,
+};
+
+struct AsyncBundleUpdateState {
+  bool ok;
+  bool totalSizeKnown;
+  size_t expectedTotal;
+  size_t headerBytes;
+  size_t payloadBytesWritten;
+  size_t partBytesRemaining;
+  uint32_t firmwareSize;
+  uint32_t filesystemSize;
+  int currentCmd;
+  AsyncBundleStage stage;
+  uint8_t header[OTA_BUNDLE_HEADER_SIZE];
+  char error[128];
+};
+
+static AsyncBundleUpdateState g_asyncBundleUpdate = {
+  false,
+  false,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  -1,
+  AsyncBundleStage::Header,
+  {0},
+  {0},
+};
 
 struct PendingWsFrame {
   int fd;
@@ -100,6 +154,16 @@ struct PendingWsFrame {
 struct PendingWsPing {
   int fd;
 };
+
+static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json = false);
+
+static void logHeapSnapshot(const char* stage) {
+  Serial.printf("[HEAP] %s free=%lu min=%lu largest=%lu\n",
+                stage ? stage : "unknown",
+                (unsigned long)ESP.getFreeHeap(),
+                (unsigned long)ESP.getMinFreeHeap(),
+                (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
 
 static void noteWebTaskWorkUs(uint32_t busyUs) {
   uint32_t nowUs = micros();
@@ -125,7 +189,7 @@ static void noteWebTaskWorkUs(uint32_t busyUs) {
 static void logFileReadPerf(const char* path) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f || f.isDirectory()) {
-    Serial.printf("[FS] open failed: %s\n", path);
+    appLogPrintf("[FS] open failed: %s\n", path);
     return;
   }
 
@@ -151,6 +215,48 @@ static void logFileReadPerf(const char* path) {
 
 Configuration& appConfig() { return g_config; }
 WifiManagerClass& appWifiManager() { return g_wifiManager; }
+size_t appBuildStatusJson(char* out, size_t outSize, bool details) {
+  if (!g_hooks.buildStatusJson || !out || outSize == 0) return 0;
+  return g_hooks.buildStatusJson(out, outSize, details);
+}
+
+static void refreshSlowStatusMetricsIfDue(uint32_t nowMs) {
+  uint32_t lastBuiltMs;
+  bool shouldRefresh = false;
+  portENTER_CRITICAL(&g_statusMux);
+  lastBuiltMs = g_slowStatusMetricsBuiltMs;
+  if (!g_slowStatusMetricsRefreshInProgress &&
+      (lastBuiltMs == 0 || (nowMs - lastBuiltMs) >= SLOW_STATUS_REFRESH_MS)) {
+    g_slowStatusMetricsRefreshInProgress = true;
+    shouldRefresh = true;
+  }
+  portEXIT_CRITICAL(&g_statusMux);
+
+  if (!shouldRefresh) {
+    return;
+  }
+
+  AppSlowStatusMetrics metrics;
+  metrics.boardTempC = appReadBoardTemperatureC();
+  metrics.freeHeap = ESP.getFreeHeap();
+  metrics.minFreeHeap = ESP.getMinFreeHeap();
+  metrics.largestFreeBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  metrics.resetReason = appResetReasonToString(esp_reset_reason());
+
+  portENTER_CRITICAL(&g_statusMux);
+  g_slowStatusMetrics = metrics;
+  g_slowStatusMetricsBuiltMs = nowMs;
+  g_slowStatusMetricsRefreshInProgress = false;
+  portEXIT_CRITICAL(&g_statusMux);
+}
+const char* appGetDeviceName() { return g_hooks.deviceName ? g_hooks.deviceName : "CableCar"; }
+
+static const char* appGetVariantName() {
+  const char* deviceName = appGetDeviceName();
+  if (strstr(deviceName, "Relay") != nullptr) return "relay";
+  if (strstr(deviceName, "LED") != nullptr) return "led";
+  return "bldc";
+}
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
   ArtDmxPacket r;
@@ -1162,12 +1268,15 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
 
 static esp_err_t updateInfoHandler(httpd_req_t* req) {
   uint32_t startMs = millis();
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<160> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
   doc["ota_ready"] = true;
+  doc["ws_ready"] = WS_BACKEND_READY;
+  doc["ota_transport"] = APP_ASYNC_WEB_ENABLE ? "raw" : "multipart";
 
-  char out[128];
+  char out[160];
   size_t outLen = serializeJson(doc, out, sizeof(out));
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
@@ -1183,6 +1292,218 @@ static void buildUpdateErrorJson(char* out, size_t outSize, const char* message)
   doc["message"] = message ? message : "Update failed";
   doc["error"] = Update.errorString();
   serializeJson(doc, out, outSize);
+}
+
+static void buildUpdateErrorJson(char* out, size_t outSize, const char* message, const char* detail) {
+  StaticJsonDocument<256> doc;
+  doc["success"] = false;
+  doc["message"] = message ? message : "Update failed";
+  doc["error"] = (detail && detail[0]) ? detail : Update.errorString();
+  serializeJson(doc, out, outSize);
+}
+
+static uint32_t readBundleU32(const uint8_t* data) {
+  return ((uint32_t)data[0]) |
+         ((uint32_t)data[1] << 8) |
+         ((uint32_t)data[2] << 16) |
+         ((uint32_t)data[3] << 24);
+}
+
+static void resetAsyncBundleUpdateState() {
+  memset(&g_asyncBundleUpdate, 0, sizeof(g_asyncBundleUpdate));
+  g_asyncBundleUpdate.currentCmd = -1;
+  g_asyncBundleUpdate.stage = AsyncBundleStage::Header;
+}
+
+static void failAsyncBundleUpdate(const char* message) {
+  if (g_asyncBundleUpdate.currentCmd != -1) {
+    Update.abort();
+    g_asyncBundleUpdate.currentCmd = -1;
+  }
+  g_asyncBundleUpdate.ok = false;
+  g_asyncBundleUpdate.stage = AsyncBundleStage::Failed;
+  snprintf(g_asyncBundleUpdate.error, sizeof(g_asyncBundleUpdate.error), "%s", message ? message : "Bundle update failed");
+}
+
+static bool beginAsyncBundlePart(int updateCmd, size_t imageSize) {
+  bool beginOk = false;
+  if (updateCmd == U_SPIFFS) {
+    const esp_partition_t* fsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "littlefs");
+    if (fsPart == nullptr) {
+      failAsyncBundleUpdate("LittleFS partition not found");
+      return false;
+    }
+    if (imageSize > fsPart->size) {
+      failAsyncBundleUpdate("Filesystem image is larger than the LittleFS partition");
+      return false;
+    }
+    beginOk = Update.begin(imageSize, U_SPIFFS);
+  } else {
+    beginOk = Update.begin(imageSize, U_FLASH);
+  }
+
+  if (!beginOk) {
+    Update.printError(Serial);
+    failAsyncBundleUpdate(updateCmd == U_SPIFFS ? "Filesystem update begin failed" : "Firmware update begin failed");
+    return false;
+  }
+
+  g_asyncBundleUpdate.currentCmd = updateCmd;
+  g_asyncBundleUpdate.partBytesRemaining = imageSize;
+  g_asyncBundleUpdate.stage = updateCmd == U_SPIFFS ? AsyncBundleStage::Filesystem : AsyncBundleStage::Firmware;
+  return true;
+}
+
+static bool advanceAsyncBundlePart() {
+  if (g_asyncBundleUpdate.stage == AsyncBundleStage::Complete) {
+    return true;
+  }
+  if (g_asyncBundleUpdate.stage == AsyncBundleStage::Failed) {
+    return false;
+  }
+
+  if (g_asyncBundleUpdate.stage == AsyncBundleStage::Header) {
+    if (g_asyncBundleUpdate.firmwareSize > 0) {
+      return beginAsyncBundlePart(U_FLASH, g_asyncBundleUpdate.firmwareSize);
+    }
+    if (g_asyncBundleUpdate.filesystemSize > 0) {
+      return beginAsyncBundlePart(U_SPIFFS, g_asyncBundleUpdate.filesystemSize);
+    }
+    failAsyncBundleUpdate("Bundle does not contain firmware or filesystem data");
+    return false;
+  }
+
+  if (g_asyncBundleUpdate.currentCmd != -1) {
+    if (!Update.end(true)) {
+      Update.printError(Serial);
+      failAsyncBundleUpdate(g_asyncBundleUpdate.currentCmd == U_SPIFFS ? "Filesystem update finalize failed" : "Firmware update finalize failed");
+      return false;
+    }
+    g_asyncBundleUpdate.currentCmd = -1;
+  }
+
+  if (g_asyncBundleUpdate.stage == AsyncBundleStage::Firmware && g_asyncBundleUpdate.filesystemSize > 0) {
+    return beginAsyncBundlePart(U_SPIFFS, g_asyncBundleUpdate.filesystemSize);
+  }
+
+  g_asyncBundleUpdate.ok = true;
+  g_asyncBundleUpdate.stage = AsyncBundleStage::Complete;
+  return true;
+}
+
+static bool parseAsyncBundleHeader(size_t totalSize, bool totalSizeKnown) {
+  if (memcmp(g_asyncBundleUpdate.header, OTA_BUNDLE_MAGIC, sizeof(OTA_BUNDLE_MAGIC)) != 0) {
+    failAsyncBundleUpdate("Invalid OTA bundle header");
+    return false;
+  }
+
+  const uint32_t version = readBundleU32(g_asyncBundleUpdate.header + 8);
+  if (version != OTA_BUNDLE_VERSION) {
+    failAsyncBundleUpdate("Unsupported OTA bundle version");
+    return false;
+  }
+
+  g_asyncBundleUpdate.firmwareSize = readBundleU32(g_asyncBundleUpdate.header + 12);
+  g_asyncBundleUpdate.filesystemSize = readBundleU32(g_asyncBundleUpdate.header + 16);
+  const size_t expectedSize = OTA_BUNDLE_HEADER_SIZE +
+                              (size_t)g_asyncBundleUpdate.firmwareSize +
+                              (size_t)g_asyncBundleUpdate.filesystemSize;
+  g_asyncBundleUpdate.expectedTotal = expectedSize;
+  g_asyncBundleUpdate.totalSizeKnown = totalSizeKnown;
+  if (totalSizeKnown && totalSize != expectedSize) {
+    failAsyncBundleUpdate("Bundle size does not match the header");
+    return false;
+  }
+
+  return advanceAsyncBundlePart();
+}
+
+static bool bundleUpdateIsComplete() {
+  return g_asyncBundleUpdate.ok &&
+         g_asyncBundleUpdate.stage == AsyncBundleStage::Complete &&
+         g_asyncBundleUpdate.payloadBytesWritten ==
+             (size_t)g_asyncBundleUpdate.firmwareSize + (size_t)g_asyncBundleUpdate.filesystemSize &&
+         (!g_asyncBundleUpdate.totalSizeKnown || g_asyncBundleUpdate.expectedTotal ==
+              OTA_BUNDLE_HEADER_SIZE + g_asyncBundleUpdate.payloadBytesWritten);
+}
+
+static void asyncHandleBundleUpdateBody(AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
+  if (index == 0) {
+    resetAsyncBundleUpdateState();
+    g_wifiManager.setOtaInProgress(true);
+  }
+
+  if (g_asyncBundleUpdate.stage == AsyncBundleStage::Failed) {
+    (void)request;
+    return;
+  }
+
+  size_t offset = 0;
+  while (offset < len) {
+    if (g_asyncBundleUpdate.stage == AsyncBundleStage::Header) {
+      const size_t needed = OTA_BUNDLE_HEADER_SIZE - g_asyncBundleUpdate.headerBytes;
+      const size_t take = (len - offset) < needed ? (len - offset) : needed;
+      memcpy(g_asyncBundleUpdate.header + g_asyncBundleUpdate.headerBytes, data + offset, take);
+      g_asyncBundleUpdate.headerBytes += take;
+      offset += take;
+      if (g_asyncBundleUpdate.headerBytes == OTA_BUNDLE_HEADER_SIZE && !parseAsyncBundleHeader(total, true)) {
+        break;
+      }
+      continue;
+    }
+
+    if (g_asyncBundleUpdate.stage == AsyncBundleStage::Complete) {
+      failAsyncBundleUpdate("Bundle contains unexpected trailing data");
+      break;
+    }
+
+    const size_t remaining = len - offset;
+    const size_t toWrite = remaining < g_asyncBundleUpdate.partBytesRemaining ? remaining : g_asyncBundleUpdate.partBytesRemaining;
+    if (toWrite == 0) {
+      if (!advanceAsyncBundlePart()) break;
+      continue;
+    }
+
+    if (Update.write(data + offset, toWrite) != toWrite) {
+      Update.printError(Serial);
+      failAsyncBundleUpdate("Bundle update write failed");
+      break;
+    }
+
+    g_asyncBundleUpdate.partBytesRemaining -= toWrite;
+    g_asyncBundleUpdate.payloadBytesWritten += toWrite;
+    offset += toWrite;
+
+    if (g_asyncBundleUpdate.partBytesRemaining == 0 && !advanceAsyncBundlePart()) {
+      break;
+    }
+  }
+
+  if (index + len == total &&
+      g_asyncBundleUpdate.stage != AsyncBundleStage::Failed &&
+      g_asyncBundleUpdate.stage != AsyncBundleStage::Complete) {
+    failAsyncBundleUpdate("Bundle upload ended before all parts were written");
+  }
+
+  (void)request;
+}
+
+static void asyncHandleBundleUpdateRequest(AsyncWebServerRequest* request) {
+  uint32_t startMs = millis();
+  g_wifiManager.setOtaInProgress(false);
+  AsyncWebServerResponse* response;
+  if (bundleUpdateIsComplete()) {
+    response = request->beginResponse(200, "application/json", "{\"success\":true,\"message\":\"Bundle update successful. Restarting...\"}");
+    g_wifiManager.scheduleRestart(1000);
+  } else {
+    char out[256];
+    buildUpdateErrorJson(out, sizeof(out), "Bundle update failed", g_asyncBundleUpdate.error);
+    response = request->beginResponse(400, "application/json", out);
+  }
+  asyncAddCommonHeaders(response, true);
+  request->send(response);
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+  resetAsyncBundleUpdateState();
 }
 
 static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
@@ -1262,7 +1583,7 @@ static esp_err_t performUpdate(httpd_req_t* req, int updateCmd) {
 static esp_err_t firmwareUpdateHandler(httpd_req_t* req) { return performUpdate(req, U_FLASH); }
 static esp_err_t fsUpdateHandler(httpd_req_t* req) { return performUpdate(req, U_SPIFFS); }
 
-static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json = false) {
+static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json) {
   if (!response) return;
   response->addHeader("Access-Control-Allow-Origin", "*");
   response->addHeader("Access-Control-Allow-Methods", "GET,PUT,POST,OPTIONS");
@@ -1287,6 +1608,13 @@ static void asyncSendOptions(AsyncWebServerRequest* request) {
   noteWebTaskWorkUs((millis() - startMs) * 1000UL);
 }
 
+static bool isCompressedPageCandidate(const char* path, const char* contentType) {
+  if (contentType && strcmp(contentType, "text/html") == 0) return true;
+  if (!path) return false;
+  const char* ext = strrchr(path, '.');
+  return ext && strcmp(ext, ".html") == 0;
+}
+
 static void asyncSendFsFile(AsyncWebServerRequest* request, const char* path, const char* contentType) {
   uint32_t startMs = millis();
   portENTER_CRITICAL(&g_fileSendMux);
@@ -1295,17 +1623,25 @@ static void asyncSendFsFile(AsyncWebServerRequest* request, const char* path, co
 
   String resolvedPath = path;
   bool servingGzip = false;
-  if (asyncRequestAcceptsGzip(request)) {
-    String gzPath = resolvedPath + ".gz";
-    File gzFile = LittleFS.open(gzPath, FILE_READ);
-    if (gzFile && !gzFile.isDirectory()) {
-      resolvedPath = gzPath;
-      servingGzip = true;
-      gzFile.close();
-    }
+  String gzPath = resolvedPath + ".gz";
+  bool requestAcceptsGzip = asyncRequestAcceptsGzip(request);
+  File gzFile = LittleFS.open(gzPath, FILE_READ);
+  bool gzipFileExists = gzFile && !gzFile.isDirectory();
+  if (gzFile) gzFile.close();
+  bool preferGzip = gzipFileExists && isCompressedPageCandidate(path, contentType);
+  bool plainFileExists = false;
+  if (!preferGzip) {
+    File plainFile = LittleFS.open(resolvedPath, FILE_READ);
+    plainFileExists = plainFile && !plainFile.isDirectory();
+    if (plainFile) plainFile.close();
   }
 
-  if (!LittleFS.exists(resolvedPath)) {
+  if (gzipFileExists && (preferGzip || requestAcceptsGzip || !plainFileExists)) {
+    resolvedPath = gzPath;
+    servingGzip = true;
+  }
+
+  if (!servingGzip && !plainFileExists) {
     AsyncWebServerResponse* response = request->beginResponse(404, "text/plain", "Not Found");
     asyncAddCommonHeaders(response);
     request->send(response);
@@ -1317,6 +1653,7 @@ static void asyncSendFsFile(AsyncWebServerRequest* request, const char* path, co
 
   AsyncWebServerResponse* response = request->beginResponse(LittleFS, resolvedPath, contentType);
   asyncAddCommonHeaders(response);
+  response->addHeader("Cache-Control", "no-store");
   if (servingGzip) {
     response->addHeader("Content-Encoding", "gzip");
     response->addHeader("Vary", "Accept-Encoding");
@@ -1591,10 +1928,15 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
 
 static void asyncUpdateInfoHandler(AsyncWebServerRequest* request) {
   uint32_t startMs = millis();
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<160> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
+  doc["index_page"] = g_hooks.indexPagePath;
   doc["ota_ready"] = true;
+  doc["bundle_ready"] = true;
+  doc["ws_ready"] = WS_BACKEND_READY;
+  doc["ota_transport"] = "raw";
   String out;
   serializeJson(doc, out);
   AsyncWebServerResponse* response = request->beginResponse(200, "application/json", out);
@@ -1766,14 +2108,22 @@ static void webSendFsFile(const char* path, const char* contentType) {
 
   String resolvedPath = path;
   bool servingGzip = false;
-  if (webRequestAcceptsGzip()) {
-    String gzPath = resolvedPath + ".gz";
-    File gzFile = LittleFS.open(gzPath, FILE_READ);
-    if (gzFile && !gzFile.isDirectory()) {
-      resolvedPath = gzPath;
-      servingGzip = true;
-      gzFile.close();
-    }
+  String gzPath = resolvedPath + ".gz";
+  bool requestAcceptsGzip = webRequestAcceptsGzip();
+  File gzFile = LittleFS.open(gzPath, FILE_READ);
+  bool gzipFileExists = gzFile && !gzFile.isDirectory();
+  if (gzFile) gzFile.close();
+  bool preferGzip = gzipFileExists && isCompressedPageCandidate(path, contentType);
+  bool plainFileExists = false;
+  if (!preferGzip) {
+    File plainFile = LittleFS.open(resolvedPath, FILE_READ);
+    plainFileExists = plainFile && !plainFile.isDirectory();
+    if (plainFile) plainFile.close();
+  }
+
+  if (gzipFileExists && (preferGzip || requestAcceptsGzip || !plainFileExists)) {
+    resolvedPath = gzPath;
+    servingGzip = true;
   }
 
   File file = LittleFS.open(resolvedPath.c_str(), FILE_READ);
@@ -1789,7 +2139,6 @@ static void webSendFsFile(const char* path, const char* contentType) {
   const size_t size = file.size();
   webSetCommonHeaders();
   if (servingGzip) {
-    g_webServer.sendHeader("Content-Encoding", "gzip");
     g_webServer.sendHeader("Vary", "Accept-Encoding");
   }
 
@@ -2016,10 +2365,15 @@ static void webCredentialsPutHandler() {
 
 static void webUpdateInfoHandler() {
   uint32_t startMs = millis();
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<160> doc;
   doc["version"] = "1.0.0";
   doc["device"] = g_hooks.deviceName;
+  doc["variant"] = appGetVariantName();
+  doc["index_page"] = g_hooks.indexPagePath;
   doc["ota_ready"] = true;
+  doc["bundle_ready"] = true;
+  doc["ws_ready"] = WS_BACKEND_READY;
+  doc["ota_transport"] = APP_ASYNC_WEB_ENABLE ? "raw" : "multipart";
   String out;
   serializeJson(doc, out);
   webSetCommonHeaders(true);
@@ -2031,10 +2385,13 @@ static void webHandleUpdatePost(int updateCmd) {
   uint32_t startMs = millis();
   bool ok = !Update.hasError();
   g_wifiManager.setOtaInProgress(false);
+  appLogPrintf("[OTA] %s upload complete, responding to client (%s)\n",
+               updateCmd == U_SPIFFS ? "filesystem" : "firmware",
+               ok ? "success" : "failure");
   webSetCommonHeaders(true);
   if (ok) {
     g_webServer.send(200, "application/json", "{\"success\":true,\"message\":\"Update successful. Restarting...\"}");
-    g_wifiManager.scheduleRestart(1000);
+    g_wifiManager.scheduleRestart(3000);
   } else {
     g_webServer.send(400, "application/json", "{\"success\":false,\"message\":\"Update failed\"}");
   }
@@ -2046,6 +2403,10 @@ static void webHandleUpdateUpload(int updateCmd) {
   HTTPUpload& upload = g_webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     g_wifiManager.setOtaInProgress(true);
+    appLogPrintf("[OTA] Starting %s upload: %s (%u bytes if known)\n",
+                 updateCmd == U_SPIFFS ? "filesystem" : "firmware",
+                 upload.filename.c_str(),
+                 (unsigned int)upload.totalSize);
     bool beginOk = false;
     if (updateCmd == U_SPIFFS) {
       const esp_partition_t* fsPart = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "littlefs");
@@ -2054,18 +2415,116 @@ static void webHandleUpdateUpload(int updateCmd) {
       beginOk = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
     if (!beginOk) {
+      appLogPrintf("[OTA] Update.begin failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      appLogPrintf("[OTA] Update.write failed for %s at chunk %u\n",
+                   updateCmd == U_SPIFFS ? "filesystem" : "firmware",
+                   (unsigned int)upload.currentSize);
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_END) {
+    appLogPrintf("[OTA] Finalizing %s upload (%u bytes written)\n",
+                 updateCmd == U_SPIFFS ? "filesystem" : "firmware",
+                 (unsigned int)upload.totalSize);
     if (!Update.end(true)) {
+      appLogPrintf("[OTA] Update.end failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    appLogPrintf("[OTA] %s upload aborted by client\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
     Update.abort();
+    g_wifiManager.setOtaInProgress(false);
+  }
+}
+
+static void webHandleBundleUpdatePost() {
+  uint32_t startMs = millis();
+  g_wifiManager.setOtaInProgress(false);
+  appLogPrintf("[OTA] bundle upload complete, responding to client (%s)\n",
+               bundleUpdateIsComplete() ? "success" : "failure");
+  webSetCommonHeaders(true);
+  if (bundleUpdateIsComplete()) {
+    g_webServer.send(200, "application/json", "{\"success\":true,\"message\":\"Bundle update successful. Restarting...\"}");
+    g_wifiManager.scheduleRestart(3000);
+  } else {
+    char out[256];
+    buildUpdateErrorJson(out, sizeof(out), "Bundle update failed", g_asyncBundleUpdate.error);
+    g_webServer.send(400, "application/json", out);
+  }
+  noteWebTaskWorkUs((millis() - startMs) * 1000UL);
+  resetAsyncBundleUpdateState();
+}
+
+static void webHandleBundleUpdateUpload() {
+  HTTPUpload& upload = g_webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    resetAsyncBundleUpdateState();
+    g_wifiManager.setOtaInProgress(true);
+    appLogPrintf("[OTA] Starting bundle upload: %s (%u bytes if known)\n",
+                 upload.filename.c_str(),
+                 (unsigned int)upload.totalSize);
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    size_t offset = 0;
+    while (offset < upload.currentSize && g_asyncBundleUpdate.stage != AsyncBundleStage::Failed) {
+      if (g_asyncBundleUpdate.stage == AsyncBundleStage::Header) {
+        const size_t needed = OTA_BUNDLE_HEADER_SIZE - g_asyncBundleUpdate.headerBytes;
+        const size_t take = (upload.currentSize - offset) < needed ? (upload.currentSize - offset) : needed;
+        memcpy(g_asyncBundleUpdate.header + g_asyncBundleUpdate.headerBytes, upload.buf + offset, take);
+        g_asyncBundleUpdate.headerBytes += take;
+        offset += take;
+        if (g_asyncBundleUpdate.headerBytes == OTA_BUNDLE_HEADER_SIZE &&
+            !parseAsyncBundleHeader(0, false)) {
+          break;
+        }
+        continue;
+      }
+
+      if (g_asyncBundleUpdate.stage == AsyncBundleStage::Complete) {
+        failAsyncBundleUpdate("Bundle contains unexpected trailing data");
+        break;
+      }
+
+      const size_t remaining = upload.currentSize - offset;
+      const size_t toWrite = remaining < g_asyncBundleUpdate.partBytesRemaining ? remaining : g_asyncBundleUpdate.partBytesRemaining;
+      if (toWrite == 0) {
+        if (!advanceAsyncBundlePart()) break;
+        continue;
+      }
+
+      if (Update.write(upload.buf + offset, toWrite) != toWrite) {
+        Update.printError(Serial);
+        failAsyncBundleUpdate("Bundle update write failed");
+        break;
+      }
+
+      g_asyncBundleUpdate.partBytesRemaining -= toWrite;
+      g_asyncBundleUpdate.payloadBytesWritten += toWrite;
+      offset += toWrite;
+
+      if (g_asyncBundleUpdate.partBytesRemaining == 0 && !advanceAsyncBundlePart()) {
+        break;
+      }
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END) {
+    appLogPrintf("[OTA] Finalizing bundle upload (%u bytes written)\n", (unsigned int)upload.totalSize);
+    if (g_asyncBundleUpdate.stage != AsyncBundleStage::Failed && g_asyncBundleUpdate.stage != AsyncBundleStage::Complete) {
+      failAsyncBundleUpdate("Bundle upload ended before all parts were written");
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    appLogLine("[OTA] bundle upload aborted by client");
+    failAsyncBundleUpdate("Bundle upload aborted");
     g_wifiManager.setOtaInProgress(false);
   }
 }
@@ -2098,6 +2557,7 @@ static void registerWsUri(const char* path, esp_err_t (*handler)(httpd_req_t*)) 
 
 static void startWebServer() {
   if (g_webServerStarted) return;
+#if APP_ASYNC_WEB_ENABLE
   Serial.printf("[HTTPCFG] backend=async-webserver timing=%d ws=%d prio=async-tcp core=%d sockets=na backlog=na\n",
                 HTTP_TIMING_LOG_ENABLE,
                 WEB_SOCKET_ENABLE,
@@ -2114,6 +2574,11 @@ static void startWebServer() {
   });
   g_asyncWebServer.on("/settings.html", HTTP_GET, [](AsyncWebServerRequest* request) {
     asyncSendFsFile(request, "/wifi-manager/settings.html", "text/html");
+  });
+  g_asyncWebServer.on("/favicon.ico", HTTP_GET, [](AsyncWebServerRequest* request) {
+    AsyncWebServerResponse* response = request->beginResponse(204);
+    asyncAddCommonHeaders(response);
+    request->send(response);
   });
   g_asyncWebServer.on("/status", HTTP_GET, asyncStatusHandler);
   g_asyncWebServer.on("/networks", HTTP_GET, asyncNetworksHandler);
@@ -2141,11 +2606,18 @@ static void startWebServer() {
       [](AsyncWebServerRequest* request, uint8_t* data, size_t len, size_t index, size_t total) {
         asyncHandleUpdateBody(request, U_SPIFFS, data, len, index, total);
       });
+  g_asyncWebServer.on(
+      "/updatebundle",
+      HTTP_POST,
+      asyncHandleBundleUpdateRequest,
+      nullptr,
+      asyncHandleBundleUpdateBody);
   g_asyncWebServer.on("/status", HTTP_OPTIONS, asyncSendOptions);
   g_asyncWebServer.on("/networks", HTTP_OPTIONS, asyncSendOptions);
   g_asyncWebServer.on("/credentials", HTTP_OPTIONS, asyncSendOptions);
   g_asyncWebServer.on("/update", HTTP_OPTIONS, asyncSendOptions);
   g_asyncWebServer.on("/updatefs", HTTP_OPTIONS, asyncSendOptions);
+  g_asyncWebServer.on("/updatebundle", HTTP_OPTIONS, asyncSendOptions);
   g_asyncWebServer.onNotFound(asyncNotFoundHandler);
   if (WEB_SOCKET_ENABLE) {
     g_statusWs.onEvent(onAsyncWsEvent);
@@ -2155,6 +2627,38 @@ static void startWebServer() {
   g_webServerStarted = true;
   g_webTaskHandle = nullptr;
   Serial.println("ESPAsyncWebServer started on :80");
+#else
+  Serial.printf("[HTTPCFG] backend=webserver timing=%d ws=0 prio=loop core=loop sockets=na backlog=na\n",
+                HTTP_TIMING_LOG_ENABLE);
+
+  g_webServer.on("/", HTTP_GET, []() { webSendFsFile(g_hooks.indexPagePath, "text/html"); });
+  g_webServer.on("/index.html", HTTP_GET, []() { webSendFsFile(g_hooks.indexPagePath, "text/html"); });
+  g_webServer.on("/ota.html", HTTP_GET, []() { webSendFsFile("/wifi-manager/ota.html", "text/html"); });
+  g_webServer.on("/settings.html", HTTP_GET, []() { webSendFsFile("/wifi-manager/settings.html", "text/html"); });
+  g_webServer.on("/favicon.ico", HTTP_GET, []() {
+    webSetCommonHeaders();
+    g_webServer.send(204, "text/plain", "");
+  });
+  g_webServer.on("/status", HTTP_GET, webStatusHandler);
+  g_webServer.on("/networks", HTTP_GET, webNetworksHandler);
+  g_webServer.on("/credentials", HTTP_GET, webCredentialsGetHandler);
+  g_webServer.on("/credentials", HTTP_PUT, webCredentialsPutHandler);
+  g_webServer.on("/update", HTTP_GET, webUpdateInfoHandler);
+  g_webServer.on("/update", HTTP_POST, []() { webHandleUpdatePost(U_FLASH); }, []() { webHandleUpdateUpload(U_FLASH); });
+  g_webServer.on("/updatefs", HTTP_POST, []() { webHandleUpdatePost(U_SPIFFS); }, []() { webHandleUpdateUpload(U_SPIFFS); });
+  g_webServer.on("/status", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/networks", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/credentials", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/update", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/updatefs", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/updatebundle", HTTP_OPTIONS, webSendOptions);
+  g_webServer.on("/updatebundle", HTTP_POST, webHandleBundleUpdatePost, webHandleBundleUpdateUpload);
+  g_webServer.onNotFound(webNotFoundHandler);
+  g_webServer.begin();
+  g_webServerStarted = true;
+  g_webTaskHandle = nullptr;
+  appLogLine("WebServer started on :80");
+#endif
 }
 
 static void logStoredConfig() {
@@ -2201,6 +2705,17 @@ AppTaskRuntimeStats appGetWebTaskRuntimeStats() {
   return stats;
 }
 
+AppSlowStatusMetrics appGetSlowStatusMetrics() {
+  const uint32_t nowMs = millis();
+  refreshSlowStatusMetricsIfDue(nowMs);
+
+  AppSlowStatusMetrics metrics;
+  portENTER_CRITICAL(&g_statusMux);
+  metrics = g_slowStatusMetrics;
+  portEXIT_CRITICAL(&g_statusMux);
+  return metrics;
+}
+
 
 void appInitializeBaseRuntime() {
   Serial.begin(115200);
@@ -2212,11 +2727,12 @@ void appInitializeBaseRuntime() {
   }
 #endif
 
-  Serial.println("Startup...");
+  appLogLine("Startup...");
 
   if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
-    Serial.println("LittleFS mount failed");
+    appLogLine("LittleFS mount failed");
   }
+  logHeapSnapshot("base-runtime");
 }
 
 void appInitRuntime(const AppRuntimeHooks& hooks) {
@@ -2224,12 +2740,17 @@ void appInitRuntime(const AppRuntimeHooks& hooks) {
 }
 
 void appStartCommonServices() {
+  logHeapSnapshot("before-ble");
+  appStartBleServices();
+  logHeapSnapshot("after-ble");
+}
+
+void appStartWebServices() {
   startWebServer();
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
 
 #if FS_BENCHMARK_LOG_ENABLE
   logFileReadPerf("/wifi-manager/index.html");
-  logFileReadPerf("/wifi-manager/index_led.html");
   logFileReadPerf("/wifi-manager/settings.html");
   logFileReadPerf("/wifi-manager/ota.html");
 #endif
@@ -2237,14 +2758,21 @@ void appStartCommonServices() {
 
 void appConnectWifi() {
   logStoredConfig();
+  logHeapSnapshot("before-wifi");
   bool connected = g_wifiManager.connectToWifi();
   if (!connected) {
-    Serial.println("No WiFi... Starting AP");
+    appLogLine("No WiFi... Starting AP");
     g_wifiManager.startManagementAP();
   }
 
+  appRefreshBleAdvertising();
+  logHeapSnapshot("after-wifi");
+
+  appStartWebServices();
+  logHeapSnapshot("after-web");
+
   IPAddress ip = g_wifiManager.getIP();
-  Serial.printf("IP Address: %s\n", ip.toString().c_str());
+  appLogPrintf("IP Address: %s\n", ip.toString().c_str());
 }
 
 void appCommonLoop(uint32_t wsStatusPushMs) {
@@ -2252,7 +2780,14 @@ void appCommonLoop(uint32_t wsStatusPushMs) {
     g_hooks.pollInputs();
   }
 
+#if !APP_ASYNC_WEB_ENABLE
+  uint32_t webStartUs = micros();
+  g_webServer.handleClient();
+  noteWebTaskWorkUs(micros() - webStartUs);
+#endif
+
   g_wifiManager.check();
+  appBleLoop();
 
   uint32_t now = millis();
   refreshStatusCacheIfDue(now);
