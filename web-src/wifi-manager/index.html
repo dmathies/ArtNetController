@@ -498,6 +498,17 @@
         document.title = title;
       }
 
+      function formatBuildSummary(data) {
+        if (!data || typeof data !== 'object') return '-';
+        if (typeof data.build_summary === 'string' && data.build_summary.length) {
+          return data.build_summary;
+        }
+        if (typeof data.version === 'string' && typeof data.build === 'string') {
+          return `${data.version} (${data.build})`;
+        }
+        return data.version || '-';
+      }
+
       function formatVariantLabel(variant) {
         if (variant === 'bldc') return 'BLDC';
         if (variant === 'relay') return 'Relay';
@@ -598,6 +609,8 @@
           if (data && typeof data.device === 'string' && data.device.length) {
             updateDashboardTitle(data.device);
           }
+          setText('buildSummary', formatBuildSummary(data));
+          setText('buildMeta', `${data.build_env || '-'} | ${data.build_time_utc || '-'}`);
           if (data && typeof data.ws_ready !== 'undefined') {
             wsSupported = Boolean(data.ws_ready);
             if (!wsSupported) {
@@ -812,6 +825,8 @@
           <p class="eyebrow">Geneva Musical Theatre</p>
           <h1 id="dashboardTitle">Cablecar Dashboard</h1>
           <p id="dashboardSubtitle" class="subtitle">Waiting for device status...</p>
+          <p class="subtitle">Build <strong id="buildSummary">-</strong></p>
+          <p class="subtitle"><span id="buildMeta">-</span></p>
         </div>
       </div>
       <div class="toolbar">

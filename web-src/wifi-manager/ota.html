@@ -776,6 +776,17 @@
         return device || 'Unknown';
       }
 
+      function formatBuildSummary(data) {
+        if (!data || typeof data !== 'object') return '-';
+        if (typeof data.build_summary === 'string' && data.build_summary.length) {
+          return data.build_summary;
+        }
+        if (typeof data.version === 'string' && typeof data.build === 'string') {
+          return `${data.version} (${data.build})`;
+        }
+        return data.version || '-';
+      }
+
       // Get OTA info on page load
       window.addEventListener('load', async () => {
         try {
@@ -784,11 +795,21 @@
           const variantLabel = formatVariantLabel(data.variant, data.device);
           const variantEl = document.getElementById('deviceVariant');
           const variantHintEl = document.getElementById('variantPathHint');
+          const manifestHintEl = document.getElementById('manifestPathHint');
           if (variantEl) variantEl.textContent = variantLabel;
+          const buildSummaryEl = document.getElementById('buildSummary');
+          const buildMetaEl = document.getElementById('buildMeta');
+          if (buildSummaryEl) buildSummaryEl.textContent = formatBuildSummary(data);
+          if (buildMetaEl) buildMetaEl.textContent = `${data.build_env || '-'} | ${data.build_time_utc || '-'}`;
           if (variantHintEl) {
             variantHintEl.textContent = data.variant
               ? `.pio/build/<env-for-${data.variant}>/`
               : '.pio/build/<your-environment>/';
+          }
+          if (manifestHintEl) {
+            manifestHintEl.textContent = data.variant
+              ? `.pio/build/<env-for-${data.variant}>/esp-web-tools-manifest.json`
+              : '.pio/build/<your-environment>/esp-web-tools-manifest.json';
           }
           if (data && typeof data.ota_transport === 'string' && data.ota_transport.length) {
             otaTransport = data.ota_transport;
@@ -836,6 +857,8 @@
           <p class="eyebrow">Geneva Musical Theatre</p>
           <h1>Firmware Updates</h1>
           <p class="subtitle">Firmware and filesystem deployment</p>
+          <p class="subtitle">Build <strong id="buildSummary">-</strong></p>
+          <p class="subtitle"><span id="buildMeta">-</span></p>
         </div>
       </div>
       <div class="toolbar">
@@ -857,6 +880,10 @@
         <div class="card-inner">
           <h2 class="card-title">Update Packages</h2>
           <p class="subtitle" style="margin-top:8px;">Current device variant: <strong id="deviceVariant">Detecting...</strong></p>
+          <div class="info-box" style="margin-top:14px;">
+            <strong>ESP Web Tools:</strong> generated installer manifest at
+            <code id="manifestPathHint">.pio/build/&lt;your-environment&gt;/esp-web-tools-manifest.json</code>
+          </div>
 
           <div class="tabs">
             <button class="tab-btn active" onclick="switchTab('bundle', this)">Combined</button>

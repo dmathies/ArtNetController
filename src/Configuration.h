@@ -30,16 +30,24 @@ class Configuration {
 		Configuration();
 
 		bool writeSSID(const String& ssid);
+		bool writeSSID(const char* ssid);
 		bool writePass(const String& pass);
+		bool writePass(const char* pass);
         bool writeDMXAddress(int value);
         bool writeDMXUniverse(int value);
         bool writeHostname(const String& hostname);
+        bool writeHostname(const char* hostname);
 		bool writeDhcpEnabled(bool enabled);
 		bool writeStaticIP(const String& ip);
+		bool writeStaticIP(const char* ip);
 		bool writeGateway(const String& gateway);
+		bool writeGateway(const char* gateway);
 		bool writeSubnet(const String& subnet);
+		bool writeSubnet(const char* subnet);
 		bool writeDNS1(const String& dns1);
+		bool writeDNS1(const char* dns1);
 		bool writeDNS2(const String& dns2);
+		bool writeDNS2(const char* dns2);
 		bool writeStartValue(float value);
 
         String getSSID();

@@ -56,12 +56,24 @@ bool Configuration::writeSSID(const String& ssid) {
 	return writeFile(LittleFS, ssidPath, ssid.c_str());
 }
 
+bool Configuration::writeSSID(const char* ssid) {
+	return writeFile(LittleFS, ssidPath, ssid);
+}
+
 bool Configuration::writePass(const String& pass) {
 	return writeFile(LittleFS, passPath, pass.c_str());
 }
 
+bool Configuration::writePass(const char* pass) {
+	return writeFile(LittleFS, passPath, pass);
+}
+
 bool Configuration::writeHostname(const String& hostname) {
 	return writeFile(LittleFS, hostnamePath, hostname.c_str());
+}
+
+bool Configuration::writeHostname(const char* hostname) {
+	return writeFile(LittleFS, hostnamePath, hostname);
 }
 
 bool Configuration::writeDMXAddress(int value) {
@@ -82,20 +94,40 @@ bool Configuration::writeStaticIP(const String& ip) {
 	return writeFile(LittleFS, ipPath, ip.c_str());
 }
 
+bool Configuration::writeStaticIP(const char* ip) {
+	return writeFile(LittleFS, ipPath, ip);
+}
+
 bool Configuration::writeGateway(const String& gateway) {
 	return writeFile(LittleFS, gatewayPath, gateway.c_str());
+}
+
+bool Configuration::writeGateway(const char* gateway) {
+	return writeFile(LittleFS, gatewayPath, gateway);
 }
 
 bool Configuration::writeSubnet(const String& subnet) {
 	return writeFile(LittleFS, subnetPath, subnet.c_str());
 }
 
+bool Configuration::writeSubnet(const char* subnet) {
+	return writeFile(LittleFS, subnetPath, subnet);
+}
+
 bool Configuration::writeDNS1(const String& dns1) {
 	return writeFile(LittleFS, dns1Path, dns1.c_str());
 }
 
+bool Configuration::writeDNS1(const char* dns1) {
+	return writeFile(LittleFS, dns1Path, dns1);
+}
+
 bool Configuration::writeDNS2(const String& dns2) {
 	return writeFile(LittleFS, dns2Path, dns2.c_str());
+}
+
+bool Configuration::writeDNS2(const char* dns2) {
+	return writeFile(LittleFS, dns2Path, dns2);
 }
 
 bool Configuration::writeStartValue(float value) {

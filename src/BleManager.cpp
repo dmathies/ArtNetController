@@ -22,9 +22,11 @@
 
 #if APP_BLE_ENABLE
 
+#include <cstring>
 #include <ArduinoJson.h>
 #include <NimBLEDevice.h>
 
+#include "BuildMetadata.h"
 #include "RemoteLogBuffer.h"
 #include "main_common.h"
 
@@ -59,7 +61,15 @@ constexpr size_t BLE_PENDING_VALUE_MAX = 96;
 constexpr uint16_t BLE_MANUFACTURER_ID = 0xFFFF;
 constexpr uint8_t BLE_ADV_METADATA_VERSION = 1;
 constexpr uint8_t BLE_ADV_FLAG_IP_PRESENT = 0x01;
+constexpr uint32_t BLE_ADV_REFRESH_MS = 1000;
 constexpr size_t BLE_RSSI_TEXT_BYTES = 16;
+
+enum class AdvertisedVariant : uint8_t {
+  Bldc = 0,
+  Relay = 1,
+  Led = 2,
+  Unknown = 255,
+};
 
 enum class ConfigField {
   Ssid,
@@ -141,8 +151,12 @@ bool g_bleStarted = false;
 bool g_bleClientConnected = false;
 uint32_t g_lastStatusRefreshMs = 0;
 bool g_statusRefreshPending = false;
+uint32_t g_lastAdvRefreshMs = 0;
 char g_lastNotifiedLogLine[BLE_LAST_LOG_BYTES + 1] = {0};
 char g_lastNotifiedRssi[BLE_RSSI_TEXT_BYTES] = {0};
+std::string g_lastAdvertisingMetadata;
+std::string g_lastScanResponseMetadata;
+String g_lastAdvertisedName;
 portMUX_TYPE g_bleMux = portMUX_INITIALIZER_UNLOCKED;
 
 struct PendingBleWrite {
@@ -251,14 +265,87 @@ bool parseMacAddressBytes(const char* macText, uint8_t out[6]) {
   return true;
 }
 
+void parseVersionTriplet(uint8_t out[3]) {
+  if (!out) return;
+  out[0] = 0;
+  out[1] = 0;
+  out[2] = 0;
+
+  unsigned int major = 0;
+  unsigned int minor = 0;
+  unsigned int patch = 0;
+  int matched = sscanf(APP_BUILD_VERSION, "%u.%u.%u", &major, &minor, &patch);
+  if (matched >= 1) out[0] = (uint8_t)(major > 255 ? 255 : major);
+  if (matched >= 2) out[1] = (uint8_t)(minor > 255 ? 255 : minor);
+  if (matched >= 3) out[2] = (uint8_t)(patch > 255 ? 255 : patch);
+}
+
+uint16_t clampNormalizedValue(int32_t value) {
+  if (value < 0) return 0;
+  if (value > 1000) return 1000;
+  return (uint16_t)value;
+}
+
+uint16_t scaleByteToNormalized(uint8_t value) {
+  return (uint16_t)(((uint32_t)value * 1000U + 127U) / 255U);
+}
+
+AdvertisedVariant parseAdvertisedVariant(const char* variantText) {
+  if (!variantText) return AdvertisedVariant::Unknown;
+  if (strcmp(variantText, "bldc") == 0) return AdvertisedVariant::Bldc;
+  if (strcmp(variantText, "relay") == 0) return AdvertisedVariant::Relay;
+  if (strcmp(variantText, "led") == 0) return AdvertisedVariant::Led;
+  return AdvertisedVariant::Unknown;
+}
+
+bool readAdvertisedStatusPayload(AdvertisedVariant& variantOut, uint16_t& normalizedValueOut) {
+  char json[512];
+  size_t jsonLen = appBuildStatusJson(json, sizeof(json), false);
+  if (jsonLen == 0 || jsonLen >= sizeof(json)) {
+    variantOut = AdvertisedVariant::Unknown;
+    normalizedValueOut = 0;
+    return false;
+  }
+
+  json[jsonLen] = '\0';
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, json);
+  if (err) {
+    variantOut = AdvertisedVariant::Unknown;
+    normalizedValueOut = 0;
+    return false;
+  }
+
+  const char* variantText = doc["variant"] | "";
+  variantOut = parseAdvertisedVariant(variantText);
+
+  switch (variantOut) {
+    case AdvertisedVariant::Bldc:
+      normalizedValueOut = scaleByteToNormalized((uint8_t)(doc["motor_value"] | 0));
+      return true;
+    case AdvertisedVariant::Relay:
+      normalizedValueOut = (doc["relay_on"] | false) ? 1000 : 0;
+      return true;
+    case AdvertisedVariant::Led: {
+      float led0 = doc["led_value0"] | 0.0f;
+      if (isnan(led0) || isinf(led0)) led0 = 0.0f;
+      if (led0 < 0.0f) led0 = 0.0f;
+      if (led0 > 1.0f) led0 = 1.0f;
+      normalizedValueOut = clampNormalizedValue((int32_t)(led0 * 1000.0f + 0.5f));
+      return true;
+    }
+    default:
+      normalizedValueOut = 0;
+      return false;
+  }
+}
+
 std::string buildAdvertisingMetadata() {
   WifiManagerClass& wifi = appWifiManager();
   char macBuf[18];
-  wifi.getMacAddress(macBuf, sizeof(macBuf));
-
   uint8_t macBytes[6] = {0};
+  wifi.getMacAddress(macBuf, sizeof(macBuf));
   parseMacAddressBytes(macBuf, macBytes);
-
   IPAddress ip = wifi.getIP();
   bool hasIp = ip != IPAddress((uint32_t)0);
 
@@ -273,25 +360,48 @@ std::string buildAdvertisingMetadata() {
     uint8_t ipBytes[4] = {ip[0], ip[1], ip[2], ip[3]};
     data.append((const char*)ipBytes, sizeof(ipBytes));
   }
-
   return data;
 }
 
-void configureAdvertisingPayload(BLEAdvertising* advertising, const String& deviceName) {
+std::string buildScanResponseMetadata() {
+  AdvertisedVariant variant = AdvertisedVariant::Unknown;
+  uint16_t normalizedValue = 0;
+  readAdvertisedStatusPayload(variant, normalizedValue);
+  uint8_t version[3];
+  parseVersionTriplet(version);
+
+  std::string data;
+  data.reserve(9);
+  data.push_back((char)(BLE_MANUFACTURER_ID & 0xFF));
+  data.push_back((char)((BLE_MANUFACTURER_ID >> 8) & 0xFF));
+  data.push_back((char)BLE_ADV_METADATA_VERSION);
+  data.push_back((char)version[0]);
+  data.push_back((char)version[1]);
+  data.push_back((char)version[2]);
+  data.push_back((char)variant);
+  data.push_back((char)(normalizedValue & 0xFF));
+  data.push_back((char)((normalizedValue >> 8) & 0xFF));
+  return data;
+}
+
+void configureAdvertisingPayload(BLEAdvertising* advertising,
+                                 const String& deviceName,
+                                 const std::string& metadata,
+                                 const std::string& scanMetadata) {
   if (!advertising) return;
 
   advertising->setMinInterval(BLE_ADV_INTERVAL_MIN);
   advertising->setMaxInterval(BLE_ADV_INTERVAL_MAX);
 
   BLEAdvertisementData advData;
-  advData.setManufacturerData(buildAdvertisingMetadata());
+  advData.setManufacturerData(metadata);
 #if APP_BLE_GATT_ENABLE
   advertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
   advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
-  advData.addServiceUUID(BLE_SERVICE_UUID);
   advertising->setAdvertisementData(advData);
 
   BLEAdvertisementData scanResponseData;
+  scanResponseData.setManufacturerData(scanMetadata);
   scanResponseData.setName(deviceName.c_str());
   advertising->setScanResponseData(scanResponseData);
   advertising->enableScanResponse(true);
@@ -302,6 +412,30 @@ void configureAdvertisingPayload(BLEAdvertising* advertising, const String& devi
   advertising->setAdvertisementData(advData);
   advertising->enableScanResponse(false);
 #endif
+}
+
+void refreshAdvertisingPayloadIfNeeded(bool force) {
+  if (!g_bleStarted) return;
+
+  String deviceName = buildAdvertisedName();
+  std::string metadata = buildAdvertisingMetadata();
+  std::string scanMetadata = buildScanResponseMetadata();
+  if (!force &&
+      metadata == g_lastAdvertisingMetadata &&
+      scanMetadata == g_lastScanResponseMetadata &&
+      deviceName == g_lastAdvertisedName) {
+    return;
+  }
+
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  if (!advertising) return;
+
+  advertising->stop();
+  configureAdvertisingPayload(advertising, deviceName, metadata, scanMetadata);
+  advertising->start();
+  g_lastAdvertisingMetadata = metadata;
+  g_lastScanResponseMetadata = scanMetadata;
+  g_lastAdvertisedName = deviceName;
 }
 
 void setResult(const String& message) {
@@ -563,13 +697,19 @@ void appStartBleServices() {
   if (g_bleStarted) return;
 
   String deviceName = buildAdvertisedName();
+  std::string metadata = buildAdvertisingMetadata();
+  std::string scanMetadata = buildScanResponseMetadata();
   BLEDevice::init(deviceName.c_str());
   BLEDevice::setMTU(APP_BLE_MTU);
 
 #if !APP_BLE_GATT_ENABLE
   BLEAdvertising* advertisingOnly = BLEDevice::getAdvertising();
-  configureAdvertisingPayload(advertisingOnly, deviceName);
+  configureAdvertisingPayload(advertisingOnly, deviceName, metadata, scanMetadata);
   advertisingOnly->start();
+  g_lastAdvertisingMetadata = metadata;
+  g_lastScanResponseMetadata = scanMetadata;
+  g_lastAdvertisedName = deviceName;
+  g_lastAdvRefreshMs = millis();
   appLogPrintf("BLE advertising-only started as %s\n", deviceName.c_str());
   g_bleStarted = true;
   return;
@@ -692,8 +832,12 @@ void appStartBleServices() {
   g_server->start();
 
   BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  configureAdvertisingPayload(advertising, deviceName);
+  configureAdvertisingPayload(advertising, deviceName, metadata, scanMetadata);
   advertising->start();
+  g_lastAdvertisingMetadata = metadata;
+  g_lastScanResponseMetadata = scanMetadata;
+  g_lastAdvertisedName = deviceName;
+  g_lastAdvRefreshMs = millis();
 
   appLogPrintf("BLE service started as %s\n", deviceName.c_str());
   g_bleStarted = true;
@@ -701,19 +845,19 @@ void appStartBleServices() {
 
 void appRefreshBleAdvertising() {
   if (!g_bleStarted) return;
-
-  String deviceName = buildAdvertisedName();
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
-  if (!advertising) return;
-
-  advertising->stop();
-  configureAdvertisingPayload(advertising, deviceName);
-  advertising->start();
-  appLogPrintf("BLE advertising refreshed as %s\n", deviceName.c_str());
+  refreshAdvertisingPayloadIfNeeded(true);
+  g_lastAdvRefreshMs = millis();
+  appLogPrintf("BLE advertising refreshed as %s\n", g_lastAdvertisedName.c_str());
 }
 
 void appBleLoop() {
   if (!g_bleStarted) return;
+
+  uint32_t now = millis();
+  if ((now - g_lastAdvRefreshMs) >= BLE_ADV_REFRESH_MS) {
+    refreshAdvertisingPayloadIfNeeded(false);
+    g_lastAdvRefreshMs = now;
+  }
 
 #if !APP_BLE_GATT_ENABLE
   return;
@@ -755,7 +899,6 @@ void appBleLoop() {
     }
   }
 
-  uint32_t now = millis();
   if (!g_bleClientConnected && !g_statusRefreshPending) return;
   if (!g_statusRefreshPending && (now - g_lastStatusRefreshMs) < BLE_STATUS_REFRESH_MS) return;
   g_lastStatusRefreshMs = now;

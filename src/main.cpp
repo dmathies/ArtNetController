@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "BleManager.h"
+#include "BuildMetadata.h"
 #include "main_common.h"
 #include "RemoteLogBuffer.h"
 
@@ -25,7 +26,6 @@ static constexpr uint32_t SLOW_WS_BROADCAST_MS = 50;
 static constexpr uint32_t SLOW_FS_SEND_MS = 500;
 static constexpr uint32_t SLOW_FS_TOTAL_MS = 1000;
 static constexpr size_t HTTP_FILE_CHUNK_SIZE = 1024;
-static constexpr size_t HTTP_FILE_DIRECT_SEND_LIMIT = 32768;
 static constexpr size_t STATUS_JSON_BUFFER_SIZE = 2048;
 static constexpr size_t OTA_BUNDLE_HEADER_SIZE = 20;
 static constexpr uint32_t HEALTH_LOG_INTERVAL_MS = 5000;
@@ -44,6 +44,10 @@ static constexpr uint32_t OTA_BUNDLE_VERSION = 1;
 
 #ifndef APP_ASYNC_WEB_ENABLE
 #define APP_ASYNC_WEB_ENABLE 1
+#endif
+
+#ifndef HTTP_FILE_DIRECT_SEND_LIMIT
+#define HTTP_FILE_DIRECT_SEND_LIMIT 4096
 #endif
 
 #ifndef HTTP_TIMING_LOG_ENABLE
@@ -156,6 +160,15 @@ struct PendingWsPing {
 };
 
 static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json = false);
+
+static void addBuildInfo(JsonDocument& doc) {
+  doc["version"] = APP_BUILD_VERSION;
+  doc["build"] = APP_BUILD_GIT_SHA;
+  doc["build_ref"] = APP_BUILD_GIT_REF;
+  doc["build_env"] = APP_BUILD_ENV;
+  doc["build_time_utc"] = APP_BUILD_TIME_UTC;
+  doc["build_summary"] = APP_BUILD_SUMMARY;
+}
 
 static void logHeapSnapshot(const char* stage) {
   Serial.printf("[HEAP] %s free=%lu min=%lu largest=%lu\n",
@@ -491,6 +504,23 @@ static bool requestAcceptsGzip(httpd_req_t* req) {
   }
 
   return strstr(value, "gzip") != nullptr;
+}
+
+static bool copyCachedStatusJson(char* out, size_t outSize, size_t* outLen) {
+  if (!out || outSize == 0 || !outLen) return false;
+
+  size_t cachedLen = 0;
+  portENTER_CRITICAL(&g_statusMux);
+  cachedLen = g_statusJsonCacheLen;
+  if (cachedLen > (outSize - 1)) cachedLen = outSize - 1;
+  if (cachedLen > 0) {
+    memcpy(out, g_statusJsonCache, cachedLen);
+  }
+  portEXIT_CRITICAL(&g_statusMux);
+
+  out[cachedLen] = '\0';
+  *outLen = cachedLen;
+  return cachedLen > 0;
 }
 
 static esp_err_t sendFsFile(httpd_req_t* req, const char* path, const char* contentType) {
@@ -1176,12 +1206,9 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return false;
   };
 
-  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
-  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
-  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
-  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
+  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
 #if CONFIG_DEBUG_LOG_ENABLE
@@ -1210,15 +1237,15 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
   }
 
   bool writeOk = true;
-  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidText) && writeOk;
-  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordText) && writeOk;
-  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameText) && writeOk;
+  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidValue) && writeOk;
+  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordValue) && writeOk;
+  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameValue) && writeOk;
   if (doc.containsKey("dhcp")) writeOk = g_config.writeDhcpEnabled(dhcpValue) && writeOk;
-  if (doc.containsKey("ip")) writeOk = g_config.writeStaticIP(doc["ip"].as<String>()) && writeOk;
-  if (doc.containsKey("gateway")) writeOk = g_config.writeGateway(doc["gateway"].as<String>()) && writeOk;
-  if (doc.containsKey("subnet")) writeOk = g_config.writeSubnet(doc["subnet"].as<String>()) && writeOk;
-  if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<String>()) && writeOk;
-  if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<String>()) && writeOk;
+  if (doc.containsKey("ip")) writeOk = g_config.writeStaticIP(doc["ip"].as<const char*>()) && writeOk;
+  if (doc.containsKey("gateway")) writeOk = g_config.writeGateway(doc["gateway"].as<const char*>()) && writeOk;
+  if (doc.containsKey("subnet")) writeOk = g_config.writeSubnet(doc["subnet"].as<const char*>()) && writeOk;
+  if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<const char*>()) && writeOk;
+  if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<const char*>()) && writeOk;
   if (doc.containsKey("start_value")) writeOk = g_config.writeStartValue(startValue) && writeOk;
 
   if (doc.containsKey("channel")) {
@@ -1268,15 +1295,18 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
 
 static esp_err_t updateInfoHandler(httpd_req_t* req) {
   uint32_t startMs = millis();
-  StaticJsonDocument<160> doc;
-  doc["version"] = "1.0.0";
+  StaticJsonDocument<320> doc;
+  addBuildInfo(doc);
   doc["device"] = g_hooks.deviceName;
   doc["variant"] = appGetVariantName();
   doc["ota_ready"] = true;
   doc["ws_ready"] = WS_BACKEND_READY;
   doc["ota_transport"] = APP_ASYNC_WEB_ENABLE ? "raw" : "multipart";
+  doc["web_manifest"] = "/esp-web-tools-manifest.json";
+  doc["install_image"] = "merged-install.bin";
+  doc["bundle_image"] = "ota_bundle.ota";
 
-  char out[160];
+  char out[320];
   size_t outLen = serializeJson(doc, out, sizeof(out));
   setCorsHeaders(req);
   httpd_resp_set_type(req, "application/json");
@@ -1683,11 +1713,7 @@ static void asyncStatusHandler(AsyncWebServerRequest* request) {
   char out[STATUS_JSON_BUFFER_SIZE];
   size_t outLen = 0;
   if (!details) {
-    portENTER_CRITICAL(&g_statusMux);
-    outLen = g_statusJsonCacheLen;
-    if (outLen > sizeof(out)) outLen = sizeof(out);
-    if (outLen > 0) memcpy(out, g_statusJsonCache, outLen);
-    portEXIT_CRITICAL(&g_statusMux);
+    copyCachedStatusJson(out, sizeof(out), &outLen);
   }
   if (outLen == 0 && g_hooks.buildStatusJson) {
     outLen = g_hooks.buildStatusJson(out, sizeof(out), details);
@@ -1700,7 +1726,9 @@ static void asyncStatusHandler(AsyncWebServerRequest* request) {
     }
   }
 
-  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", String(out).substring(0, outLen));
+  out[outLen < sizeof(out) ? outLen : (sizeof(out) - 1)] = '\0';
+  String payload(out);
+  AsyncWebServerResponse* response = request->beginResponse(200, "application/json", payload);
   asyncAddCommonHeaders(response, true);
   request->send(response);
   uint32_t totalMs = millis() - startMs;
@@ -1793,10 +1821,10 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
   }
 
   DynamicJsonDocument doc(2048);
-  DeserializationError err = deserializeJson(doc, static_cast<const char*>(body));
-  free(body);
-  request->_tempObject = nullptr;
+  DeserializationError err = deserializeJson(doc, body);
   if (err) {
+    free(body);
+    request->_tempObject = nullptr;
     AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "");
     asyncAddCommonHeaders(response);
     request->send(response);
@@ -1816,15 +1844,14 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return false;
   };
 
-  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
-  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
-  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
-  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
+  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
   if (ssidValue && invalidTextField(ssidValue, false, 32)) {
+    free(body);
+    request->_tempObject = nullptr;
     AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "Invalid SSID");
     asyncAddCommonHeaders(response);
     request->send(response);
@@ -1832,6 +1859,8 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return;
   }
   if (hostnameValue && invalidTextField(hostnameValue, true, 63)) {
+    free(body);
+    request->_tempObject = nullptr;
     AsyncWebServerResponse* response = request->beginResponse(400, "text/plain", "Invalid hostname");
     asyncAddCommonHeaders(response);
     request->send(response);
@@ -1841,15 +1870,15 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
 
   bool writeOk = true;
   if (doc.containsKey("ssid")) {
-    bool ok = g_config.writeSSID(ssidText);
+    bool ok = g_config.writeSSID(ssidValue);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("password")) {
-    bool ok = g_config.writePass(passwordText);
+    bool ok = g_config.writePass(passwordValue);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("hostname")) {
-    bool ok = g_config.writeHostname(hostnameText);
+    bool ok = g_config.writeHostname(hostnameValue);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("dhcp")) {
@@ -1857,28 +1886,23 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("ip")) {
-    String value = doc["ip"].as<String>();
-    bool ok = g_config.writeStaticIP(value);
+    bool ok = g_config.writeStaticIP(doc["ip"].as<const char*>());
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("gateway")) {
-    String value = doc["gateway"].as<String>();
-    bool ok = g_config.writeGateway(value);
+    bool ok = g_config.writeGateway(doc["gateway"].as<const char*>());
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("subnet")) {
-    String value = doc["subnet"].as<String>();
-    bool ok = g_config.writeSubnet(value);
+    bool ok = g_config.writeSubnet(doc["subnet"].as<const char*>());
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("dns1")) {
-    String value = doc["dns1"].as<String>();
-    bool ok = g_config.writeDNS1(value);
+    bool ok = g_config.writeDNS1(doc["dns1"].as<const char*>());
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("dns2")) {
-    String value = doc["dns2"].as<String>();
-    bool ok = g_config.writeDNS2(value);
+    bool ok = g_config.writeDNS2(doc["dns2"].as<const char*>());
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("start_value")) {
@@ -1913,12 +1937,16 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
   }
 
   if (!writeOk) {
+    free(body);
+    request->_tempObject = nullptr;
     AsyncWebServerResponse* response = request->beginResponse(500, "text/plain", "Failed to persist settings");
     asyncAddCommonHeaders(response);
     request->send(response);
     noteWebTaskWorkUs((millis() - startMs) * 1000UL);
     return;
   }
+  free(body);
+  request->_tempObject = nullptr;
   g_wifiManager.scheduleRestart(1000);
   AsyncWebServerResponse* response = request->beginResponse(204);
   asyncAddCommonHeaders(response);
@@ -1928,8 +1956,8 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
 
 static void asyncUpdateInfoHandler(AsyncWebServerRequest* request) {
   uint32_t startMs = millis();
-  StaticJsonDocument<160> doc;
-  doc["version"] = "1.0.0";
+  StaticJsonDocument<320> doc;
+  addBuildInfo(doc);
   doc["device"] = g_hooks.deviceName;
   doc["variant"] = appGetVariantName();
   doc["index_page"] = g_hooks.indexPagePath;
@@ -1937,6 +1965,9 @@ static void asyncUpdateInfoHandler(AsyncWebServerRequest* request) {
   doc["bundle_ready"] = true;
   doc["ws_ready"] = WS_BACKEND_READY;
   doc["ota_transport"] = "raw";
+  doc["web_manifest"] = "/esp-web-tools-manifest.json";
+  doc["install_image"] = "merged-install.bin";
+  doc["bundle_image"] = "ota_bundle.ota";
   String out;
   serializeJson(doc, out);
   AsyncWebServerResponse* response = request->beginResponse(200, "application/json", out);
@@ -2001,11 +2032,7 @@ static void asyncNotFoundHandler(AsyncWebServerRequest* request) {
 static String buildAsyncStatusPayload() {
   char out[STATUS_JSON_BUFFER_SIZE];
   size_t outLen = 0;
-  portENTER_CRITICAL(&g_statusMux);
-  outLen = g_statusJsonCacheLen;
-  if (outLen > sizeof(out)) outLen = sizeof(out);
-  if (outLen > 0) memcpy(out, g_statusJsonCache, outLen);
-  portEXIT_CRITICAL(&g_statusMux);
+  copyCachedStatusJson(out, sizeof(out), &outLen);
 
   if (outLen == 0 && g_hooks.buildStatusJson) {
     outLen = g_hooks.buildStatusJson(out, sizeof(out), false);
@@ -2018,7 +2045,9 @@ static String buildAsyncStatusPayload() {
     }
   }
 
-  return String(out).substring(0, outLen);
+  out[outLen < sizeof(out) ? outLen : (sizeof(out) - 1)] = '\0';
+  String payload(out);
+  return payload;
 }
 
 static void asyncBroadcastStatusIfDue(uint32_t nowMs, uint32_t wsStatusPushMs) {
@@ -2365,8 +2394,8 @@ static void webCredentialsPutHandler() {
 
 static void webUpdateInfoHandler() {
   uint32_t startMs = millis();
-  StaticJsonDocument<160> doc;
-  doc["version"] = "1.0.0";
+  StaticJsonDocument<320> doc;
+  addBuildInfo(doc);
   doc["device"] = g_hooks.deviceName;
   doc["variant"] = appGetVariantName();
   doc["index_page"] = g_hooks.indexPagePath;
@@ -2374,6 +2403,9 @@ static void webUpdateInfoHandler() {
   doc["bundle_ready"] = true;
   doc["ws_ready"] = WS_BACKEND_READY;
   doc["ota_transport"] = APP_ASYNC_WEB_ENABLE ? "raw" : "multipart";
+  doc["web_manifest"] = "/esp-web-tools-manifest.json";
+  doc["install_image"] = "merged-install.bin";
+  doc["bundle_image"] = "ota_bundle.ota";
   String out;
   serializeJson(doc, out);
   webSetCommonHeaders(true);
