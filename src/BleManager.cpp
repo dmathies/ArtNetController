@@ -398,6 +398,7 @@ void configureAdvertisingPayload(BLEAdvertising* advertising,
 #if APP_BLE_GATT_ENABLE
   advertising->setConnectableMode(BLE_GAP_CONN_MODE_UND);
   advertising->setDiscoverableMode(BLE_GAP_DISC_MODE_GEN);
+  advData.addServiceUUID(BLE_SERVICE_UUID);
   advertising->setAdvertisementData(advData);
 
   BLEAdvertisementData scanResponseData;
