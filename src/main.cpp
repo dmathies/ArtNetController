@@ -189,7 +189,7 @@ static void noteWebTaskWorkUs(uint32_t busyUs) {
 static void logFileReadPerf(const char* path) {
   File f = LittleFS.open(path, FILE_READ);
   if (!f || f.isDirectory()) {
-    Serial.printf("[FS] open failed: %s\n", path);
+    appLogPrintf("[FS] open failed: %s\n", path);
     return;
   }
 
@@ -2385,9 +2385,6 @@ static void webHandleUpdatePost(int updateCmd) {
   uint32_t startMs = millis();
   bool ok = !Update.hasError();
   g_wifiManager.setOtaInProgress(false);
-  Serial.printf("[OTA] %s upload complete, responding to client (%s)\n",
-                updateCmd == U_SPIFFS ? "filesystem" : "firmware",
-                ok ? "success" : "failure");
   appLogPrintf("[OTA] %s upload complete, responding to client (%s)\n",
                updateCmd == U_SPIFFS ? "filesystem" : "firmware",
                ok ? "success" : "failure");
@@ -2406,10 +2403,6 @@ static void webHandleUpdateUpload(int updateCmd) {
   HTTPUpload& upload = g_webServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     g_wifiManager.setOtaInProgress(true);
-    Serial.printf("[OTA] Starting %s upload: %s (%u bytes if known)\n",
-                  updateCmd == U_SPIFFS ? "filesystem" : "firmware",
-                  upload.filename.c_str(),
-                  (unsigned int)upload.totalSize);
     appLogPrintf("[OTA] Starting %s upload: %s (%u bytes if known)\n",
                  updateCmd == U_SPIFFS ? "filesystem" : "firmware",
                  upload.filename.c_str(),
@@ -2422,34 +2415,25 @@ static void webHandleUpdateUpload(int updateCmd) {
       beginOk = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
     }
     if (!beginOk) {
-      Serial.printf("[OTA] Update.begin failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       appLogPrintf("[OTA] Update.begin failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Serial.printf("[OTA] Update.write failed for %s at chunk %u\n",
-                    updateCmd == U_SPIFFS ? "filesystem" : "firmware",
-                    (unsigned int)upload.currentSize);
       appLogPrintf("[OTA] Update.write failed for %s at chunk %u\n",
                    updateCmd == U_SPIFFS ? "filesystem" : "firmware",
                    (unsigned int)upload.currentSize);
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_END) {
-    Serial.printf("[OTA] Finalizing %s upload (%u bytes written)\n",
-                  updateCmd == U_SPIFFS ? "filesystem" : "firmware",
-                  (unsigned int)upload.totalSize);
     appLogPrintf("[OTA] Finalizing %s upload (%u bytes written)\n",
                  updateCmd == U_SPIFFS ? "filesystem" : "firmware",
                  (unsigned int)upload.totalSize);
     if (!Update.end(true)) {
-      Serial.printf("[OTA] Update.end failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       appLogPrintf("[OTA] Update.end failed for %s\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
       Update.printError(Serial);
     }
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    Serial.printf("[OTA] %s upload aborted by client\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
     appLogPrintf("[OTA] %s upload aborted by client\n", updateCmd == U_SPIFFS ? "filesystem" : "firmware");
     Update.abort();
     g_wifiManager.setOtaInProgress(false);
@@ -2459,8 +2443,6 @@ static void webHandleUpdateUpload(int updateCmd) {
 static void webHandleBundleUpdatePost() {
   uint32_t startMs = millis();
   g_wifiManager.setOtaInProgress(false);
-  Serial.printf("[OTA] bundle upload complete, responding to client (%s)\n",
-                bundleUpdateIsComplete() ? "success" : "failure");
   appLogPrintf("[OTA] bundle upload complete, responding to client (%s)\n",
                bundleUpdateIsComplete() ? "success" : "failure");
   webSetCommonHeaders(true);
@@ -2481,9 +2463,6 @@ static void webHandleBundleUpdateUpload() {
   if (upload.status == UPLOAD_FILE_START) {
     resetAsyncBundleUpdateState();
     g_wifiManager.setOtaInProgress(true);
-    Serial.printf("[OTA] Starting bundle upload: %s (%u bytes if known)\n",
-                  upload.filename.c_str(),
-                  (unsigned int)upload.totalSize);
     appLogPrintf("[OTA] Starting bundle upload: %s (%u bytes if known)\n",
                  upload.filename.c_str(),
                  (unsigned int)upload.totalSize);
@@ -2536,7 +2515,6 @@ static void webHandleBundleUpdateUpload() {
   }
 
   if (upload.status == UPLOAD_FILE_END) {
-    Serial.printf("[OTA] Finalizing bundle upload (%u bytes written)\n", (unsigned int)upload.totalSize);
     appLogPrintf("[OTA] Finalizing bundle upload (%u bytes written)\n", (unsigned int)upload.totalSize);
     if (g_asyncBundleUpdate.stage != AsyncBundleStage::Failed && g_asyncBundleUpdate.stage != AsyncBundleStage::Complete) {
       failAsyncBundleUpdate("Bundle upload ended before all parts were written");
@@ -2545,7 +2523,6 @@ static void webHandleBundleUpdateUpload() {
   }
 
   if (upload.status == UPLOAD_FILE_ABORTED) {
-    Serial.println("[OTA] bundle upload aborted by client");
     appLogLine("[OTA] bundle upload aborted by client");
     failAsyncBundleUpdate("Bundle upload aborted");
     g_wifiManager.setOtaInProgress(false);
@@ -2680,7 +2657,7 @@ static void startWebServer() {
   g_webServer.begin();
   g_webServerStarted = true;
   g_webTaskHandle = nullptr;
-  Serial.println("WebServer started on :80");
+  appLogLine("WebServer started on :80");
 #endif
 }
 
@@ -2750,11 +2727,9 @@ void appInitializeBaseRuntime() {
   }
 #endif
 
-  Serial.println("Startup...");
   appLogLine("Startup...");
 
   if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
-    Serial.println("LittleFS mount failed");
     appLogLine("LittleFS mount failed");
   }
   logHeapSnapshot("base-runtime");
@@ -2786,7 +2761,6 @@ void appConnectWifi() {
   logHeapSnapshot("before-wifi");
   bool connected = g_wifiManager.connectToWifi();
   if (!connected) {
-    Serial.println("No WiFi... Starting AP");
     appLogLine("No WiFi... Starting AP");
     g_wifiManager.startManagementAP();
   }
@@ -2798,7 +2772,6 @@ void appConnectWifi() {
   logHeapSnapshot("after-web");
 
   IPAddress ip = g_wifiManager.getIP();
-  Serial.printf("IP Address: %s\n", ip.toString().c_str());
   appLogPrintf("IP Address: %s\n", ip.toString().c_str());
 }
 

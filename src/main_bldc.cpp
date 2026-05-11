@@ -7,6 +7,7 @@
 #include "main_common.h"
 #include "runtime_metrics.h"
 #include "bldc_uart.h"
+#include "RemoteLogBuffer.h"
 
 #ifndef BLDC_UART_TX_PIN
 #define BLDC_UART_TX_PIN 27
@@ -254,9 +255,9 @@ static void startArtnetListener() {
 
   g_artudpListening = g_artudp.listen(APP_ARTNET_PORT);
   if (g_artudpListening) {
-    Serial.printf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
+    appLogPrintf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
   } else {
-    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+    appLogPrintf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
   }
 }
 

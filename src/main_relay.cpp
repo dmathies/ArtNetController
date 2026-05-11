@@ -6,6 +6,7 @@
 
 #include "main_common.h"
 #include "runtime_metrics.h"
+#include "RemoteLogBuffer.h"
 
 #ifndef RELAY_OUTPUT_PIN
 #define RELAY_OUTPUT_PIN 9
@@ -258,9 +259,9 @@ static void startArtnetListener() {
 
   g_artudpListening = g_artudp.listen(APP_ARTNET_PORT);
   if (g_artudpListening) {
-    Serial.printf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
+    appLogPrintf("[ARTNET] AsyncUDP listening on :%u\n", APP_ARTNET_PORT);
   } else {
-    Serial.printf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
+    appLogPrintf("[ARTNET] AsyncUDP listen failed err=%d\n", (int)g_artudp.lastErr());
   }
 }
 

@@ -22,12 +22,19 @@ void appendLocked(const char* text, size_t len) {
     }
   }
 }
+
+void mirrorToSerial(const char* text) {
+  if (!text || text[0] == '\0') return;
+  Serial.print(text);
+}
 }  // namespace
 
 void appLogAppend(const char* text) {
   if (!text || text[0] == '\0') return;
   size_t len = strlen(text);
   if (len == 0) return;
+
+  mirrorToSerial(text);
 
   portENTER_CRITICAL(&g_logMux);
   appendLocked(text, len);
@@ -36,6 +43,7 @@ void appLogAppend(const char* text) {
 
 void appLogLine(const char* text) {
   const char* value = text ? text : "";
+  Serial.println(value);
   portENTER_CRITICAL(&g_logMux);
   g_lastLine = value;
   appendLocked(value, strlen(value));
@@ -54,21 +62,30 @@ void appLogPrintf(const char* fmt, ...) {
   if (written <= 0) return;
 
   if ((size_t)written < sizeof(stackBuf)) {
-    appLogAppend(stackBuf);
+    mirrorToSerial(stackBuf);
+    portENTER_CRITICAL(&g_logMux);
+    appendLocked(stackBuf, strlen(stackBuf));
+    portEXIT_CRITICAL(&g_logMux);
     return;
   }
 
   size_t needed = (size_t)written + 1;
   char* heapBuf = (char*)malloc(needed);
   if (!heapBuf) {
-    appLogAppend(stackBuf);
+    mirrorToSerial(stackBuf);
+    portENTER_CRITICAL(&g_logMux);
+    appendLocked(stackBuf, strlen(stackBuf));
+    portEXIT_CRITICAL(&g_logMux);
     return;
   }
 
   va_start(args, fmt);
   vsnprintf(heapBuf, needed, fmt, args);
   va_end(args);
-  appLogAppend(heapBuf);
+  mirrorToSerial(heapBuf);
+  portENTER_CRITICAL(&g_logMux);
+  appendLocked(heapBuf, strlen(heapBuf));
+  portEXIT_CRITICAL(&g_logMux);
   free(heapBuf);
 }
 
