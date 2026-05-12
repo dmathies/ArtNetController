@@ -1,4 +1,4 @@
-# ArtNetController
+# ArtNet Controller
 
 An ESP32-based Art-Net lighting controller. The repository contains multiple firmware variants that share the same Wi-Fi, web UI, OTA update flow, and LittleFS-backed configuration storage.
 
@@ -304,4 +304,4 @@ The recommended one-file OTA artifact is `.pio/build/<env>/ota_bundle.ota`. It i
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0. See [LICENSE](/c:/Users/derek/OneDrive/Documents/PlatformIO/Projects/CableCar/LICENSE).
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](/c:/Users/derek/OneDrive/Documents/PlatformIO/Projects/ArtNetController/LICENSE).

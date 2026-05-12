@@ -73,9 +73,11 @@ WifiManagerClass g_wifiManager(g_config);
 
 static AppRuntimeHooks g_hooks = {
   "/wifi-manager/index.html",
-  "CableCar",
+  "ArtNetController",
   nullptr,
   nullptr,
+  nullptr,
+  AppVariantKind::Unknown,
   nullptr,
 };
 
@@ -110,6 +112,7 @@ static bool g_asyncUpdateOk = false;
 static AppSlowStatusMetrics g_slowStatusMetrics = {};
 static uint32_t g_slowStatusMetricsBuiltMs = 0;
 static bool g_slowStatusMetricsRefreshInProgress = false;
+static AppVariantStatus g_variantStatus = {};
 
 enum class AsyncBundleStage : uint8_t {
   Header,
@@ -233,6 +236,19 @@ size_t appBuildStatusJson(char* out, size_t outSize, bool details) {
   return g_hooks.buildStatusJson(out, outSize, details);
 }
 
+const char* appVariantKindToString(AppVariantKind variant) {
+  switch (variant) {
+    case AppVariantKind::Bldc:
+      return "bldc";
+    case AppVariantKind::Relay:
+      return "relay";
+    case AppVariantKind::Led:
+      return "led";
+    default:
+      return "unknown";
+  }
+}
+
 static void refreshSlowStatusMetricsIfDue(uint32_t nowMs) {
   uint32_t lastBuiltMs;
   bool shouldRefresh = false;
@@ -262,13 +278,33 @@ static void refreshSlowStatusMetricsIfDue(uint32_t nowMs) {
   g_slowStatusMetricsRefreshInProgress = false;
   portEXIT_CRITICAL(&g_statusMux);
 }
-const char* appGetDeviceName() { return g_hooks.deviceName ? g_hooks.deviceName : "CableCar"; }
+const char* appGetDeviceName() { return g_hooks.deviceName ? g_hooks.deviceName : "ArtNetController"; }
 
-static const char* appGetVariantName() {
-  const char* deviceName = appGetDeviceName();
-  if (strstr(deviceName, "Relay") != nullptr) return "relay";
-  if (strstr(deviceName, "LED") != nullptr) return "led";
-  return "bldc";
+AppVariantKind appGetVariantKind() {
+  AppVariantStatus snapshot = appGetVariantStatus();
+  return snapshot.variant;
+}
+
+const char* appGetVariantName() { return appVariantKindToString(appGetVariantKind()); }
+
+AppVariantStatus appGetVariantStatus() {
+  AppVariantStatus snapshot;
+  portENTER_CRITICAL(&g_statusMux);
+  snapshot = g_variantStatus;
+  portEXIT_CRITICAL(&g_statusMux);
+  return snapshot;
+}
+
+void appSetVariantStatus(const AppVariantStatus& status) {
+  portENTER_CRITICAL(&g_statusMux);
+  g_variantStatus = status;
+  portEXIT_CRITICAL(&g_statusMux);
+}
+
+void appApplyVariantStartValue(float value) {
+  if (g_hooks.applyStartValue) {
+    g_hooks.applyStartValue(value);
+  }
 }
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len) {
@@ -2769,6 +2805,9 @@ void appInitializeBaseRuntime() {
 
 void appInitRuntime(const AppRuntimeHooks& hooks) {
   g_hooks = hooks;
+  AppVariantStatus status = g_variantStatus;
+  status.variant = g_hooks.variant;
+  appSetVariantStatus(status);
 }
 
 void appStartCommonServices() {

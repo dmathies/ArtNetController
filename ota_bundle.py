@@ -212,7 +212,7 @@ def build_web_installer_artifacts(*_args, **_kwargs):
     )
 
     manifest = {
-        "name": f"CableCar ({env.subst('$PIOENV')})",
+        "name": f"ArtNetController ({env.subst('$PIOENV')})",
         "version": env.GetProjectOption("custom_firmware_version", "dev"),
         "new_install_prompt_erase": True,
         "builds": [

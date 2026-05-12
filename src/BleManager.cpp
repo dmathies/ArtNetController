@@ -23,7 +23,6 @@
 #if APP_BLE_ENABLE
 
 #include <cstring>
-#include <ArduinoJson.h>
 #include <NimBLEDevice.h>
 
 #include "BuildMetadata.h"
@@ -55,8 +54,8 @@ constexpr char BLE_CHAR_DMX_UNIVERSE_UUID[] = "8f2a201b-1e8e-4f4c-a8c0-6c5b7d019
 constexpr uint32_t BLE_STATUS_REFRESH_MS = 1000;
 constexpr size_t BLE_LOG_TAIL_BYTES = APP_BLE_LOG_TAIL_BYTES;
 constexpr size_t BLE_LAST_LOG_BYTES = APP_BLE_LAST_LOG_BYTES;
-constexpr uint16_t BLE_ADV_INTERVAL_MIN = 0xA0;  // 100 ms
-constexpr uint16_t BLE_ADV_INTERVAL_MAX = 0xC0;  // 120 ms
+constexpr uint16_t BLE_ADV_INTERVAL_MIN = 0x320;  // 500 ms
+constexpr uint16_t BLE_ADV_INTERVAL_MAX = 0x320;  // 500 ms
 constexpr size_t BLE_PENDING_VALUE_MAX = 96;
 constexpr uint16_t BLE_MANUFACTURER_ID = 0xFFFF;
 constexpr uint8_t BLE_ADV_METADATA_VERSION = 1;
@@ -64,12 +63,7 @@ constexpr uint8_t BLE_ADV_FLAG_IP_PRESENT = 0x01;
 constexpr uint32_t BLE_ADV_REFRESH_MS = 1000;
 constexpr size_t BLE_RSSI_TEXT_BYTES = 16;
 
-enum class AdvertisedVariant : uint8_t {
-  Bldc = 0,
-  Relay = 1,
-  Led = 2,
-  Unknown = 255,
-};
+using AdvertisedVariant = AppVariantKind;
 
 enum class ConfigField {
   Ssid,
@@ -280,64 +274,11 @@ void parseVersionTriplet(uint8_t out[3]) {
   if (matched >= 3) out[2] = (uint8_t)(patch > 255 ? 255 : patch);
 }
 
-uint16_t clampNormalizedValue(int32_t value) {
-  if (value < 0) return 0;
-  if (value > 1000) return 1000;
-  return (uint16_t)value;
-}
-
-uint16_t scaleByteToNormalized(uint8_t value) {
-  return (uint16_t)(((uint32_t)value * 1000U + 127U) / 255U);
-}
-
-AdvertisedVariant parseAdvertisedVariant(const char* variantText) {
-  if (!variantText) return AdvertisedVariant::Unknown;
-  if (strcmp(variantText, "bldc") == 0) return AdvertisedVariant::Bldc;
-  if (strcmp(variantText, "relay") == 0) return AdvertisedVariant::Relay;
-  if (strcmp(variantText, "led") == 0) return AdvertisedVariant::Led;
-  return AdvertisedVariant::Unknown;
-}
-
 bool readAdvertisedStatusPayload(AdvertisedVariant& variantOut, uint16_t& normalizedValueOut) {
-  char json[512];
-  size_t jsonLen = appBuildStatusJson(json, sizeof(json), false);
-  if (jsonLen == 0 || jsonLen >= sizeof(json)) {
-    variantOut = AdvertisedVariant::Unknown;
-    normalizedValueOut = 0;
-    return false;
-  }
-
-  json[jsonLen] = '\0';
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, json);
-  if (err) {
-    variantOut = AdvertisedVariant::Unknown;
-    normalizedValueOut = 0;
-    return false;
-  }
-
-  const char* variantText = doc["variant"] | "";
-  variantOut = parseAdvertisedVariant(variantText);
-
-  switch (variantOut) {
-    case AdvertisedVariant::Bldc:
-      normalizedValueOut = scaleByteToNormalized((uint8_t)(doc["motor_value"] | 0));
-      return true;
-    case AdvertisedVariant::Relay:
-      normalizedValueOut = (doc["relay_on"] | false) ? 1000 : 0;
-      return true;
-    case AdvertisedVariant::Led: {
-      float led0 = doc["led_value0"] | 0.0f;
-      if (isnan(led0) || isinf(led0)) led0 = 0.0f;
-      if (led0 < 0.0f) led0 = 0.0f;
-      if (led0 > 1.0f) led0 = 1.0f;
-      normalizedValueOut = clampNormalizedValue((int32_t)(led0 * 1000.0f + 0.5f));
-      return true;
-    }
-    default:
-      normalizedValueOut = 0;
-      return false;
-  }
+  AppVariantStatus status = appGetVariantStatus();
+  variantOut = status.variant;
+  normalizedValueOut = status.normalizedValue;
+  return variantOut != AdvertisedVariant::Unknown;
 }
 
 std::string buildAdvertisingMetadata() {
@@ -382,6 +323,34 @@ std::string buildScanResponseMetadata() {
   data.push_back((char)(normalizedValue & 0xFF));
   data.push_back((char)((normalizedValue >> 8) & 0xFF));
   return data;
+}
+
+const char* advertisedVariantName(AdvertisedVariant variant) {
+  return appVariantKindToString(variant);
+}
+
+void logScanResponsePayload(const String& deviceName, const std::string& scanMetadata) {
+  if (scanMetadata.size() < 9) {
+    appLogPrintf("BLE scan response armed: name=%s invalid_payload_len=%u\n",
+                 deviceName.c_str(),
+                 (unsigned)scanMetadata.size());
+    return;
+  }
+
+  uint8_t fwMajor = (uint8_t)scanMetadata[3];
+  uint8_t fwMinor = (uint8_t)scanMetadata[4];
+  uint8_t fwPatch = (uint8_t)scanMetadata[5];
+  AdvertisedVariant variant = (AdvertisedVariant)(uint8_t)scanMetadata[6];
+  uint16_t normalizedValue =
+      (uint16_t)(uint8_t)scanMetadata[7] | ((uint16_t)(uint8_t)scanMetadata[8] << 8);
+
+  appLogPrintf("BLE scan response armed: name=%s fw=%u.%u.%u variant=%s value=%u\n",
+               deviceName.c_str(),
+               (unsigned)fwMajor,
+               (unsigned)fwMinor,
+               (unsigned)fwPatch,
+               advertisedVariantName(variant),
+               (unsigned)normalizedValue);
 }
 
 void configureAdvertisingPayload(BLEAdvertising* advertising,
@@ -437,6 +406,7 @@ void refreshAdvertisingPayloadIfNeeded(bool force) {
   g_lastAdvertisingMetadata = metadata;
   g_lastScanResponseMetadata = scanMetadata;
   g_lastAdvertisedName = deviceName;
+  logScanResponsePayload(deviceName, scanMetadata);
 }
 
 void setResult(const String& message) {
@@ -711,6 +681,7 @@ void appStartBleServices() {
   g_lastScanResponseMetadata = scanMetadata;
   g_lastAdvertisedName = deviceName;
   g_lastAdvRefreshMs = millis();
+  logScanResponsePayload(deviceName, scanMetadata);
   appLogPrintf("BLE advertising-only started as %s\n", deviceName.c_str());
   g_bleStarted = true;
   return;
@@ -839,6 +810,7 @@ void appStartBleServices() {
   g_lastScanResponseMetadata = scanMetadata;
   g_lastAdvertisedName = deviceName;
   g_lastAdvRefreshMs = millis();
+  logScanResponsePayload(deviceName, scanMetadata);
 
   appLogPrintf("BLE service started as %s\n", deviceName.c_str());
   g_bleStarted = true;

@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="UTF-8" />
-<title>Cablecar Dashboard</title>
+<title>Art-Net Controller Dashboard</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
 <style>
       :root {
@@ -492,7 +492,7 @@
       }
 
       function updateDashboardTitle(hostname) {
-        const base = toInitCapHostname(hostname) || 'Cablecar';
+        const base = toInitCapHostname(hostname) || 'ArtNetController';
         const title = `${base} Dashboard`;
         setText('dashboardTitle', title);
         document.title = title;
@@ -823,7 +823,7 @@
 </svg></div>
         <div>
           <p class="eyebrow">Geneva Musical Theatre</p>
-          <h1 id="dashboardTitle">Cablecar Dashboard</h1>
+          <h1 id="dashboardTitle">Art-Net Controller Dashboard</h1>
           <p id="dashboardSubtitle" class="subtitle">Waiting for device status...</p>
           <p class="subtitle">Build <strong id="buildSummary">-</strong></p>
           <p class="subtitle"><span id="buildMeta">-</span></p>
