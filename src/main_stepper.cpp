@@ -3,7 +3,6 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <ArduinoJson.h>
-#include <esp_heap_caps.h>
 #include <cstdlib>
 #include <cstring>
 
@@ -132,26 +131,6 @@ static bool g_persistSpeedPending = false;
 static bool g_persistAccelPending = false;
 static bool g_motionCommandActive = false;
 static bool g_configWriteActive = false;
-
-// ESP-IDF 4.4 allocates shared-interrupt descriptors with malloc(). On boards
-// with PSRAM, those descriptors can otherwise land in external RAM, which is
-// inaccessible while a LittleFS/OTA flash operation has the cache disabled.
-// Keep the temporary preference scoped to FastAccelStepper initialization so
-// the rest of the application can continue using PSRAM normally.
-class PreferInternalMallocScope {
- public:
-  PreferInternalMallocScope() {
-#if defined(BOARD_HAS_PSRAM) && CONFIG_SPIRAM_USE_MALLOC
-    heap_caps_malloc_extmem_enable(SIZE_MAX);
-#endif
-  }
-
-  ~PreferInternalMallocScope() {
-#if defined(BOARD_HAS_PSRAM) && CONFIG_SPIRAM_USE_MALLOC
-    heap_caps_malloc_extmem_enable(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
-#endif
-  }
-};
 
 static void applyStepperHoldState(bool enabled) {
   g_holdIdle = enabled;
@@ -800,20 +779,17 @@ static void setupStepperHardware() {
   digitalWrite(MS1_GPIO, HIGH);
   digitalWrite(HOME_GPIO2, HIGH);
 
-  {
-    PreferInternalMallocScope internalAllocations;
-    g_engine.init();
-    g_stepper = g_engine.stepperConnectToPin(STEP_GPIO);
-    if (!g_stepper) {
-      appLogLine("Stepper init failed");
-      return;
-    }
-
-    g_stepper->setDirectionPin(DIR_GPIO, true);
-    g_stepper->setEnablePin(EN_GPIO, true);
-    applyStepperHoldState(g_holdIdle);
-    configureMotionFast();
+  g_engine.init();
+  g_stepper = g_engine.stepperConnectToPin(STEP_GPIO);
+  if (!g_stepper) {
+    appLogLine("Stepper init failed");
+    return;
   }
+
+  g_stepper->setDirectionPin(DIR_GPIO, true);
+  g_stepper->setEnablePin(EN_GPIO, true);
+  applyStepperHoldState(g_holdIdle);
+  configureMotionFast();
 }
 
 void setup() {

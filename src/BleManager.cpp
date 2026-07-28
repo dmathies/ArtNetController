@@ -411,7 +411,9 @@ void refreshAdvertisingPayloadIfNeeded(bool force) {
   g_lastAdvertisingMetadata = metadata;
   g_lastScanResponseMetadata = scanMetadata;
   g_lastAdvertisedName = deviceName;
-  logScanResponsePayload(deviceName, scanMetadata);
+  if (force) {
+    logScanResponsePayload(deviceName, scanMetadata);
+  }
 }
 
 void setResult(const String& message) {
