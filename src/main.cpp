@@ -12,6 +12,7 @@
 #include <lwip/sockets.h>
 #include <lwip/tcp.h>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 
 #include "BleManager.h"
@@ -33,6 +34,7 @@ static constexpr uint32_t STATUS_CACHE_REFRESH_MS = 100;
 static constexpr uint32_t SLOW_STATUS_REFRESH_MS = 5000;
 static constexpr uint8_t OTA_BUNDLE_MAGIC[8] = {'C', 'C', 'A', 'R', 'O', 'T', 'A', '1'};
 static constexpr uint32_t OTA_BUNDLE_VERSION = 1;
+static constexpr size_t CLI_BUFFER_SIZE = 96;
 
 #ifndef WEB_DEBUG_LOG
 #define WEB_DEBUG_LOG 0
@@ -113,6 +115,9 @@ static AppSlowStatusMetrics g_slowStatusMetrics = {};
 static uint32_t g_slowStatusMetricsBuiltMs = 0;
 static bool g_slowStatusMetricsRefreshInProgress = false;
 static AppVariantStatus g_variantStatus = {};
+static char g_cliBuffer[CLI_BUFFER_SIZE] = {0};
+static size_t g_cliLength = 0;
+static bool g_cliSawCarriageReturn = false;
 
 enum class AsyncBundleStage : uint8_t {
   Header,
@@ -164,6 +169,183 @@ struct PendingWsPing {
 
 static void asyncAddCommonHeaders(AsyncWebServerResponse* response, bool json = false);
 
+static char* trimAsciiWhitespace(char* text) {
+  if (!text) return text;
+  while (*text && isspace((unsigned char)*text)) {
+    text++;
+  }
+  size_t len = strlen(text);
+  while (len > 0 && isspace((unsigned char)text[len - 1])) {
+    text[--len] = '\0';
+  }
+  return text;
+}
+
+static void printCliPrompt() {
+  Serial.print("> ");
+}
+
+static void printCliHelp() {
+  Serial.println("Commands:");
+  Serial.println("  status");
+  Serial.println("  reboot");
+  Serial.println("  help");
+  if (g_hooks.printCliHelp) {
+    g_hooks.printCliHelp();
+  }
+}
+
+static void printCliStatus() {
+  AppVariantStatus status = appGetVariantStatus();
+  wl_status_t wifiStatus = WiFi.status();
+  IPAddress ip = g_wifiManager.getIP();
+  Serial.printf("status variant=%s wifi=%d ip=%s rssi=%d\n",
+                appVariantKindToString(status.variant),
+                (int)wifiStatus,
+                ip.toString().c_str(),
+                (int)g_wifiManager.getRSSI());
+
+  if (g_hooks.buildStatusJson) {
+    char live[STATUS_JSON_BUFFER_SIZE];
+    size_t liveLen = g_hooks.buildStatusJson(live, sizeof(live), true);
+    if (liveLen >= sizeof(live)) {
+      liveLen = sizeof(live) - 1;
+    }
+    live[liveLen] = '\0';
+
+    if (liveLen > 0) {
+      DynamicJsonDocument doc(2048);
+      DeserializationError err = deserializeJson(doc, live);
+      if (!err) {
+        const char* variant = doc["variant"] | "unknown";
+        if (strcmp(variant, "stepper") == 0) {
+          uint8_t angleRaw = doc["stepper_angle"] | status.motorValue;
+          bool homeSwitch = doc["stepper_home_sensor"] | false;
+          bool homed = doc["stepper_homed"] | false;
+          int32_t positionSteps = doc["stepper_position_steps"] | 0;
+          int32_t targetSteps = doc["stepper_target_steps"] | 0;
+          unsigned int degrees = (unsigned int)(((uint32_t)angleRaw * 360U + 127U) / 255U);
+          Serial.printf("stepper angle=%u degrees home_switch=%s homed=%s pos=%ld target=%ld\n",
+                        degrees,
+                        homeSwitch ? "yes" : "no",
+                        homed ? "yes" : "no",
+                        (long)positionSteps,
+                        (long)targetSteps);
+          return;
+        }
+      }
+    }
+  }
+
+  switch (status.variant) {
+    case AppVariantKind::Stepper: {
+      unsigned int degrees = (unsigned int)(((uint32_t)status.motorValue * 360U + 127U) / 255U);
+      Serial.printf("stepper angle=%u degrees home=%s normalized=%u\n",
+                    degrees,
+                    status.controllerPowerOn ? "yes" : "no",
+                    (unsigned int)status.normalizedValue);
+      break;
+    }
+    case AppVariantKind::Bldc:
+      Serial.printf("bldc speed_raw=%u speed_step=%u controller_power=%s controller_last=%ldms normalized=%u\n",
+                    (unsigned int)status.motorValue,
+                    (unsigned int)status.motorStep,
+                    status.controllerPowerOn ? "on" : "off",
+                    (long)status.controllerLastStatusMsAgo,
+                    (unsigned int)status.normalizedValue);
+      break;
+    case AppVariantKind::Led:
+      Serial.printf("led ch1=%.3f ch2=%.3f ch3=%.3f ch4=%.3f\n",
+                    status.ledValues[0],
+                    status.ledValues[1],
+                    status.ledValues[2],
+                    status.ledValues[3]);
+      break;
+    case AppVariantKind::Relay:
+      Serial.printf("relay state=%s normalized=%u\n",
+                    status.relayOn ? "on" : "off",
+                    (unsigned int)status.normalizedValue);
+      break;
+    default:
+      Serial.println("variant status unavailable");
+      break;
+  }
+}
+
+static void runCliCommand(char* line) {
+  char* command = trimAsciiWhitespace(line);
+  if (!command || command[0] == '\0') {
+    printCliPrompt();
+    return;
+  }
+
+  if (strcmp(command, "status") == 0) {
+    printCliStatus();
+    printCliPrompt();
+    return;
+  }
+
+  if (strcmp(command, "reboot") == 0) {
+    Serial.println("Rebooting...");
+    g_wifiManager.scheduleRestart(100);
+    return;
+  }
+
+  if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
+    printCliHelp();
+    printCliPrompt();
+    return;
+  }
+
+  if (g_hooks.handleCliCommand && g_hooks.handleCliCommand(command)) {
+    printCliPrompt();
+    return;
+  }
+
+  Serial.printf("Unknown command: %s\n", command);
+  printCliHelp();
+  printCliPrompt();
+}
+
+static void handleSerialCli() {
+  while (Serial.available() > 0) {
+    int raw = Serial.read();
+    if (raw < 0) {
+      return;
+    }
+
+    char ch = (char)raw;
+    if (ch == '\r' || ch == '\n') {
+      if (ch == '\n' && g_cliSawCarriageReturn) {
+        g_cliSawCarriageReturn = false;
+        continue;
+      }
+      g_cliSawCarriageReturn = (ch == '\r');
+      g_cliBuffer[g_cliLength] = '\0';
+      runCliCommand(g_cliBuffer);
+      g_cliLength = 0;
+      continue;
+    }
+
+    g_cliSawCarriageReturn = false;
+
+    if (ch == '\b' || ch == 127) {
+      if (g_cliLength > 0) {
+        g_cliLength--;
+      }
+      continue;
+    }
+
+    if (!isprint((unsigned char)ch)) {
+      continue;
+    }
+
+    if (g_cliLength < (CLI_BUFFER_SIZE - 1)) {
+      g_cliBuffer[g_cliLength++] = ch;
+    }
+  }
+}
+
 static void addBuildInfo(JsonDocument& doc) {
   doc["version"] = APP_BUILD_VERSION;
   doc["build"] = APP_BUILD_GIT_SHA;
@@ -200,6 +382,44 @@ static void noteWebTaskWorkUs(uint32_t busyUs) {
     g_webTaskWindowStartUs = nowUs;
   }
   portEXIT_CRITICAL(&g_statusMux);
+}
+
+static int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+static String normalizeCredentialText(const char* value, bool trimEdges = true) {
+  if (!value) return String();
+
+  String input(value);
+  if (trimEdges) {
+    input.trim();
+  }
+  if (input.length() == 0) return input;
+
+  String out;
+  out.reserve(input.length());
+  bool changed = false;
+  const size_t len = input.length();
+  for (size_t i = 0; i < len; i++) {
+    char ch = input[i];
+    if (ch == '%' && (i + 2) < len) {
+      int hi = hexNibble(input[i + 1]);
+      int lo = hexNibble(input[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        out += (char)((hi << 4) | lo);
+        i += 2;
+        changed = true;
+        continue;
+      }
+    }
+    out += ch;
+  }
+
+  return changed ? out : input;
 }
 
 static void logFileReadPerf(const char* path) {
@@ -244,6 +464,8 @@ const char* appVariantKindToString(AppVariantKind variant) {
       return "relay";
     case AppVariantKind::Led:
       return "led";
+    case AppVariantKind::Stepper:
+      return "stepper";
     default:
       return "unknown";
   }
@@ -304,6 +526,12 @@ void appSetVariantStatus(const AppVariantStatus& status) {
 void appApplyVariantStartValue(float value) {
   if (g_hooks.applyStartValue) {
     g_hooks.applyStartValue(value);
+  }
+}
+
+void appApplyStepperHoldIdle(bool enabled) {
+  if (g_hooks.applyStepperHoldIdle) {
+    g_hooks.applyStepperHoldIdle(enabled);
   }
 }
 
@@ -1163,6 +1391,9 @@ static esp_err_t credentialsGetHandler(httpd_req_t* req) {
   doc["dns1"] = g_config.getDNS1();
   doc["dns2"] = g_config.getDNS2();
   doc["start_value"] = g_config.getStartValue();
+  doc["stepper_hold_idle"] = g_config.getStepperHoldIdle();
+  doc["stepper_speed_hz"] = (int)g_config.getStepperSpeedHz();
+  doc["stepper_accel"] = (int)g_config.getStepperAccel();
   doc["channel"] = channel;
   doc["universe"] = universe;
   doc["dmx_address"] = channel;
@@ -1242,9 +1473,12 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
     return false;
   };
 
-  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  String ssidText = doc.containsKey("ssid") ? normalizeCredentialText(doc["ssid"].as<const char*>()) : String();
+  String hostnameText = doc.containsKey("hostname") ? normalizeCredentialText(doc["hostname"].as<const char*>()) : String();
+  String passwordText = doc.containsKey("password") ? normalizeCredentialText(doc["password"].as<const char*>(), false) : String();
+  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
 #if CONFIG_DEBUG_LOG_ENABLE
@@ -1273,9 +1507,9 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
   }
 
   bool writeOk = true;
-  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidValue) && writeOk;
-  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordValue) && writeOk;
-  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameValue) && writeOk;
+  if (doc.containsKey("ssid")) writeOk = g_config.writeSSID(ssidText) && writeOk;
+  if (doc.containsKey("password")) writeOk = g_config.writePass(passwordText) && writeOk;
+  if (doc.containsKey("hostname")) writeOk = g_config.writeHostname(hostnameText) && writeOk;
   if (doc.containsKey("dhcp")) writeOk = g_config.writeDhcpEnabled(dhcpValue) && writeOk;
   if (doc.containsKey("ip")) writeOk = g_config.writeStaticIP(doc["ip"].as<const char*>()) && writeOk;
   if (doc.containsKey("gateway")) writeOk = g_config.writeGateway(doc["gateway"].as<const char*>()) && writeOk;
@@ -1283,6 +1517,15 @@ static esp_err_t credentialsPutHandler(httpd_req_t* req) {
   if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<const char*>()) && writeOk;
   if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<const char*>()) && writeOk;
   if (doc.containsKey("start_value")) writeOk = g_config.writeStartValue(startValue) && writeOk;
+  if (doc.containsKey("stepper_hold_idle")) writeOk = g_config.writeStepperHoldIdle(doc["stepper_hold_idle"].as<bool>()) && writeOk;
+  if (doc.containsKey("stepper_speed_hz")) {
+    int v = doc["stepper_speed_hz"].as<int>();
+    if (v >= 100 && v <= 200000) writeOk = g_config.writeStepperSpeedHz((uint32_t)v) && writeOk;
+  }
+  if (doc.containsKey("stepper_accel")) {
+    int v = doc["stepper_accel"].as<int>();
+    if (v >= 10 && v <= 1000000) writeOk = g_config.writeStepperAccel((uint32_t)v) && writeOk;
+  }
 
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
@@ -1819,6 +2062,9 @@ static void asyncCredentialsGetHandler(AsyncWebServerRequest* request) {
   doc["dns1"] = g_config.getDNS1();
   doc["dns2"] = g_config.getDNS2();
   doc["start_value"] = g_config.getStartValue();
+  doc["stepper_hold_idle"] = g_config.getStepperHoldIdle();
+  doc["stepper_speed_hz"] = (int)g_config.getStepperSpeedHz();
+  doc["stepper_accel"] = (int)g_config.getStepperAccel();
   doc["channel"] = channel;
   doc["universe"] = universe;
   doc["dmx_address"] = channel;
@@ -1880,9 +2126,12 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
     return false;
   };
 
-  const char* ssidValue = doc.containsKey("ssid") ? doc["ssid"].as<const char*>() : nullptr;
-  const char* hostnameValue = doc.containsKey("hostname") ? doc["hostname"].as<const char*>() : nullptr;
-  const char* passwordValue = doc.containsKey("password") ? doc["password"].as<const char*>() : nullptr;
+  String ssidText = doc.containsKey("ssid") ? normalizeCredentialText(doc["ssid"].as<const char*>()) : String();
+  String hostnameText = doc.containsKey("hostname") ? normalizeCredentialText(doc["hostname"].as<const char*>()) : String();
+  String passwordText = doc.containsKey("password") ? normalizeCredentialText(doc["password"].as<const char*>(), false) : String();
+  const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
+  const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
+  const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
   bool dhcpValue = doc.containsKey("dhcp") ? doc["dhcp"].as<bool>() : g_config.getDhcpEnabled();
   float startValue = doc.containsKey("start_value") ? doc["start_value"].as<float>() : g_config.getStartValue();
   if (ssidValue && invalidTextField(ssidValue, false, 32)) {
@@ -1906,15 +2155,15 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
 
   bool writeOk = true;
   if (doc.containsKey("ssid")) {
-    bool ok = g_config.writeSSID(ssidValue);
+    bool ok = g_config.writeSSID(ssidText);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("password")) {
-    bool ok = g_config.writePass(passwordValue);
+    bool ok = g_config.writePass(passwordText);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("hostname")) {
-    bool ok = g_config.writeHostname(hostnameValue);
+    bool ok = g_config.writeHostname(hostnameText);
     writeOk = ok && writeOk;
   }
   if (doc.containsKey("dhcp")) {
@@ -1944,6 +2193,18 @@ static void asyncCredentialsPutHandler(AsyncWebServerRequest* request) {
   if (doc.containsKey("start_value")) {
     bool ok = g_config.writeStartValue(startValue);
     writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("stepper_hold_idle")) {
+    bool ok = g_config.writeStepperHoldIdle(doc["stepper_hold_idle"].as<bool>());
+    writeOk = ok && writeOk;
+  }
+  if (doc.containsKey("stepper_speed_hz")) {
+    int v = doc["stepper_speed_hz"].as<int>();
+    if (v >= 100 && v <= 200000) writeOk = g_config.writeStepperSpeedHz((uint32_t)v) && writeOk;
+  }
+  if (doc.containsKey("stepper_accel")) {
+    int v = doc["stepper_accel"].as<int>();
+    if (v >= 10 && v <= 1000000) writeOk = g_config.writeStepperAccel((uint32_t)v) && writeOk;
   }
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
@@ -2326,6 +2587,9 @@ static void webCredentialsGetHandler() {
   doc["dns1"] = g_config.getDNS1();
   doc["dns2"] = g_config.getDNS2();
   doc["start_value"] = g_config.getStartValue();
+  doc["stepper_hold_idle"] = g_config.getStepperHoldIdle();
+  doc["stepper_speed_hz"] = (int)g_config.getStepperSpeedHz();
+  doc["stepper_accel"] = (int)g_config.getStepperAccel();
   doc["channel"] = channel;
   doc["universe"] = universe;
   doc["dmx_address"] = channel;
@@ -2367,9 +2631,9 @@ static void webCredentialsPutHandler() {
     return false;
   };
 
-  String ssidText = doc.containsKey("ssid") ? doc["ssid"].as<String>() : String();
-  String hostnameText = doc.containsKey("hostname") ? doc["hostname"].as<String>() : String();
-  String passwordText = doc.containsKey("password") ? doc["password"].as<String>() : String();
+  String ssidText = doc.containsKey("ssid") ? normalizeCredentialText(doc["ssid"].as<const char*>()) : String();
+  String hostnameText = doc.containsKey("hostname") ? normalizeCredentialText(doc["hostname"].as<const char*>()) : String();
+  String passwordText = doc.containsKey("password") ? normalizeCredentialText(doc["password"].as<const char*>(), false) : String();
   const char* ssidValue = doc.containsKey("ssid") ? ssidText.c_str() : nullptr;
   const char* hostnameValue = doc.containsKey("hostname") ? hostnameText.c_str() : nullptr;
   const char* passwordValue = doc.containsKey("password") ? passwordText.c_str() : nullptr;
@@ -2400,6 +2664,15 @@ static void webCredentialsPutHandler() {
   if (doc.containsKey("dns1")) writeOk = g_config.writeDNS1(doc["dns1"].as<String>()) && writeOk;
   if (doc.containsKey("dns2")) writeOk = g_config.writeDNS2(doc["dns2"].as<String>()) && writeOk;
   if (doc.containsKey("start_value")) writeOk = g_config.writeStartValue(startValue) && writeOk;
+  if (doc.containsKey("stepper_hold_idle")) writeOk = g_config.writeStepperHoldIdle(doc["stepper_hold_idle"].as<bool>()) && writeOk;
+  if (doc.containsKey("stepper_speed_hz")) {
+    int v = doc["stepper_speed_hz"].as<int>();
+    if (v >= 100 && v <= 200000) writeOk = g_config.writeStepperSpeedHz((uint32_t)v) && writeOk;
+  }
+  if (doc.containsKey("stepper_accel")) {
+    int v = doc["stepper_accel"].as<int>();
+    if (v >= 10 && v <= 1000000) writeOk = g_config.writeStepperAccel((uint32_t)v) && writeOk;
+  }
   if (doc.containsKey("channel")) {
     int channel = doc["channel"].as<int>();
     if (channel >= 1 && channel <= 512) writeOk = g_config.writeDMXAddress(channel) && writeOk;
@@ -2847,6 +3120,8 @@ void appConnectWifi() {
 }
 
 void appCommonLoop(uint32_t wsStatusPushMs) {
+  handleSerialCli();
+
   if (g_hooks.pollInputs) {
     g_hooks.pollInputs();
   }

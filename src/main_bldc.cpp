@@ -2,6 +2,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <ArduinoJson.h>
+#include <cstdlib>
+#include <cstring>
 
 #include "main_common.h"
 #include "bldc_uart.h"
@@ -178,6 +180,39 @@ static void enqueueMotor(uint8_t raw) {
   if (!motorQueue) return;
   MotorCmd cmd{raw};
   xQueueOverwrite(motorQueue, &cmd);
+}
+
+static bool handleCliCommand(const char* commandLine) {
+  char buffer[48];
+  strncpy(buffer, commandLine, sizeof(buffer) - 1);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  char* context = nullptr;
+  char* command = strtok_r(buffer, " ", &context);
+  if (!command || strcmp(command, "speed") != 0) {
+    return false;
+  }
+
+  char* valueText = strtok_r(nullptr, " ", &context);
+  if (!valueText) {
+    Serial.println("Usage: speed [0-255]");
+    return true;
+  }
+
+  char* end = nullptr;
+  long value = strtol(valueText, &end, 10);
+  if (!end || *end != '\0' || value < 0 || value > 255) {
+    Serial.println("Speed must be an integer from 0 to 255");
+    return true;
+  }
+
+  enqueueMotor((uint8_t)value);
+  Serial.printf("OK speed=%ld\n", value);
+  return true;
+}
+
+static void printCliHelp() {
+  Serial.println("  speed [0-255]");
 }
 
 static void motorTask(void* parameter) {
@@ -358,6 +393,9 @@ void setup() {
     nullptr,
     AppVariantKind::Bldc,
     applyStartValue,
+    nullptr,
+    handleCliCommand,
+    printCliHelp,
   });
 
   appApplyVariantStartValue(g_shared.cfg.startValue);

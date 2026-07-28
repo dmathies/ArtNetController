@@ -18,6 +18,7 @@ enum class AppVariantKind : uint8_t {
   Bldc = 0,
   Relay = 1,
   Led = 2,
+  Stepper = 3,
   Unknown = 255,
 };
 
@@ -29,6 +30,9 @@ struct AppRuntimeHooks {
   void (*pollInputs)();
   AppVariantKind variant;
   void (*applyStartValue)(float value);
+  void (*applyStepperHoldIdle)(bool enabled);
+  bool (*handleCliCommand)(const char* commandLine);
+  void (*printCliHelp)();
 };
 
 struct AppVariantStatus {
@@ -66,6 +70,7 @@ const char* appVariantKindToString(AppVariantKind variant);
 AppVariantStatus appGetVariantStatus();
 void appSetVariantStatus(const AppVariantStatus& status);
 void appApplyVariantStartValue(float value);
+void appApplyStepperHoldIdle(bool enabled);
 
 ArtDmxPacket appParseArtDmx(const uint8_t* p, int len);
 void appMarkArtnetActivity();
@@ -80,6 +85,7 @@ float appReadBoardTemperatureC();
 void appInitializeBaseRuntime();
 void appInitRuntime(const AppRuntimeHooks& hooks);
 void appStartCommonServices();
+void appSetBleAdvertisingEnabled(bool enabled);
 void appConnectWifi();
 void appStartWebServices();
 void appCommonLoop(uint32_t wsStatusPushMs);

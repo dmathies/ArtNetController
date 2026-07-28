@@ -3,6 +3,8 @@ import struct
 import subprocess
 import json
 import csv
+import os
+import tempfile
 
 from SCons.Script import AlwaysBuild, DefaultEnvironment
 
@@ -152,6 +154,15 @@ def build_ota_bundle(*_args, **_kwargs):
 
 
 def build_web_installer_artifacts(*_args, **_kwargs):
+    try:
+        _build_web_installer_artifacts_impl()
+    except Exception as e:
+        print(f"[esp-web-tools] WARNING: Skipping web installer generation due to: {type(e).__name__}: {e}")
+        print(f"[esp-web-tools] The OTA bundle has been generated successfully.")
+        print(f"[esp-web-tools] Workaround: Pause OneDrive syncing or move project outside OneDrive")
+        
+
+def _build_web_installer_artifacts_impl():
     build_dir = Path(env.subst("$BUILD_DIR"))
     firmware_path = _firmware_path(build_dir)
     filesystem_path = _filesystem_path(build_dir)
@@ -184,12 +195,19 @@ def build_web_installer_artifacts(*_args, **_kwargs):
         print(f"[esp-web-tools] up to date: {merged_path.name}, {manifest_path.name}")
         return
 
+    mcu = str(env.BoardConfig().get("build.mcu", "esp32")).lower()
+    bootloader_offset = "0x0000" if mcu in ("esp32s3", "esp32s2", "esp32c3", "esp32c2", "esp32c5", "esp32c6", "esp32h2") else "0x1000"
+
     esptool_cmd = _esptool_command()
+    
+    # Work around OneDrive permission issues by using system temp as cwd
+    # All paths are absolute so this should be safe
+    temp_cwd = os.environ.get('TEMP', tempfile.gettempdir())
     subprocess.check_call(
         esptool_cmd
         + [
             "--chip",
-            str(env.BoardConfig().get("build.mcu", "esp32")),
+            mcu,
             "merge_bin",
             "-o",
             str(merged_path),
@@ -199,7 +217,7 @@ def build_web_installer_artifacts(*_args, **_kwargs):
             "40m",
             "--flash_size",
             env.BoardConfig().get("upload.flash_size", "4MB"),
-            "0x1000",
+            bootloader_offset,
             str(bootloader_path),
             "0x8000",
             str(partitions_path),
@@ -208,7 +226,7 @@ def build_web_installer_artifacts(*_args, **_kwargs):
             "0x10000",
             str(firmware_path),
         ],
-        cwd=env.subst("$PROJECT_DIR"),
+        cwd=temp_cwd,
     )
 
     manifest = {

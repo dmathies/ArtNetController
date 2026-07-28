@@ -513,7 +513,15 @@
         if (variant === 'bldc') return 'BLDC';
         if (variant === 'relay') return 'Relay';
         if (variant === 'led') return 'LED';
+        if (variant === 'stepper') return 'Stepper';
         return 'Unknown';
+      }
+
+      function formatStepperAngle(raw) {
+        const num = Number(raw);
+        if (!isFinite(num)) return '-';
+        const degrees = (Math.max(0, Math.min(255, num)) * 360) / 255;
+        return `${Math.round(degrees)} degrees`;
       }
 
       function formatTaskAge(msAgo) {
@@ -556,6 +564,11 @@
           subtitle: 'Embedded lighting controller',
           outputTitle: 'LED Output',
           tasksColumns: 'repeat(2, minmax(0, 1fr))'
+        },
+        stepper: {
+          subtitle: 'Art-Net stepper motor controller',
+          outputTitle: 'Stepper Control',
+          tasksColumns: 'repeat(2, minmax(0, 1fr))'
         }
       };
 
@@ -573,6 +586,9 @@
         }
         if (typeof s.led_value0 !== 'undefined' || typeof s.led_value1 !== 'undefined' || typeof s.led_value2 !== 'undefined' || typeof s.led_value3 !== 'undefined') {
           return 'led';
+        }
+        if (typeof s.stepper_angle !== 'undefined' || typeof s.stepper_homed !== 'undefined') {
+          return 'stepper';
         }
         return 'bldc';
       }
@@ -593,6 +609,7 @@
         setVisible('motorOutputPanel', variant === 'bldc');
         setVisible('relayOutputPanel', variant === 'relay');
         setVisible('ledOutputPanel', variant === 'led');
+        setVisible('stepperOutputPanel', variant === 'stepper');
         setVisible('motorTaskMeta', variant === 'bldc');
         const tasksGrid = document.getElementById('tasksGrid');
         if (tasksGrid) tasksGrid.style.gridTemplateColumns = meta.tasksColumns;
@@ -649,6 +666,9 @@
         setText('motorValue', isFinite(motorValue) ? String(Math.round(motorValue) / 10.0) : '-');
         setText('controllerPowerState', controllerPowerOn ? 'On' : 'Off');
         setText('controllerLastStatus', formatPresenceAge(controllerLastStatusMsAgo));
+        setText('stepperAngle', formatStepperAngle(s.stepper_angle));
+        const homeSwitchActive = (typeof s.stepper_home_sensor !== 'undefined') ? Boolean(s.stepper_home_sensor) : Boolean(s.stepper_homed);
+        setText('stepperHome', homeSwitchActive ? 'Yes' : 'No');
         setText('relayState', Boolean(s.relay_on) ? 'On' : 'Off');
         setText('relayValue', isFinite(Number(s.relay_value ?? NaN)) ? String(Math.round(Number(s.relay_value))) : '-');
         for (let i = 0; i < 4; i++) {
@@ -897,6 +917,16 @@
               <div class="status-row"><div class="label">LED 1</div><div class="meter"><div id="led-fill-1" class="meter-fill"></div></div><div id="led-val-1" class="meter-value mono">0.000</div></div>
               <div class="status-row"><div class="label">LED 2</div><div class="meter"><div id="led-fill-2" class="meter-fill"></div></div><div id="led-val-2" class="meter-value mono">0.000</div></div>
               <div class="status-row"><div class="label">LED 3</div><div class="meter"><div id="led-fill-3" class="meter-fill"></div></div><div id="led-val-3" class="meter-value mono">0.000</div></div>
+            </div>
+            <div id="stepperOutputPanel" class="meta-grid hidden" style="margin-top:16px;grid-template-columns:1fr;">
+              <div class="meta">
+                <span class="label">Angle</span>
+                <div id="stepperAngle" class="value mono">-</div>
+              </div>
+              <div class="meta">
+                <span class="label">Home Switch</span>
+                <div id="stepperHome" class="value mono">No</div>
+              </div>
             </div>
           </div>
         </article>

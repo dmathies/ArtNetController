@@ -118,6 +118,31 @@ static void applyStartValue(float value) {
   applyRelayValue(clampStartRaw(value));
 }
 
+static bool handleCliCommand(const char* commandLine) {
+  if (!commandLine) {
+    return false;
+  }
+
+  if (strcmp(commandLine, "on") == 0) {
+    applyRelayValue(255);
+    Serial.println("OK on");
+    return true;
+  }
+
+  if (strcmp(commandLine, "off") == 0) {
+    applyRelayValue(0);
+    Serial.println("OK off");
+    return true;
+  }
+
+  return false;
+}
+
+static void printCliHelp() {
+  Serial.println("  on");
+  Serial.println("  off");
+}
+
 static bool consumeDmxPayload(void* ctx, const ArtDmxPacket& packet, uint16_t startAddress, uint32_t nowMs) {
   (void)ctx;
   (void)nowMs;
@@ -245,6 +270,9 @@ void setup() {
     nullptr,
     AppVariantKind::Relay,
     applyStartValue,
+    nullptr,
+    handleCliCommand,
+    printCliHelp,
   });
 
   appApplyVariantStartValue(g_shared.cfg.startValue);

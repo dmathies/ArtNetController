@@ -13,6 +13,7 @@ struct AppConfigCache {
   uint16_t dmxStartAddress = 1;
   uint16_t artnetUniverse = 0;
   float startValue = 0.0f;
+  bool stepperHoldIdle = false;
 };
 
 struct AppArtnetStats {

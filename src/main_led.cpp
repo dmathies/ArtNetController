@@ -2,6 +2,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <ArduinoJson.h>
+#include <cstdlib>
+#include <cstring>
 
 #include "main_common.h"
 #include "RemoteLogBuffer.h"
@@ -96,6 +98,48 @@ static void applyStartValue(float value) {
     setLedFloat(i, value);
   }
   publishVariantStatus();
+}
+
+static bool handleCliCommand(const char* commandLine) {
+  char buffer[64];
+  strncpy(buffer, commandLine, sizeof(buffer) - 1);
+  buffer[sizeof(buffer) - 1] = '\0';
+
+  char* context = nullptr;
+  char* command = strtok_r(buffer, " ", &context);
+  if (!command || strcmp(command, "channel") != 0) {
+    return false;
+  }
+
+  char* channelText = strtok_r(nullptr, " ", &context);
+  char* valueText = strtok_r(nullptr, " ", &context);
+  if (!channelText || !valueText) {
+    Serial.println("Usage: channel [1-4] [0.0-1.0]");
+    return true;
+  }
+
+  char* channelEnd = nullptr;
+  long channel = strtol(channelText, &channelEnd, 10);
+  if (!channelEnd || *channelEnd != '\0' || channel < 1 || channel > 4) {
+    Serial.println("Channel must be an integer from 1 to 4");
+    return true;
+  }
+
+  char* valueEnd = nullptr;
+  float value = strtof(valueText, &valueEnd);
+  if (!valueEnd || *valueEnd != '\0' || value < 0.0f || value > 1.0f) {
+    Serial.println("Value must be a number from 0.0 to 1.0");
+    return true;
+  }
+
+  setLedFloat((int)(channel - 1), value);
+  publishVariantStatus();
+  Serial.printf("OK channel=%ld value=%.3f\n", channel, value);
+  return true;
+}
+
+static void printCliHelp() {
+  Serial.println("  channel [1-4] [0.0-1.0]");
 }
 
 static bool consumeDmxPayload(void* ctx, const ArtDmxPacket& packet, uint16_t startAddress, uint32_t nowMs) {
@@ -237,6 +281,9 @@ void setup() {
     nullptr,
     AppVariantKind::Led,
     applyStartValue,
+    nullptr,
+    handleCliCommand,
+    printCliHelp,
   });
 
   appApplyVariantStartValue(g_shared.cfg.startValue);

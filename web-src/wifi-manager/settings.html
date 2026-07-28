@@ -456,7 +456,10 @@
             dns2: json.dns2 || "",
             channel: (json.channel ?? json.dmx_address ?? 1),
             universe: (json.universe ?? json.dmx_universe ?? 0),
-            start_value: (json.start_value ?? 0)
+            start_value: (json.start_value ?? 0),
+            stepper_hold_idle: (typeof json.stepper_hold_idle === 'boolean') ? json.stepper_hold_idle : false,
+            stepper_speed_hz: (json.stepper_speed_hz > 0) ? json.stepper_speed_hz : 19200,
+            stepper_accel: (json.stepper_accel > 0) ? json.stepper_accel : 64000
           };
 
           document.getElementById("ssid").value = initialCreds.ssid || "";
@@ -471,6 +474,9 @@
           document.getElementById("channel").value = initialCreds.channel;
           document.getElementById("universe").value = initialCreds.universe;
           document.getElementById("start_value").value = initialCreds.start_value;
+          document.getElementById("stepper_hold_idle").checked = !!initialCreds.stepper_hold_idle;
+          document.getElementById("stepper_speed_hz").value = initialCreds.stepper_speed_hz;
+          document.getElementById("stepper_accel").value = initialCreds.stepper_accel;
           toggleIpMode(document.getElementById("ip_mode").value);
           credentialsLoaded = true;
           setSaveEnabled(true);
@@ -662,6 +668,9 @@
           payload.universe = Number(document.getElementById("universe").value || "0");
           payload.dmx_universe = payload.universe;
           payload.start_value = Number(document.getElementById("start_value").value || "0");
+          payload.stepper_hold_idle = !!document.getElementById("stepper_hold_idle").checked;
+          payload.stepper_speed_hz = Number(document.getElementById("stepper_speed_hz").value || "19200");
+          payload.stepper_accel = Number(document.getElementById("stepper_accel").value || "64000");
 
           const payloadJson = JSON.stringify(payload);
           console.log("[CFG PAYLOAD]", payloadJson);
@@ -790,6 +799,21 @@
               <div class="field">
                 <label for="start_value">Start Value</label>
                 <input id="start_value" type="number" step="any" inputmode="decimal" placeholder="0" />
+              </div>
+              <div class="field">
+                <label for="stepper_hold_idle">Stepper Hold</label>
+                <div style="display:flex;align-items:center;gap:12px;padding:0 14px;border:1px solid var(--line);border-radius:0 14px 14px 0;background:var(--input-bg);min-height:50px;">
+                  <input id="stepper_hold_idle" type="checkbox" style="width:18px;height:18px;accent-color:var(--accent);" />
+                  <span class="muted">Keep the stepper energized when idle.</span>
+                </div>
+              </div>
+              <div class="field">
+                <label for="stepper_speed_hz">Speed (Hz)</label>
+                <input id="stepper_speed_hz" type="number" min="100" max="200000" step="1" inputmode="numeric" placeholder="19200" />
+              </div>
+              <div class="field">
+                <label for="stepper_accel">Acceleration (steps/s&sup2;)</label>
+                <input id="stepper_accel" type="number" min="10" max="1000000" step="1" inputmode="numeric" placeholder="64000" />
               </div>
             </div>
           </section>

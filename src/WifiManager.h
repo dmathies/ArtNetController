@@ -33,6 +33,7 @@ class WifiManagerClass {
 		uint32_t getReconnectSuccesses() const;
 		uint32_t getLastReconnectAttemptMs() const;
 		uint32_t getLastReconnectSuccessMs() const;
+		void handleWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
 	private:
 		Configuration& _config;
@@ -58,21 +59,25 @@ class WifiManagerClass {
 		bool _scanHasResult;
 		bool _otaInProgress;
 		unsigned long _scanStartedAtMs;
-		TaskHandle_t _scanTaskHandle;
 		uint32_t _reconnectAttempts;
 		uint32_t _reconnectSuccesses;
 		uint32_t _lastReconnectAttemptMs;
 		uint32_t _lastReconnectSuccessMs;
+		uint8_t _lastDisconnectReason;
+		uint32_t _lastDisconnectAtMs;
+		bool _preferredBssidValid;
+		uint8_t _preferredBssid[6];
+		int32_t _preferredChannel;
 
 		String getAvailableNetworks();
 		String buildNetworksJson(int networks);
+		bool selectPreferredBssidForSsid(const String& ssid);
+		static const char* wifiDisconnectReasonToString(uint8_t reason);
 		void requestRestart(unsigned long delayMs);
 		void cleanupBeforeRestart();
 		void ensureReconnectAttempt();
 		void pollNetworkScan();
 		void startNetworkScan();
-		void runNetworkScanTask();
-		static void networkScanTaskEntry(void* parameter);
 
 		bool waitForConnection();
 };

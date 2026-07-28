@@ -11,6 +11,7 @@ An ESP32-based Art-Net lighting controller. The repository contains multiple fir
   - `BLDC` controller: maps one DMX channel to a motor speed controller over UART
   - `LED` controller: maps four 16-bit Art-Net values to four PWM LED outputs
   - `Relay` controller: maps one DMX channel to a binary relay output
+  - `Stepper` controller: maps two DMX channels to a homed stepper axis
 
 ## Hardware Targets
 
@@ -18,6 +19,7 @@ The project currently has PlatformIO environments for:
 
 - `seeed_xiao_esp32s3`
 - `seeed_xiao_esp32s3_led`
+- `seeed_xiao_esp32s3_stepper`
 - `seeed_xiao_esp32s3_relay`
 - `nodemcu-32s`
 - `nodemcu-32s_led`
@@ -91,6 +93,29 @@ Default relay pin mapping:
 
 The relay logic defaults to active-high output. Set `RELAY_ACTIVE_HIGH=0` in build flags if your relay board is active-low.
 
+### Stepper Variant
+
+Source entry point: `src/main_stepper.cpp`
+
+- Listens for Art-Net DMX
+- Reads two consecutive 8-bit values starting at the configured start address
+- `channel base+0` sets the target angle, where `0` means `0 degrees` and `255` means `360 degrees`
+- `channel base+1` controls the mode: `< 128` is normal operation, `>= 128` homes the axis by running anticlockwise until the home sensor goes high
+
+Default stepper pin mapping for `seeed_xiao_esp32s3_stepper`:
+
+- `DIR -> GPIO1`
+- `STEP -> GPIO2`
+- `SLP -> GPIO3`
+- `RST -> GPIO4`
+- `MS3 -> GPIO5`
+- `MS2 -> GPIO6`
+- `MS1 -> GPIO43`
+- `EN -> GPIO44` (`LOW` active)
+- `HOME -> D8` (`HIGH` when homed)
+
+The driver is configured for `400` full steps per revolution with `1/16` microstepping.
+
 
 ## Project Layout
 
@@ -124,6 +149,7 @@ Important PlatformIO settings:
 - Dependency:
   - `bblanchon/ArduinoJson@^6.21.3`
   - `h2zero/NimBLE-Arduino`
+  - `gin66/FastAccelStepper` for the stepper variant
 
 Partition layout:
 
@@ -184,6 +210,12 @@ Build relay firmware for XIAO ESP32S3:
 
 ```powershell
 pio run -e seeed_xiao_esp32s3_relay
+```
+
+Build stepper firmware for XIAO ESP32S3:
+
+```powershell
+pio run -e seeed_xiao_esp32s3_stepper
 ```
 
 Upload firmware:

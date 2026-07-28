@@ -23,6 +23,9 @@ class Configuration {
 		const char *dns1Path;
 		const char *dns2Path;
 		const char *startValuePath;
+		const char *stepperHoldIdlePath;
+		const char *stepperSpeedHzPath;
+		const char *stepperAccelPath;
 
 		bool fsInitialized;
 
@@ -49,6 +52,9 @@ class Configuration {
 		bool writeDNS2(const String& dns2);
 		bool writeDNS2(const char* dns2);
 		bool writeStartValue(float value);
+		bool writeStepperHoldIdle(bool enabled);
+		bool writeStepperSpeedHz(uint32_t value);
+		bool writeStepperAccel(uint32_t value);
 
         String getSSID();
 		String getPass();
@@ -62,6 +68,9 @@ class Configuration {
 		String getDNS1();
 		String getDNS2();
 		float getStartValue();
+		bool getStepperHoldIdle();
+		uint32_t getStepperSpeedHz();
+		uint32_t getStepperAccel();
 };
 
 #endif

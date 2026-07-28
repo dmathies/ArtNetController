@@ -18,6 +18,9 @@ Configuration::Configuration() {
 	dns1Path = "/dns1.txt";
 	dns2Path = "/dns2.txt";
 	startValuePath = "/start_value.txt";
+	stepperHoldIdlePath = "/stepper_hold_idle.txt";
+	stepperSpeedHzPath = "/stepper_speed_hz.txt";
+	stepperAccelPath = "/stepper_accel.txt";
 
 	fsInitialized = false;
 }
@@ -41,6 +44,9 @@ void Configuration::initFileSystem() {
 	ensureDefaultFile(dns1Path, "");
 	ensureDefaultFile(dns2Path, "");
 	ensureDefaultFile(startValuePath, "0");
+	ensureDefaultFile(stepperHoldIdlePath, "0");
+	ensureDefaultFile(stepperSpeedHzPath, "19200");
+	ensureDefaultFile(stepperAccelPath, "64000");
 
 	Serial.println("LittleFS mounted successfully");
 }
@@ -136,13 +142,30 @@ bool Configuration::writeStartValue(float value) {
 	return writeFile(LittleFS, startValuePath, buf);
 }
 
+bool Configuration::writeStepperHoldIdle(bool enabled) {
+	return writeFile(LittleFS, stepperHoldIdlePath, enabled ? "1" : "0");
+}
+
+bool Configuration::writeStepperSpeedHz(uint32_t value) {
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
+	return writeFile(LittleFS, stepperSpeedHzPath, buf);
+}
+
+bool Configuration::writeStepperAccel(uint32_t value) {
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%lu", (unsigned long)value);
+	return writeFile(LittleFS, stepperAccelPath, buf);
+}
+
 String Configuration::getSSID() {
-	return readFile(LittleFS, ssidPath);
+	String value = readFile(LittleFS, ssidPath);
+	value.trim();
+	return value;
 }
 
 String Configuration::getPass() {
-	String pass = readFile(LittleFS, passPath);
-	return pass;
+	return readFile(LittleFS, passPath);
 }
 
 String Configuration::getHostname() {
@@ -195,6 +218,30 @@ float Configuration::getStartValue() {
 		return 0.0f;
 	}
 	return value.toFloat();
+}
+
+bool Configuration::getStepperHoldIdle() {
+	String value = readFile(LittleFS, stepperHoldIdlePath);
+	value.trim();
+	value.toLowerCase();
+	if (value.length() == 0) {
+		return false;
+	}
+	return !(value == "0" || value == "false" || value == "off" || value == "no");
+}
+
+uint32_t Configuration::getStepperSpeedHz() {
+	String value = readFile(LittleFS, stepperSpeedHzPath);
+	if (value.length() == 0) return 19200;
+	long v = atol(value.c_str());
+	return (v > 0) ? (uint32_t)v : 19200;
+}
+
+uint32_t Configuration::getStepperAccel() {
+	String value = readFile(LittleFS, stepperAccelPath);
+	if (value.length() == 0) return 64000;
+	long v = atol(value.c_str());
+	return (v > 0) ? (uint32_t)v : 64000;
 }
 
 // Read file from LittleFS

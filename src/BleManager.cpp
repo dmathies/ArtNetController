@@ -50,6 +50,7 @@ constexpr char BLE_CHAR_DNS2_UUID[] = "8f2a2018-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_START_VALUE_UUID[] = "8f2a2019-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_DMX_ADDRESS_UUID[] = "8f2a201a-1e8e-4f4c-a8c0-6c5b7d019000";
 constexpr char BLE_CHAR_DMX_UNIVERSE_UUID[] = "8f2a201b-1e8e-4f4c-a8c0-6c5b7d019000";
+constexpr char BLE_CHAR_STEPPER_HOLD_IDLE_UUID[] = "8f2a201c-1e8e-4f4c-a8c0-6c5b7d019000";
 
 constexpr uint32_t BLE_STATUS_REFRESH_MS = 1000;
 constexpr size_t BLE_LOG_TAIL_BYTES = APP_BLE_LOG_TAIL_BYTES;
@@ -76,6 +77,7 @@ enum class ConfigField {
   Dns1,
   Dns2,
   StartValue,
+  StepperHoldIdle,
   DmxAddress,
   DmxUniverse,
 };
@@ -102,6 +104,8 @@ const char* configFieldName(ConfigField field) {
       return "dns2";
     case ConfigField::StartValue:
       return "start_value";
+    case ConfigField::StepperHoldIdle:
+      return "stepper_hold_idle";
     case ConfigField::DmxAddress:
       return "dmx_address";
     case ConfigField::DmxUniverse:
@@ -139,6 +143,7 @@ BLECharacteristic* g_subnetChar = nullptr;
 BLECharacteristic* g_dns1Char = nullptr;
 BLECharacteristic* g_dns2Char = nullptr;
 BLECharacteristic* g_startValueChar = nullptr;
+BLECharacteristic* g_stepperHoldIdleChar = nullptr;
 BLECharacteristic* g_dmxAddressChar = nullptr;
 BLECharacteristic* g_dmxUniverseChar = nullptr;
 bool g_bleStarted = false;
@@ -436,6 +441,7 @@ void refreshConfigCharacteristics() {
   if (g_dmxUniverseChar) g_dmxUniverseChar->setValue(numberBuf);
   snprintf(numberBuf, sizeof(numberBuf), "%.6g", (double)config.getStartValue());
   if (g_startValueChar) g_startValueChar->setValue(numberBuf);
+  if (g_stepperHoldIdleChar) g_stepperHoldIdleChar->setValue(config.getStepperHoldIdle() ? "1" : "0");
 }
 
 void refreshStatusCharacteristics(bool notify) {
@@ -572,6 +578,20 @@ bool applyConfigField(ConfigField field, const String& value, String& message) {
         return false;
       }
       message = "Start value updated";
+      return true;
+    }
+    case ConfigField::StepperHoldIdle: {
+      bool enabled = true;
+      if (!parseBoolText(value, enabled)) {
+        message = "Invalid hold value";
+        return false;
+      }
+      if (!config.writeStepperHoldIdle(enabled)) {
+        message = "Failed to write stepper hold";
+        return false;
+      }
+      appApplyStepperHoldIdle(enabled);
+      message = enabled ? "Stepper hold enabled" : "Stepper hold disabled";
       return true;
     }
     case ConfigField::DmxAddress: {
@@ -772,6 +792,11 @@ void appStartBleServices() {
                                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
                                               NIMBLE_PROPERTY::WRITE_NR,
                                           "start_value");
+    g_stepperHoldIdleChar = createCharacteristic(service,
+                          BLE_CHAR_STEPPER_HOLD_IDLE_UUID,
+                          NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
+                            NIMBLE_PROPERTY::WRITE_NR,
+                          "stepper_hold_idle");
   g_dmxAddressChar = createCharacteristic(service,
                                           BLE_CHAR_DMX_ADDRESS_UUID,
                                           NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE |
@@ -793,6 +818,7 @@ void appStartBleServices() {
   g_dns1Char->setCallbacks(new ConfigCallbacks(ConfigField::Dns1));
   g_dns2Char->setCallbacks(new ConfigCallbacks(ConfigField::Dns2));
   g_startValueChar->setCallbacks(new ConfigCallbacks(ConfigField::StartValue));
+  g_stepperHoldIdleChar->setCallbacks(new ConfigCallbacks(ConfigField::StepperHoldIdle));
   g_dmxAddressChar->setCallbacks(new ConfigCallbacks(ConfigField::DmxAddress));
   g_dmxUniverseChar->setCallbacks(new ConfigCallbacks(ConfigField::DmxUniverse));
   g_rebootChar->setCallbacks(new RebootCallbacks());
@@ -821,6 +847,17 @@ void appRefreshBleAdvertising() {
   refreshAdvertisingPayloadIfNeeded(true);
   g_lastAdvRefreshMs = millis();
   appLogPrintf("BLE advertising refreshed as %s\n", g_lastAdvertisedName.c_str());
+}
+
+void appSetBleAdvertisingEnabled(bool enabled) {
+  if (!g_bleStarted) return;
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  if (!advertising) return;
+  if (enabled) {
+    advertising->start();
+  } else {
+    advertising->stop();
+  }
 }
 
 void appBleLoop() {
@@ -885,6 +922,8 @@ void appBleLoop() {
 void appStartBleServices() {}
 
 void appRefreshBleAdvertising() {}
+
+void appSetBleAdvertisingEnabled(bool enabled) { (void)enabled; }
 
 void appBleLoop() {}
 

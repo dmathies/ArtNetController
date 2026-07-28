@@ -12,14 +12,120 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_wifi.h>
+#include <esp_err.h>
+#include <cctype>
 
 #include "Configuration.h"
+#include "main_common.h"
 #include "RemoteLogBuffer.h"
 
 namespace {
+WifiManagerClass* g_wifiManagerInstance = nullptr;
+
 void applyWifiPowerSaveForCoexistence() {
 	WiFi.setSleep(true);
 	esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+}
+
+void applyStaTxPowerPreference() {
+	if (!WiFi.setTxPower(WIFI_POWER_8_5dBm)) {
+		appLogLine("WiFi setTxPower(WIFI_POWER_8_5dBm) failed");
+	}
+}
+
+void applyStaSecurityCompatibility() {
+	wifi_config_t cfg = {};
+	esp_err_t getErr = esp_wifi_get_config(WIFI_IF_STA, &cfg);
+	if (getErr != ESP_OK) {
+		appLogPrintf("WiFi get STA config failed (%d:%s)\n", (int)getErr, esp_err_to_name(getErr));
+		return;
+	}
+
+	// Prefer WPA2-PSK when APs are in mixed WPA2/WPA3 transition modes.
+	cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+	// Keep PMF optional for compatibility with consumer routers.
+	cfg.sta.pmf_cfg.capable = true;
+	cfg.sta.pmf_cfg.required = false;
+
+	esp_err_t setErr = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+	if (setErr != ESP_OK) {
+		appLogPrintf("WiFi set STA compat config failed (%d:%s)\n", (int)setErr, esp_err_to_name(setErr));
+	}
+}
+
+void applyStaPostBeginPreferences() {
+	applyStaTxPowerPreference();
+	applyStaSecurityCompatibility();
+}
+
+int hexNibble(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+	if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+	return -1;
+}
+
+String normalizeCredentialForAuthRetry(const String& input, bool* changedOut) {
+	const bool hasSpace = input.indexOf(' ') >= 0;
+	String out;
+	out.reserve(input.length());
+	bool changed = false;
+
+	const size_t len = input.length();
+	for (size_t i = 0; i < len; i++) {
+		char ch = input[i];
+		if (ch == '%' && (i + 2) < len) {
+			int hi = hexNibble(input[i + 1]);
+			int lo = hexNibble(input[i + 2]);
+			if (hi >= 0 && lo >= 0) {
+				out += (char)((hi << 4) | lo);
+				i += 2;
+				changed = true;
+				continue;
+			}
+		}
+		if (ch == '+' && !hasSpace) {
+			out += ' ';
+			changed = true;
+			continue;
+		}
+		out += ch;
+	}
+
+	if (changedOut) {
+		*changedOut = changed;
+	}
+	return changed ? out : input;
+}
+
+String buildNetworksJsonFromApRecords(const wifi_ap_record_t* records, uint16_t count) {
+	String json = "[";
+	json.reserve((count * 34) + 2);
+	bool first = true;
+
+	for (uint16_t i = 0; i < count; i++) {
+		if (records[i].ssid[0] == '\0') {
+			continue;
+		}
+
+		String network = "\"" + String((const char*)records[i].ssid) + "\"";
+		if (json.indexOf(network) == -1) {
+			if (!first) {
+				json += ",";
+			}
+			json += network;
+			first = false;
+		}
+	}
+
+	json += "]";
+	return json;
+}
+
+void wifiEventRouter(WiFiEvent_t event, WiFiEventInfo_t info) {
+	if (g_wifiManagerInstance) {
+		g_wifiManagerInstance->handleWifiEvent(event, info);
+	}
 }
 }
 
@@ -38,16 +144,58 @@ WifiManagerClass::WifiManagerClass(Configuration& config)
 	_scanHasResult = false;
 	_otaInProgress = false;
 	_scanStartedAtMs = 0;
-	_scanTaskHandle = nullptr;
 	_reconnectAttempts = 0;
 	_reconnectSuccesses = 0;
 	_lastReconnectAttemptMs = 0;
 	_lastReconnectSuccessMs = 0;
+	_lastDisconnectReason = 0;
+	_lastDisconnectAtMs = 0;
+	_preferredBssidValid = false;
+	memset(_preferredBssid, 0, sizeof(_preferredBssid));
+	_preferredChannel = 0;
+
+	g_wifiManagerInstance = this;
+	WiFi.onEvent(wifiEventRouter);
 
 	_networks = "[]";
 	_hostname = "";
 	_stationSsid = "";
 	_apSsid = "";
+}
+
+void WifiManagerClass::handleWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+	if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+		_lastDisconnectReason = (uint8_t)info.wifi_sta_disconnected.reason;
+		_lastDisconnectAtMs = millis();
+		appLogPrintf("WiFi disconnected: reason=%u (%s)\n",
+		             (unsigned)_lastDisconnectReason,
+		             wifiDisconnectReasonToString(_lastDisconnectReason));
+	}
+}
+
+const char* WifiManagerClass::wifiDisconnectReasonToString(uint8_t reason) {
+	switch (reason) {
+		case 2: return "auth_expired";
+		case 3: return "auth_leave";
+		case 4: return "assoc_expired";
+		case 5: return "assoc_toomany";
+		case 6: return "not_authed";
+		case 7: return "not_assoced";
+		case 8: return "assoc_leave";
+		case 9: return "assoc_not_authed";
+		case 15: return "4way_handshake_timeout";
+		case 16: return "group_key_update_timeout";
+		case 17: return "ie_in_4way_differs";
+		case 23: return "8021x_auth_failed";
+		case 200: return "beacon_timeout";
+		case 201: return "no_ap_found";
+		case 202: return "auth_fail";
+		case 203: return "assoc_fail";
+		case 204: return "handshake_timeout";
+		case 205: return "connection_fail";
+		case 206: return "ap_tsf_reset";
+		default: return "unknown";
+	}
 }
 
 void WifiManagerClass::check() {
@@ -159,7 +307,71 @@ void WifiManagerClass::ensureReconnectAttempt() {
 	}
 
 	String pass = _config.getPass();
-	WiFi.begin(_stationSsid.c_str(), pass.c_str());
+	if (!_preferredBssidValid) {
+		selectPreferredBssidForSsid(_stationSsid);
+	}
+	if (_preferredBssidValid) {
+		WiFi.begin(_stationSsid.c_str(),
+		           pass.c_str(),
+		           _preferredChannel,
+		           _preferredBssid,
+		           true);
+		applyStaPostBeginPreferences();
+	} else {
+		WiFi.begin(_stationSsid.c_str(), pass.c_str());
+		applyStaPostBeginPreferences();
+	}
+}
+
+bool WifiManagerClass::selectPreferredBssidForSsid(const String& ssid) {
+	if (ssid.length() == 0) {
+		_preferredBssidValid = false;
+		_preferredChannel = 0;
+		return false;
+	}
+
+	int count = WiFi.scanNetworks(false, false);
+	if (count < 0) {
+		appLogPrintf("WiFi pre-connect scan failed (%d)\n", count);
+		_preferredBssidValid = false;
+		_preferredChannel = 0;
+		return false;
+	}
+
+	int bestIdx = -1;
+	int bestRssi = -1000;
+	for (int i = 0; i < count; i++) {
+		if (WiFi.SSID(i) != ssid) {
+			continue;
+		}
+		int rssi = WiFi.RSSI(i);
+		if (bestIdx < 0 || rssi > bestRssi) {
+			bestIdx = i;
+			bestRssi = rssi;
+		}
+	}
+
+	if (bestIdx < 0) {
+		appLogPrintf("WiFi pre-connect scan: SSID '%s' not found\n", ssid.c_str());
+		WiFi.scanDelete();
+		_preferredBssidValid = false;
+		_preferredChannel = 0;
+		return false;
+	}
+
+	uint8_t* bssid = WiFi.BSSID(bestIdx);
+	if (!bssid) {
+		WiFi.scanDelete();
+		_preferredBssidValid = false;
+		_preferredChannel = 0;
+		return false;
+	}
+
+	memcpy(_preferredBssid, bssid, sizeof(_preferredBssid));
+	_preferredChannel = WiFi.channel(bestIdx);
+	_preferredBssidValid = true;
+	WiFi.scanDelete();
+	return true;
 }
 
 void WifiManagerClass::startNetworkScan() {
@@ -168,73 +380,137 @@ void WifiManagerClass::startNetworkScan() {
 	_scanRequested = true;
 }
 
-void WifiManagerClass::networkScanTaskEntry(void* parameter) {
-	WifiManagerClass* self = static_cast<WifiManagerClass*>(parameter);
-	self->runNetworkScanTask();
-	vTaskDelete(nullptr);
-}
-
-void WifiManagerClass::runNetworkScanTask() {
-	appLogLine("Scanning networks...");
-
-	wifi_mode_t mode = WiFi.getMode();
-	if (mode == WIFI_MODE_AP) {
-		WiFi.mode(WIFI_MODE_APSTA);
-		applyWifiPowerSaveForCoexistence();
-	} else if (mode == WIFI_MODE_NULL) {
-		WiFi.mode(WIFI_MODE_STA);
-		applyWifiPowerSaveForCoexistence();
-	}
-
-	int scanResult = WiFi.scanNetworks(false, false);
-	if (scanResult < 0) {
-		appLogPrintf("WiFi scan failed (%d)\n", scanResult);
-		_networks = "[]";
-	} else {
-		_networks = buildNetworksJson(scanResult);
-		WiFi.scanDelete();
-		appLogLine("WiFi scan complete");
-	}
-
-	_scanInProgress = false;
-	_scanHasResult = true;
-	_scanTaskHandle = nullptr;
-}
-
 void WifiManagerClass::pollNetworkScan() {
 	if (_otaInProgress) {
 		return;
 	}
 
 	if (_scanRequested && !_scanInProgress) {
-		if (_scanTaskHandle != nullptr) {
-			return;
-		}
-
 		_scanRequested = false;
-		_scanInProgress = false;
 		_scanStartedAtMs = millis();
 		appLogLine("Starting WiFi scan...");
+		appLogLine("Scanning networks...");
+    appSetBleAdvertisingEnabled(false);
 
-		BaseType_t taskOk = xTaskCreatePinnedToCore(
-			networkScanTaskEntry,
-			"WifiScanTask",
-			6144,
-			this,
-			1,
-			&_scanTaskHandle,
-			1);
+		wifi_mode_t mode = WiFi.getMode();
+		if (mode != WIFI_MODE_APSTA) {
+			WiFi.mode(WIFI_MODE_APSTA);
+			applyWifiPowerSaveForCoexistence();
+			delay(50);
+		}
 
-		if (taskOk != pdPASS) {
-			appLogLine("Failed to start WiFi scan task");
-			_networks = "[]";
-			_scanInProgress = false;
-			_scanHasResult = true;
-			_scanTaskHandle = nullptr;
+		// If STA connect is still in progress after a failed join attempt,
+		// scan start can fail with ESP_ERR_WIFI_STATE.
+		if (_managementApActive && WiFi.status() != WL_CONNECTED) {
+			esp_wifi_disconnect();
+			delay(20);
+		}
+
+		int previousScan = WiFi.scanComplete();
+		if (previousScan == WIFI_SCAN_RUNNING) {
+			WiFi.scanDelete();
+			delay(20);
+		}
+		WiFi.scanDelete();
+		int startResult = WiFi.scanNetworks(true, false);
+		if (startResult == WIFI_SCAN_RUNNING) {
+			_scanInProgress = true;
 			return;
 		}
 
-		_scanInProgress = true;
+		if (startResult == WIFI_SCAN_FAILED) {
+			appLogLine("WiFi async scan failed, retrying sync scan");
+			delay(50);
+			startResult = WiFi.scanNetworks(false, false);
+
+			if (startResult == WIFI_SCAN_FAILED) {
+				appLogLine("WiFi sync scan failed, retrying IDF scan");
+				esp_wifi_scan_stop();
+
+				wifi_scan_config_t config = {};
+				config.show_hidden = false;
+				esp_err_t idfScanErr = esp_wifi_scan_start(&config, true);
+				if (idfScanErr == ESP_ERR_WIFI_STATE) {
+					appLogLine("WiFi IDF scan in bad state, resetting STA state and retrying");
+					esp_wifi_disconnect();
+					delay(20);
+					idfScanErr = esp_wifi_scan_start(&config, true);
+				}
+				if (idfScanErr == ESP_OK) {
+					uint16_t apCount = 0;
+					esp_err_t countErr = esp_wifi_scan_get_ap_num(&apCount);
+					if (countErr != ESP_OK) {
+						appLogPrintf("WiFi IDF scan count failed (%d:%s)\n",
+						             (int)countErr,
+						             esp_err_to_name(countErr));
+						startResult = WIFI_SCAN_FAILED;
+					} else if (apCount == 0) {
+						_networks = "[]";
+						startResult = 0;
+					} else {
+						wifi_ap_record_t* records =
+							(wifi_ap_record_t*)malloc(sizeof(wifi_ap_record_t) * apCount);
+						if (!records) {
+							appLogLine("WiFi IDF scan allocation failed");
+							startResult = WIFI_SCAN_FAILED;
+						} else {
+							uint16_t recordsToRead = apCount;
+							esp_err_t recordsErr =
+								esp_wifi_scan_get_ap_records(&recordsToRead, records);
+							if (recordsErr != ESP_OK) {
+								appLogPrintf("WiFi IDF scan records failed (%d:%s)\n",
+								             (int)recordsErr,
+								             esp_err_to_name(recordsErr));
+								startResult = WIFI_SCAN_FAILED;
+							} else {
+								_networks = buildNetworksJsonFromApRecords(records, recordsToRead);
+								startResult = recordsToRead;
+							}
+							free(records);
+						}
+					}
+				} else {
+					appLogPrintf("WiFi IDF scan start failed (%d:%s)\n",
+					             (int)idfScanErr,
+					             esp_err_to_name(idfScanErr));
+					startResult = WIFI_SCAN_FAILED;
+				}
+			}
+		}
+
+		if (startResult >= 0) {
+			_networks = buildNetworksJson(startResult);
+			WiFi.scanDelete();
+			appLogLine("WiFi scan complete");
+		} else {
+			appLogPrintf("WiFi scan failed (%d)\n", startResult);
+			_networks = "[]";
+		}
+		appSetBleAdvertisingEnabled(true);
+
+		_scanInProgress = false;
+		_scanHasResult = true;
+		return;
+	}
+
+	if (_scanInProgress) {
+		int scanResult = WiFi.scanComplete();
+		if (scanResult == WIFI_SCAN_RUNNING) {
+			return;
+		}
+
+		if (scanResult >= 0) {
+			_networks = buildNetworksJson(scanResult);
+			WiFi.scanDelete();
+			appLogLine("WiFi scan complete");
+		} else {
+			appLogPrintf("WiFi scan failed (%d)\n", scanResult);
+			_networks = "[]";
+		}
+		appSetBleAdvertisingEnabled(true);
+
+		_scanInProgress = false;
+		_scanHasResult = true;
 		return;
 	}
 }
@@ -342,9 +618,42 @@ bool WifiManagerClass::connectToWifi() {
 
 	appLogLine("Connecting to WiFi...");
 
-	WiFi.begin(_stationSsid.c_str(), pass.c_str());
+	selectPreferredBssidForSsid(_stationSsid);
+	if (_preferredBssidValid) {
+		WiFi.begin(_stationSsid.c_str(),
+		           pass.c_str(),
+		           _preferredChannel,
+		           _preferredBssid,
+		           true);
+		applyStaPostBeginPreferences();
+	} else {
+		WiFi.begin(_stationSsid.c_str(), pass.c_str());
+		applyStaPostBeginPreferences();
+	}
 
 	_connected = waitForConnection();
+	if (!_connected && _lastDisconnectReason == 2) {
+		bool changed = false;
+		String retryPass = normalizeCredentialForAuthRetry(pass, &changed);
+		if (changed && retryPass != pass) {
+			WiFi.disconnect(true, true);
+			if (_preferredBssidValid) {
+				WiFi.begin(_stationSsid.c_str(),
+				           retryPass.c_str(),
+				           _preferredChannel,
+				           _preferredBssid,
+				           true);
+				applyStaPostBeginPreferences();
+			} else {
+				WiFi.begin(_stationSsid.c_str(), retryPass.c_str());
+				applyStaPostBeginPreferences();
+			}
+			_connected = waitForConnection();
+			if (_connected) {
+				_config.writePass(retryPass);
+			}
+		}
+	}
 	applyWifiPowerSaveForCoexistence();
 
 	return _connected;
@@ -356,6 +665,14 @@ bool WifiManagerClass::waitForConnection() {
 	while (WiFi.status() != WL_CONNECTED) {
 		if (millis() > timeout) {
 			appLogLine("Unable to connect to WIFI");
+			wl_status_t status = WiFi.status();
+			appLogPrintf("WiFi status=%d ssid=%s\n", (int)status, _stationSsid.c_str());
+			if (_lastDisconnectAtMs != 0) {
+				appLogPrintf("WiFi last disconnect reason=%u (%s) %lums ago\n",
+				             (unsigned)_lastDisconnectReason,
+				             wifiDisconnectReasonToString(_lastDisconnectReason),
+				             (unsigned long)(millis() - _lastDisconnectAtMs));
+			}
 
 			return false;
 		}
