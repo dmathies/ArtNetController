@@ -1,4 +1,5 @@
 ﻿#include <Arduino.h>
+#include <esp_task_wdt.h>
 #include <FastAccelStepper.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -654,7 +655,16 @@ static void pollArtnet() {
 
 static void controlTask(void* parameter) {
   (void)parameter;
+#if CONFIG_TASK_WDT
+  esp_err_t taskWdtErr = esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+  if (taskWdtErr != ESP_OK && taskWdtErr != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[WDT] stepper control task registration failed: %d\n", (int)taskWdtErr);
+  }
+#endif
   for (;;) {
+#if CONFIG_TASK_WDT
+    esp_task_wdt_reset();
+#endif
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(CONTROL_TASK_IDLE_WAIT_MS));
     uint32_t loopNowUs = micros();
     noteControlLoopTiming(g_shared.artnetTiming, loopNowUs);

@@ -8,6 +8,7 @@
 #include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
 #include <ArduinoJson.h>
 #include <lwip/sockets.h>
 #include <lwip/tcp.h>
@@ -3070,6 +3071,13 @@ void appInitializeBaseRuntime() {
 
   appLogLine("Startup...");
 
+#if CONFIG_TASK_WDT
+  esp_err_t mainTaskWdtErr = esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+  if (mainTaskWdtErr != ESP_OK && mainTaskWdtErr != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[WDT] main task registration failed: %d\n", (int)mainTaskWdtErr);
+  }
+#endif
+
   if (!LittleFS.begin(true, "/littlefs", 10, "littlefs")) {
     appLogLine("LittleFS mount failed");
   }
@@ -3120,24 +3128,32 @@ void appConnectWifi() {
 }
 
 void appCommonLoop(uint32_t wsStatusPushMs) {
+  esp_task_wdt_reset();
   handleSerialCli();
+  yield();
 
   if (g_hooks.pollInputs) {
     g_hooks.pollInputs();
   }
+  yield();
 
 #if !APP_ASYNC_WEB_ENABLE
   uint32_t webStartUs = micros();
   g_webServer.handleClient();
   noteWebTaskWorkUs(micros() - webStartUs);
 #endif
+  yield();
 
   g_wifiManager.check();
+  yield();
   appBleLoop();
+  yield();
 
   uint32_t now = millis();
   refreshStatusCacheIfDue(now);
+  yield();
   asyncBroadcastStatusIfDue(now, wsStatusPushMs);
+  yield();
 #if HEALTH_LOG_ENABLE
   if (now - g_lastHealthLogMs >= HEALTH_LOG_INTERVAL_MS) {
     wl_status_t wifiStatus = WiFi.status();

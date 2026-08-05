@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <ArduinoJson.h>
@@ -232,6 +233,7 @@ static void motorTask(void* parameter) {
   };
 
   for (;;) {
+    esp_task_wdt_reset();
     uint32_t workUs = 0;
     MotorCmd cmd;
     if (xQueueReceive(motorQueue, &cmd, pdMS_TO_TICKS(MOTOR_TASK_DELAY_MS)) == pdPASS) {
@@ -278,7 +280,14 @@ static void pollArtnet() {
 
 static void controlTask(void* parameter) {
   (void)parameter;
+#if CONFIG_TASK_WDT
+  esp_err_t taskWdtErr = esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+  if (taskWdtErr != ESP_OK && taskWdtErr != ESP_ERR_INVALID_STATE) {
+    Serial.printf("[WDT] BLDC control task registration failed: %d\n", (int)taskWdtErr);
+  }
+#endif
   for (;;) {
+    esp_task_wdt_reset();
     uint32_t loopNowUs = micros();
     noteControlLoopTiming(g_shared.artnetTiming, loopNowUs);
     uint32_t busyStartUs = micros();

@@ -14,5 +14,8 @@
         "cmath": "cpp",
         "typeinfo": "cpp",
         "string": "cpp"
+    },
+    "chat.tools.terminal.autoApprove": {
+        "&": true
     }
 }

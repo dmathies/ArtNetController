@@ -13,6 +13,7 @@
 #include <LittleFS.h>
 #include <esp_wifi.h>
 #include <esp_err.h>
+#include <esp_task_wdt.h>
 #include <cctype>
 
 #include "Configuration.h"
@@ -55,7 +56,16 @@ void applyStaSecurityCompatibility() {
 
 void applyStaPostBeginPreferences() {
 	applyStaTxPowerPreference();
-	applyStaSecurityCompatibility();
+
+	wl_status_t status = WiFi.status();
+	if (status == WL_CONNECTED) {
+		return;
+	}
+
+	if (status == WL_IDLE_STATUS || status == WL_DISCONNECTED || status == WL_NO_SSID_AVAIL ||
+	    status == WL_SCAN_COMPLETED || status == WL_CONNECT_FAILED || status == WL_CONNECTION_LOST) {
+		applyStaSecurityCompatibility();
+	}
 }
 
 int hexNibble(char c) {
@@ -199,6 +209,7 @@ const char* WifiManagerClass::wifiDisconnectReasonToString(uint8_t reason) {
 }
 
 void WifiManagerClass::check() {
+	esp_task_wdt_reset();
 	wl_status_t status = WiFi.status();
 	if (status == WL_CONNECTED) {
 		_ip = WiFi.localIP();
@@ -226,6 +237,7 @@ void WifiManagerClass::check() {
 		}
 		_nextReconnectCheck = millis() + _reconnectIntervalCheck;
 	}
+	yield();
 }
 
 String WifiManagerClass::getNetworksPayload(bool details, bool refresh) {
@@ -301,77 +313,30 @@ void WifiManagerClass::ensureReconnectAttempt() {
 	applyWifiPowerSaveForCoexistence();
 
 	appLogLine("WiFi not connected. Attempting to reconnect.");
-	String currentTarget = WiFi.SSID();
-	if (currentTarget == _stationSsid && WiFi.reconnect()) {
-		return;
-	}
 
 	String pass = _config.getPass();
 	if (!_preferredBssidValid) {
 		selectPreferredBssidForSsid(_stationSsid);
 	}
+	applyStaTxPowerPreference();
+	applyStaSecurityCompatibility();
 	if (_preferredBssidValid) {
 		WiFi.begin(_stationSsid.c_str(),
 		           pass.c_str(),
 		           _preferredChannel,
 		           _preferredBssid,
 		           true);
-		applyStaPostBeginPreferences();
 	} else {
 		WiFi.begin(_stationSsid.c_str(), pass.c_str());
-		applyStaPostBeginPreferences();
 	}
 }
 
 bool WifiManagerClass::selectPreferredBssidForSsid(const String& ssid) {
-	if (ssid.length() == 0) {
-		_preferredBssidValid = false;
-		_preferredChannel = 0;
-		return false;
-	}
-
-	int count = WiFi.scanNetworks(false, false);
-	if (count < 0) {
-		appLogPrintf("WiFi pre-connect scan failed (%d)\n", count);
-		_preferredBssidValid = false;
-		_preferredChannel = 0;
-		return false;
-	}
-
-	int bestIdx = -1;
-	int bestRssi = -1000;
-	for (int i = 0; i < count; i++) {
-		if (WiFi.SSID(i) != ssid) {
-			continue;
-		}
-		int rssi = WiFi.RSSI(i);
-		if (bestIdx < 0 || rssi > bestRssi) {
-			bestIdx = i;
-			bestRssi = rssi;
-		}
-	}
-
-	if (bestIdx < 0) {
-		appLogPrintf("WiFi pre-connect scan: SSID '%s' not found\n", ssid.c_str());
-		WiFi.scanDelete();
-		_preferredBssidValid = false;
-		_preferredChannel = 0;
-		return false;
-	}
-
-	uint8_t* bssid = WiFi.BSSID(bestIdx);
-	if (!bssid) {
-		WiFi.scanDelete();
-		_preferredBssidValid = false;
-		_preferredChannel = 0;
-		return false;
-	}
-
-	memcpy(_preferredBssid, bssid, sizeof(_preferredBssid));
-	_preferredChannel = WiFi.channel(bestIdx);
-	_preferredBssidValid = true;
-	WiFi.scanDelete();
-	return true;
+	(void)ssid;
+	_preferredBssidValid = false;
+	_preferredChannel = 0;
+	// appLogLine("Skipping pre-connect BSSID scan to avoid startup blocking");
+	return false;
 }
 
 void WifiManagerClass::startNetworkScan() {
@@ -396,6 +361,7 @@ void WifiManagerClass::pollNetworkScan() {
 		if (mode != WIFI_MODE_APSTA) {
 			WiFi.mode(WIFI_MODE_APSTA);
 			applyWifiPowerSaveForCoexistence();
+			yield();
 			delay(50);
 		}
 
@@ -403,12 +369,14 @@ void WifiManagerClass::pollNetworkScan() {
 		// scan start can fail with ESP_ERR_WIFI_STATE.
 		if (_managementApActive && WiFi.status() != WL_CONNECTED) {
 			esp_wifi_disconnect();
+			yield();
 			delay(20);
 		}
 
 		int previousScan = WiFi.scanComplete();
 		if (previousScan == WIFI_SCAN_RUNNING) {
 			WiFi.scanDelete();
+			yield();
 			delay(20);
 		}
 		WiFi.scanDelete();
@@ -420,6 +388,7 @@ void WifiManagerClass::pollNetworkScan() {
 
 		if (startResult == WIFI_SCAN_FAILED) {
 			appLogLine("WiFi async scan failed, retrying sync scan");
+			yield();
 			delay(50);
 			startResult = WiFi.scanNetworks(false, false);
 
@@ -433,6 +402,7 @@ void WifiManagerClass::pollNetworkScan() {
 				if (idfScanErr == ESP_ERR_WIFI_STATE) {
 					appLogLine("WiFi IDF scan in bad state, resetting STA state and retrying");
 					esp_wifi_disconnect();
+					yield();
 					delay(20);
 					idfScanErr = esp_wifi_scan_start(&config, true);
 				}
@@ -557,7 +527,8 @@ bool WifiManagerClass::connectToWifi() {
 	}
 
 	WiFi.mode(WIFI_MODE_STA);
-	applyWifiPowerSaveForCoexistence();
+	WiFi.setAutoReconnect(true);
+	WiFi.setSleep(false);
 
 	// Don't scan networks at startup - it blocks for several seconds
 	// Networks will be scanned on-demand when /networks endpoint is called
@@ -617,6 +588,8 @@ bool WifiManagerClass::connectToWifi() {
 	}
 
 	appLogLine("Connecting to WiFi...");
+	applyStaTxPowerPreference();
+	applyStaSecurityCompatibility();
 
 	selectPreferredBssidForSsid(_stationSsid);
 	if (_preferredBssidValid) {
@@ -625,67 +598,67 @@ bool WifiManagerClass::connectToWifi() {
 		           _preferredChannel,
 		           _preferredBssid,
 		           true);
-		applyStaPostBeginPreferences();
 	} else {
 		WiFi.begin(_stationSsid.c_str(), pass.c_str());
-		applyStaPostBeginPreferences();
 	}
 
-	_connected = waitForConnection();
+	const unsigned long startedAtMs = millis();
+	while (millis() - startedAtMs < _connectionTimeout) {
+		wl_status_t status = WiFi.status();
+		if (status == WL_CONNECTED) {
+			_ip = WiFi.localIP();
+			_connected = true;
+			appLogPrintf("Assigned IP Address: %s\n", _ip.toString().c_str());
+			applyWifiPowerSaveForCoexistence();
+			return true;
+		}
+
+		if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL || status == WL_CONNECTION_LOST) {
+			break;
+		}
+
+		esp_task_wdt_reset();
+		yield();
+		delay(50);
+	}
+
 	if (!_connected && _lastDisconnectReason == 2) {
 		bool changed = false;
 		String retryPass = normalizeCredentialForAuthRetry(pass, &changed);
 		if (changed && retryPass != pass) {
 			WiFi.disconnect(true, true);
+			applyStaTxPowerPreference();
 			if (_preferredBssidValid) {
 				WiFi.begin(_stationSsid.c_str(),
 				           retryPass.c_str(),
 				           _preferredChannel,
 				           _preferredBssid,
 				           true);
-				applyStaPostBeginPreferences();
 			} else {
 				WiFi.begin(_stationSsid.c_str(), retryPass.c_str());
-				applyStaPostBeginPreferences();
 			}
-			_connected = waitForConnection();
-			if (_connected) {
-				_config.writePass(retryPass);
+			const unsigned long retryStartedAtMs = millis();
+			while (millis() - retryStartedAtMs < _connectionTimeout) {
+				wl_status_t status = WiFi.status();
+				if (status == WL_CONNECTED) {
+					_ip = WiFi.localIP();
+					_connected = true;
+					appLogPrintf("Assigned IP Address: %s\n", _ip.toString().c_str());
+					_config.writePass(retryPass);
+					applyWifiPowerSaveForCoexistence();
+					return true;
+				}
+				esp_task_wdt_reset();
+				yield();
+				delay(50);
 			}
 		}
 	}
+
+	appLogPrintf("WiFi connect timed out; status=%d ssid=%s\n", (int)WiFi.status(), _stationSsid.c_str());
 	applyWifiPowerSaveForCoexistence();
 
-	return _connected;
-}
-
-bool WifiManagerClass::waitForConnection() {
-	unsigned long timeout = millis() + _connectionTimeout;
-
-	while (WiFi.status() != WL_CONNECTED) {
-		if (millis() > timeout) {
-			appLogLine("Unable to connect to WIFI");
-			wl_status_t status = WiFi.status();
-			appLogPrintf("WiFi status=%d ssid=%s\n", (int)status, _stationSsid.c_str());
-			if (_lastDisconnectAtMs != 0) {
-				appLogPrintf("WiFi last disconnect reason=%u (%s) %lums ago\n",
-				             (unsigned)_lastDisconnectReason,
-				             wifiDisconnectReasonToString(_lastDisconnectReason),
-				             (unsigned long)(millis() - _lastDisconnectAtMs));
-			}
-
-			return false;
-		}
-
-		delay(20);
-	}
-
-	_ip = WiFi.localIP();
-
-	appLogPrintf("Assigned IP Address: %s\n", _ip.toString().c_str());
-
-
-	return true;
+	return false;
 }
 
 void WifiManagerClass::startManagementAP() {
